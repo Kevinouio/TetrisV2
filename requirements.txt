@@ -1,0 +1,9 @@
+gymnasium>=0.29.1
+numpy
+pygame
+# For training (optional; uncomment or pin when you’re ready)
+# stable-baselines3[extra]
+# torch
+# wandb
+# hydra-core
+# pytest

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tetris-v2"
+version = "0.0.1"
+description = "Tetris RL environments and agents (NES → modern → adversarial)"
+authors = [{name="Your Name"}]
+requires-python = ">=3.9"
+dependencies = [
+    "gymnasium>=0.29.1",
+    "numpy",
+    "pygame",
+]
+
+[tool.setuptools.packages.find]
+where = [""]
+include = ["tetris_v2*"]

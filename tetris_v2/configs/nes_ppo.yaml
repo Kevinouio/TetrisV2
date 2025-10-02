@@ -1,0 +1,8 @@
+# NES PPO default config (skeleton)
+seed: 0
+total_timesteps: 1000000
+learning_rate: 0.0003
+n_steps: 256
+batch_size: 64
+gamma: 0.99
+env_id: KevinNES/Tetris-v0
