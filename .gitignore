@@ -1,0 +1,39 @@
+# Bytecode and cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Test & tooling artifacts
+.pytest_cache/
+.mypy_cache/
+coverage*
+
+# Experiment outputs
+runs/
+videos/
+wandb/
+checkpoints/
+
+# Logs & data
+*.log
+*.csv
+*.npz
+*.npy
+
+# Media generated during recording
+*.mp4
+*.gif
+*.pdf
+
+# Misc
+.DS_Store
+Thumbs.db

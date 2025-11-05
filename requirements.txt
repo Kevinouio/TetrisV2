@@ -1,9 +1,15 @@
+# Core environment dependencies
 gymnasium>=0.29.1
-numpy
-pygame
-# For training (optional; uncomment or pin when you’re ready)
-# stable-baselines3[extra]
-# torch
-# wandb
-# hydra-core
-# pytest
+numpy>=1.24
+pygame>=2.1
+
+# Reinforcement learning stack
+stable-baselines3[extra]>=2.2.1
+torch>=2.1
+
+# Experiment tooling
+hydra-core>=1.3
+wandb>=0.16
+
+# Development and testing
+pytest>=7.4
