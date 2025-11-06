@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generator, List, Sequence, Tuple
+from typing import Generator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -31,6 +31,8 @@ PALETTE = np.array(
     ],
     dtype=np.uint8,
 )
+
+GHOST_COLOR = np.array([200, 200, 200], dtype=np.uint8)
 
 
 def _base_shapes() -> List[np.ndarray]:
@@ -265,7 +267,7 @@ def detect_t_spin(board: np.ndarray, piece_state: PieceState, last_action: str) 
     """Return 'tspin', 'mini', or None if the placement is not a T-Spin."""
     if piece_state.piece_id != NAME_TO_ID["T"]:
         return None
-    if last_action not in {"rotate_cw", "rotate_ccw"}:
+    if last_action not in {"rotate_cw", "rotate_ccw", "rotate_180"}:
         return None
     center_row, center_col = _t_spin_center(piece_state)
     corner_offsets = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
@@ -338,8 +340,28 @@ def tick_gravity(rows_elapsed: int, level: int) -> bool:
     return rows_elapsed >= gravity_frames(level)
 
 
-def render_board_rgb(board: np.ndarray) -> np.ndarray:
-    pixels = PALETTE[np.clip(board_visible(board), 0, len(PALETTE) - 1)]
+def render_board_rgb(
+    board: np.ndarray,
+    *,
+    current: Optional[PieceState] = None,
+    ghost: Optional[PieceState] = None,
+) -> np.ndarray:
+    visible = board_visible(board)
+    overlay = visible.copy()
+    ghost_mask = np.zeros_like(overlay, dtype=bool)
+    if ghost is not None:
+        for row, col in iter_filled_cells(ghost):
+            if row >= HIDDEN_ROWS:
+                r = row - HIDDEN_ROWS
+                if 0 <= col < BOARD_WIDTH and overlay[r, col] == 0:
+                    ghost_mask[r, col] = True
+    if current is not None:
+        for row, col in iter_filled_cells(current):
+            if row >= HIDDEN_ROWS:
+                overlay[row - HIDDEN_ROWS, col] = current.piece_id + 1
+    pixels = PALETTE[np.clip(overlay, 0, len(PALETTE) - 1)]
+    if ghost is not None:
+        pixels[ghost_mask] = GHOST_COLOR
     return np.repeat(np.repeat(pixels, 20, axis=0), 20, axis=1)
 
 

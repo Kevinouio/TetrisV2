@@ -26,10 +26,11 @@ class ModernTetrisEnv(gym.Env):
         render_mode: Optional[str] = None,
         queue_size: int = 5,
         lock_delay_frames: int = 30,
-        line_clear_delay_frames: int = 20,
+        line_clear_delay_frames: int = 0,
         reward_mode: str = "score",
         time_limit_seconds: Optional[float] = None,
         max_steps: Optional[int] = None,
+        soft_drop_factor: float = 6.0,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
@@ -44,6 +45,7 @@ class ModernTetrisEnv(gym.Env):
             queue_size=queue_size,
             lock_delay_frames=lock_delay_frames,
             line_clear_delay_frames=line_clear_delay_frames,
+            soft_drop_factor=soft_drop_factor,
             max_steps=max_steps,
         )
         self.observation_space = spaces.Dict(
@@ -62,6 +64,7 @@ class ModernTetrisEnv(gym.Env):
         )
         self.action_space = spaces.Discrete(9)
         self._renderer: Optional[PygameBoardRenderer] = None
+        self._skip_frame_advance = False
 
     # ------------------------------------------------------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -75,7 +78,10 @@ class ModernTetrisEnv(gym.Env):
         result = self._rules.step(action)
         reward = self._compute_reward(result)
         info = dict(result.info)
-        self._frames += 1
+        if getattr(self, "_skip_frame_advance", False):
+            pass
+        else:
+            self._frames += 1
         truncated = False
         if self._frame_limit is not None and self._frames >= self._frame_limit:
             truncated = True
@@ -83,15 +89,18 @@ class ModernTetrisEnv(gym.Env):
         if self._frame_limit:
             remaining = max(self._frame_limit - self._frames, 0)
             info["time_remaining_frames"] = remaining
+        self._skip_frame_advance = False
         return result.observation, reward, result.terminated, truncated, info
 
     # ------------------------------------------------------------------
     def render(self):
+        current_piece = self._rules.current_piece()
+        ghost_piece = self._rules.ghost_piece()
+        base_board = self._rules.board_matrix(include_current=False)
         if self.render_mode == "rgb_array":
-            board = self._rules.board_matrix()
-            return utils.render_board_rgb(board)
+            return utils.render_board_rgb(base_board, current=current_piece, ghost=ghost_piece)
         if self.render_mode == "human":
-            rgb = utils.render_board_rgb(self._rules.board_matrix())
+            rgb = utils.render_board_rgb(base_board, current=current_piece, ghost=ghost_piece)
             observation = self._rules.snapshot()
             hud = {
                 "Score": int(observation["score"]),

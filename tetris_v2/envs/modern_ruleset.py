@@ -52,7 +52,8 @@ class ModernRuleset:
         *,
         queue_size: int = 5,
         lock_delay_frames: int = 30,
-        line_clear_delay_frames: int = 20,
+        line_clear_delay_frames: int = 0,
+        soft_drop_factor: float = 6.0,
         max_steps: Optional[int] = None,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
@@ -60,6 +61,7 @@ class ModernRuleset:
         self.lock_delay_frames = lock_delay_frames
         self.line_clear_delay_frames = line_clear_delay_frames
         self.max_steps = max_steps
+        self.soft_drop_factor = float(max(1.0, soft_drop_factor))
         self._rng = rng or np.random.default_rng()
         self._bag_iter = utils.bag_sequence(self._rng)
         self._queue: Deque[int] = deque()
@@ -77,7 +79,7 @@ class ModernRuleset:
         self._level = 0
         self._line_clear_timer = 0
         self._ground_frames = 0
-        self._gravity_timer = 0
+        self._gravity_progress = 0.0
         self._last_action = "none"
         self._fill_queue()
         self.reset()
@@ -104,7 +106,7 @@ class ModernRuleset:
         self._level = 0
         self._line_clear_timer = 0
         self._ground_frames = 0
-        self._gravity_timer = 0
+        self._gravity_progress = 0.0
         self._last_action = "none"
         return self._observe()
 
@@ -119,6 +121,13 @@ class ModernRuleset:
         self._steps += 1
         info: Dict[str, int | float | bool | str] = {}
 
+        if self._current is None:
+            self._spawn_next()
+            if self._current is None:
+                obs = self._observe()
+                info["top_out"] = self._top_out
+                return StepResult(obs, self._top_out, 0, 0, 0, info)
+
         if self._line_clear_timer > 0:
             self._line_clear_timer -= 1
             if self._line_clear_timer == 0:
@@ -130,9 +139,13 @@ class ModernRuleset:
 
         locked = False
         self._last_action = "none"
+        lock_reset = False
+
         def _reset_ground_if_touching(did_move: bool) -> None:
+            nonlocal lock_reset
             if did_move and self._is_touching_ground():
                 self._ground_frames = 0
+                lock_reset = True
 
         if action == MOVE_LEFT:
             moved = self._attempt_move(-1)
@@ -158,6 +171,7 @@ class ModernRuleset:
             if self._attempt_hold():
                 self._last_action = "hold"
                 self._ground_frames = 0
+                lock_reset = True
         elif action == ROTATE_180:
             if self._attempt_rotate_180():
                 self._last_action = "rotate_180"
@@ -165,6 +179,8 @@ class ModernRuleset:
 
         score_delta = 0
         touching_ground = False
+        gravity_interval = self._gravity_interval()
+        moved_down = False
         if action == HARD_DROP:
             distance = utils.hard_drop_distance(self._board, self._current)
             self._current = self._current.moved(d_row=distance)
@@ -172,32 +188,34 @@ class ModernRuleset:
             score_delta += distance * 2
             touching_ground = True
             locked = True
+            self._gravity_progress = 0.0
         else:
-            moved_down = False
-            if action == SOFT_DROP:
-                if self._try_fall(soft_drop=True):
-                    moved_down = True
-                    self._last_action = "soft_drop"
-                    score_delta += utils.soft_drop_points(1)
-                    self._gravity_timer = 0
-                else:
+            increment = self.soft_drop_factor if action == SOFT_DROP else 1.0
+            self._gravity_progress += increment
+            while self._gravity_progress >= gravity_interval:
+                candidate = self._current.moved(d_row=1)
+                if utils.collides(self._board, candidate):
                     touching_ground = True
-            if not moved_down:
-                self._gravity_timer += 1
-                if self._gravity_timer >= self._gravity_interval():
-                    if self._try_fall(soft_drop=False):
-                        moved_down = True
-                    else:
-                        touching_ground = True
-                    self._gravity_timer = 0
+                    self._gravity_progress = gravity_interval
+                    break
+                self._current = candidate
+                moved_down = True
+                lock_reset = True
+                self._gravity_progress -= gravity_interval
+                if action == SOFT_DROP:
+                    score_delta += utils.soft_drop_points(1)
+                    self._last_action = "soft_drop"
             if moved_down:
                 self._ground_frames = 0
+            else:
+                self._gravity_progress = min(self._gravity_progress, gravity_interval)
 
         if not touching_ground and self._is_touching_ground():
             touching_ground = True
 
         if touching_ground and not locked:
-            self._ground_frames += 1
+            if not lock_reset:
+                self._ground_frames += 1
             if self._ground_frames >= self.lock_delay_frames:
                 locked = True
         elif not touching_ground:
@@ -244,7 +262,7 @@ class ModernRuleset:
             self._score += int(score_delta)
             self._hold_available = True
             self._ground_frames = 0
-            self._gravity_timer = 0
+            self._gravity_progress = 0.0
             info["lines_cleared"] = lines_cleared
             if t_spin_result:
                 info["t_spin"] = t_spin_result
@@ -317,23 +335,19 @@ class ModernRuleset:
         return True
 
     def _attempt_rotate_180(self) -> bool:
-        original = self._current
-        if self._double_rotate(1):
+        piece_id = self._current.piece_id
+        if utils.ID_TO_NAME[piece_id] == "O":
             return True
-        self._current = original
-        if self._double_rotate(-1):
-            return True
-        self._current = original
-        return False
-
-    def _double_rotate(self, delta: int) -> bool:
-        first_state = self._current
-        if not self._attempt_rotate(delta):
-            self._current = first_state
-            return False
-        if self._attempt_rotate(delta):
-            return True
-        self._current = first_state
+        rotations = len(utils.PIECE_ROTATIONS[piece_id])
+        from_rotation = self._current.rotation % rotations
+        candidate = self._current.rotated(delta=2)
+        to_rotation = candidate.rotation % rotations
+        kicks = ModernTetrisKicks.kicks_180_for(piece_id, from_rotation, to_rotation)
+        for dx, dy in kicks:
+            shifted = candidate.moved(d_row=-dy, d_col=dx)
+            if not utils.collides(self._board, shifted):
+                self._current = shifted
+                return True
         return False
 
     def _compute_attack(
@@ -368,6 +382,8 @@ class ModernRuleset:
             self._queue.append(next(self._bag_iter))
 
     def _spawn_next(self) -> None:
+        if self._pending_garbage:
+            self._inject_pending_garbage()
         if not self._queue:
             self._fill_queue()
         piece_id = self._queue.popleft()
@@ -417,11 +433,19 @@ class ModernRuleset:
     def snapshot(self) -> Dict[str, np.ndarray]:
         return self._observe()
 
-    def board_matrix(self) -> np.ndarray:
+    def board_matrix(self, *, include_current: bool = True) -> np.ndarray:
         board = self._board.copy()
-        if self._current is not None:
+        if include_current and self._current is not None:
             board = utils.lock_piece(board, self._current)
         return board
+
+    def current_piece(self) -> Optional[utils.PieceState]:
+        return self._current
+
+    def ghost_piece(self) -> Optional[utils.PieceState]:
+        if self._current is None:
+            return None
+        return utils.project_lock_position(self._board, self._current)
 
 
 class ModernTetrisKicks:
@@ -453,3 +477,31 @@ class ModernTetrisKicks:
         if utils.ID_TO_NAME[piece_id] == "I":
             return cls.KICKS_I.get((from_rotation, to_rotation), ((0, 0),))
         return cls.KICKS_JLSTZ.get((from_rotation, to_rotation), ((0, 0),))
+
+    KICKS_180_JLSTZ = {
+        0: ((0, 0), (-1, 0), (1, 0), (0, 1), (0, -1), (-2, 0), (2, 0), (-1, 1), (1, 1), (-1, -1), (1, -1)),
+        1: ((0, 0), (0, 1), (0, -1), (1, 0), (-1, 0), (0, 2), (0, -2), (1, 1), (-1, 1), (1, -1), (-1, -1)),
+        2: ((0, 0), (-1, 0), (1, 0), (0, 1), (0, -1), (-2, 0), (2, 0), (-1, -1), (1, -1), (-1, 1), (1, 1)),
+        3: ((0, 0), (0, 1), (0, -1), (1, 0), (-1, 0), (0, 2), (0, -2), (1, -1), (-1, -1), (1, 1), (-1, 1)),
+    }
+
+    KICKS_180_I = {
+        0: ((0, 0), (-1, 0), (1, 0), (-2, 0), (2, 0), (0, 1), (0, -1), (-3, 0), (3, 0), (0, 2), (0, -2)),
+        1: ((0, 0), (0, 1), (0, -1), (1, 0), (-1, 0), (0, 2), (0, -2), (2, 0), (-2, 0), (0, 3), (0, -3)),
+        2: ((0, 0), (-1, 0), (1, 0), (-2, 0), (2, 0), (0, 1), (0, -1), (-3, 0), (3, 0), (0, 2), (0, -2)),
+        3: ((0, 0), (0, 1), (0, -1), (1, 0), (-1, 0), (0, 2), (0, -2), (2, 0), (-2, 0), (0, 3), (0, -3)),
+    }
+
+    @classmethod
+    def kicks_180_for(
+        cls,
+        piece_id: int,
+        from_rotation: int,
+        to_rotation: int,
+    ) -> Tuple[Tuple[int, int], ...]:
+        name = utils.ID_TO_NAME[piece_id]
+        if name == "I":
+            return cls.KICKS_180_I.get(from_rotation % 4, ((0, 0),))
+        if name == "O":
+            return ((0, 0),)
+        return cls.KICKS_180_JLSTZ.get(from_rotation % 4, ((0, 0),))

@@ -69,8 +69,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--env", choices=("nes", "modern", "versus"), default="nes")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--fps", type=int, default=60, help="Target frames per second.")
-    parser.add_argument("--das", type=int, default=10, help="Frames before auto shift activates.")
-    parser.add_argument("--arr", type=int, default=2, help="Frames between repeated shifts.")
+    parser.add_argument("--das", type=int, default=20, help="Frames before auto shift activates.")
+    parser.add_argument("--arr", type=int, default=4, help="Frames between repeated shifts.")
     parser.add_argument("--quit-key", default="escape", help="Key used to exit (default: escape).")
     return parser.parse_args(argv)
 
@@ -159,21 +159,37 @@ class InputController:
         self.left_pressed = any(keys[key] for key in self.bindings.get("move_left", ()))
         self.right_pressed = any(keys[key] for key in self.bindings.get("move_right", ()))
 
-    def next_action(self) -> int:
+    def next_actions(self) -> List[int]:
+        actions: List[int] = []
         while self.pending:
             cmd = self.pending.popleft()
             action = self.scheme.get(cmd)
-            if action is not None:
-                return action
-        if self.soft_drop_active and "soft_drop" in self.scheme:
-            return self.scheme["soft_drop"]
+            if action is None:
+                continue
+            actions.append(action)
+            if cmd == "hard_drop":
+                actions.extend(self._post_hard_drop_actions())
+                return actions
+
+        lateral = None
         move_left = self.left_repeat.tick(self.left_pressed)
         move_right = self.right_repeat.tick(self.right_pressed)
         if move_left and not move_right and "left" in self.scheme:
-            return self.scheme["left"]
-        if move_right and not move_left and "right" in self.scheme:
-            return self.scheme["right"]
-        return self.scheme["none"]
+            lateral = self.scheme["left"]
+        elif move_right and not move_left and "right" in self.scheme:
+            lateral = self.scheme["right"]
+        if lateral is not None:
+            actions.append(lateral)
+
+        if self.soft_drop_active and "soft_drop" in self.scheme:
+            actions.append(self.scheme["soft_drop"])
+
+        if not actions:
+            actions.append(self.scheme["none"])
+        return actions
+
+    def _post_hard_drop_actions(self) -> List[int]:
+        return []
 
     def clear_reset(self) -> None:
         self.reset_requested = False
@@ -196,13 +212,19 @@ def main(argv=None) -> int:
     clock = pygame.time.Clock()
     while controller.running:
         controller.process_events()
-        action = controller.next_action()
-        obs, reward, terminated, truncated, info = env.step(action)
+        terminated = truncated = False
+        actions = controller.next_actions()
+        for idx, action in enumerate(actions):
+            env.unwrapped._skip_frame_advance = idx > 0
+            obs, reward, terminated, truncated, info = env.step(action)
+            if terminated or truncated:
+                break
+        env.unwrapped._skip_frame_advance = False
         env.render()
         if controller.reset_requested or terminated or truncated:
             controller.clear_reset()
             obs, _ = env.reset()
-        clock.tick(args.fps)
+            clock.tick(args.fps)
     env.close()
     pygame.quit()
     return 0

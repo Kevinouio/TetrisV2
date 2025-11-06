@@ -26,6 +26,7 @@ class VersusEnv(gym.Env):
         opponent_policy: Optional[RandomTetrisAgent] = None,
         reward_mode: str = "attack",
         time_limit_seconds: Optional[float] = 120.0,
+        soft_drop_factor: float = 6.0,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
@@ -34,8 +35,8 @@ class VersusEnv(gym.Env):
             None if time_limit_seconds is None else int(time_limit_seconds * self.metadata["render_fps"])
         )
         self._frames = 0
-        self._player = ModernRuleset()
-        self._opponent = ModernRuleset()
+        self._player = ModernRuleset(soft_drop_factor=soft_drop_factor)
+        self._opponent = ModernRuleset(soft_drop_factor=soft_drop_factor)
         self._latest_opponent_obs: Optional[Dict[str, np.ndarray]] = None
         self._opponent_policy = opponent_policy or RandomTetrisAgent(spaces.Discrete(8))
         base_space = spaces.Dict(
@@ -63,6 +64,7 @@ class VersusEnv(gym.Env):
         )
         self.action_space = spaces.Discrete(9)
         self._renderer: Optional[PygameBoardRenderer] = None
+        self._skip_frame_advance = False
 
     # ------------------------------------------------------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -98,7 +100,9 @@ class VersusEnv(gym.Env):
         info["opponent_top_out"] = opponent_result.terminated
         terminated = player_result.terminated or opponent_result.terminated
 
-        self._frames += 1
+        if not getattr(self, "_skip_frame_advance", False):
+            self._frames += 1
+        self._skip_frame_advance = False
         truncated = False
         if self._frame_limit is not None and self._frames >= self._frame_limit:
             truncated = True
@@ -138,8 +142,16 @@ class VersusEnv(gym.Env):
         return None
 
     def _compose_frame(self) -> Optional[np.ndarray]:
-        player = utils.render_board_rgb(self._player.board_matrix())
-        opponent = utils.render_board_rgb(self._opponent.board_matrix())
+        player = utils.render_board_rgb(
+            self._player.board_matrix(include_current=False),
+            current=self._player.current_piece(),
+            ghost=self._player.ghost_piece(),
+        )
+        opponent = utils.render_board_rgb(
+            self._opponent.board_matrix(include_current=False),
+            current=self._opponent.current_piece(),
+            ghost=self._opponent.ghost_piece(),
+        )
         gap = np.zeros((player.shape[0], 20, 3), dtype=np.uint8)
         return np.concatenate([player, gap, opponent], axis=1)
 
