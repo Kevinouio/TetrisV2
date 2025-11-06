@@ -125,9 +125,16 @@ class VersusEnv(gym.Env):
                 "Pending": int(player_snapshot["pending_garbage"]),
                 "Opp Pending": int(opponent_snapshot["pending_garbage"]),
             }
+            if self._frame_limit:
+                remaining = max(self._frame_limit - self._frames, 0)
+                seconds = remaining / self.metadata["render_fps"]
+                hud["Time"] = f"{int(seconds // 60)}:{int(seconds % 60):02d}"
+            hold_id = int(player_snapshot["hold"])
+            hold_image = utils.render_piece_preview(hold_id) if hold_id >= 0 else None
+            queue_images = [utils.render_piece_preview(pid) for pid in list(self._player._queue)[:3]]
             if self._renderer is None:
                 self._renderer = PygameBoardRenderer(title="Tetris Versus", board_shape=frame.shape[:2])
-            self._renderer.draw(frame, hud)
+            self._renderer.draw(frame, hud, hold_image=hold_image, queue_images=queue_images)
         return None
 
     def _compose_frame(self) -> Optional[np.ndarray]:

@@ -155,6 +155,8 @@ def main(argv=None) -> int:
     args = _parse_args(argv)
     if pygame is None:
         raise SystemExit("pygame is required for human play. Install it with `pip install pygame`.")
+    if not pygame.get_init():
+        pygame.init()
     register_envs()
     env_id = _resolve_env_id(args.env)
     env = gym.make(env_id, render_mode="human")

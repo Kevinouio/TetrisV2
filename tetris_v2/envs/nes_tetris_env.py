@@ -34,7 +34,7 @@ class NesTetrisEnv(gym.Env):
         start_level: int = 0,
         max_steps: Optional[int] = None,
         reward_mode: str = "score",
-        blitz_seconds: Optional[float] = None,
+        blitz_seconds: Optional[float] = 180.0,
     ):
         super().__init__()
         self.render_mode = render_mode
@@ -240,6 +240,10 @@ class NesTetrisEnv(gym.Env):
                 "Lines": self._lines,
                 "Level": self._level,
             }
+            if self._frame_limit:
+                remaining = max(self._frame_limit - self._frames, 0)
+                seconds = remaining / self.metadata["render_fps"]
+                hud["Time"] = f"{int(seconds // 60)}:{int(seconds % 60):02d}"
             if self._renderer is None:
                 self._renderer = PygameBoardRenderer(title="NES Tetris", board_shape=rgb.shape[:2])
             self._renderer.draw(rgb, hud)

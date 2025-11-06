@@ -76,6 +76,7 @@ class ModernRuleset:
         self._level = 0
         self._line_clear_timer = 0
         self._ground_frames = 0
+        self._gravity_timer = 0
         self._last_action = "none"
         self._fill_queue()
         self.reset()
@@ -102,6 +103,7 @@ class ModernRuleset:
         self._level = 0
         self._line_clear_timer = 0
         self._ground_frames = 0
+        self._gravity_timer = 0
         self._last_action = "none"
         return self._observe()
 
@@ -127,41 +129,75 @@ class ModernRuleset:
 
         locked = False
         self._last_action = "none"
+        def _reset_ground_if_touching(did_move: bool) -> None:
+            if did_move and self._is_touching_ground():
+                self._ground_frames = 0
+
         if action == MOVE_LEFT:
-            if self._attempt_move(-1):
+            moved = self._attempt_move(-1)
+            if moved:
                 self._last_action = "move"
+            _reset_ground_if_touching(moved)
         elif action == MOVE_RIGHT:
-            if self._attempt_move(1):
+            moved = self._attempt_move(1)
+            if moved:
                 self._last_action = "move"
+            _reset_ground_if_touching(moved)
         elif action == ROTATE_CW:
-            if self._attempt_rotate(1):
+            rotated = self._attempt_rotate(1)
+            if rotated:
                 self._last_action = "rotate_cw"
+            _reset_ground_if_touching(rotated)
         elif action == ROTATE_CCW:
-            if self._attempt_rotate(-1):
+            rotated = self._attempt_rotate(-1)
+            if rotated:
                 self._last_action = "rotate_ccw"
+            _reset_ground_if_touching(rotated)
         elif action == HOLD:
             if self._attempt_hold():
                 self._last_action = "hold"
+                self._ground_frames = 0
 
+        score_delta = 0
+        touching_ground = False
         if action == HARD_DROP:
             distance = utils.hard_drop_distance(self._board, self._current)
             self._current = self._current.moved(d_row=distance)
             info["hard_drop_distance"] = distance
             score_delta += distance * 2
+            touching_ground = True
             locked = True
         else:
-            moved = self._try_fall(soft_drop=(action == SOFT_DROP))
-            if moved:
-                if action == SOFT_DROP:
+            moved_down = False
+            if action == SOFT_DROP:
+                if self._try_fall(soft_drop=True):
+                    moved_down = True
                     self._last_action = "soft_drop"
                     score_delta += utils.soft_drop_points(1)
+                    self._gravity_timer = 0
+                else:
+                    touching_ground = True
+            if not moved_down:
+                self._gravity_timer += 1
+                if self._gravity_timer >= self._gravity_interval():
+                    if self._try_fall(soft_drop=False):
+                        moved_down = True
+                    else:
+                        touching_ground = True
+                    self._gravity_timer = 0
+            if moved_down:
                 self._ground_frames = 0
-            else:
-                self._ground_frames += 1
-                if self._ground_frames >= self.lock_delay_frames:
-                    locked = True
 
-        score_delta = 0
+        if not touching_ground and self._is_touching_ground():
+            touching_ground = True
+
+        if touching_ground and not locked:
+            self._ground_frames += 1
+            if self._ground_frames >= self.lock_delay_frames:
+                locked = True
+        elif not touching_ground:
+            self._ground_frames = 0
+
         lines_cleared = 0
         attack = 0
         t_spin_result: Optional[str] = None
@@ -203,6 +239,7 @@ class ModernRuleset:
             self._score += int(score_delta)
             self._hold_available = True
             self._ground_frames = 0
+            self._gravity_timer = 0
             info["lines_cleared"] = lines_cleared
             if t_spin_result:
                 info["t_spin"] = t_spin_result
@@ -293,6 +330,13 @@ class ModernRuleset:
         if self._back_to_back and is_b2b_event:
             attack += 1
         return attack
+
+    def _gravity_interval(self) -> int:
+        return max(1, utils.gravity_frames(min(self._level, 29)))
+
+    def _is_touching_ground(self) -> bool:
+        candidate = self._current.moved(d_row=1)
+        return utils.collides(self._board, candidate)
 
     def _fill_queue(self) -> None:
         while len(self._queue) < self.queue_size:

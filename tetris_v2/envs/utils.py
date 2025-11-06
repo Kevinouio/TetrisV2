@@ -18,6 +18,20 @@ PIECE_NAMES = ("I", "O", "T", "S", "Z", "J", "L")
 NAME_TO_ID = {name: idx for idx, name in enumerate(PIECE_NAMES)}
 ID_TO_NAME = {idx: name for idx, name in enumerate(PIECE_NAMES)}
 
+PALETTE = np.array(
+    [
+        [0, 0, 0],
+        [0, 255, 255],  # I
+        [255, 255, 0],  # O
+        [128, 0, 128],  # T
+        [0, 255, 0],  # S
+        [255, 0, 0],  # Z
+        [0, 0, 255],  # J
+        [255, 165, 0],  # L
+    ],
+    dtype=np.uint8,
+)
+
 
 def _base_shapes() -> List[np.ndarray]:
     """Return canonical 4x4 matrices for the seven tetrominoes."""
@@ -325,18 +339,23 @@ def tick_gravity(rows_elapsed: int, level: int) -> bool:
 
 
 def render_board_rgb(board: np.ndarray) -> np.ndarray:
-    palette = np.array(
-        [
-            [0, 0, 0],
-            [0, 255, 255],  # I
-            [255, 255, 0],  # O
-            [128, 0, 128],  # T
-            [0, 255, 0],  # S
-            [255, 0, 0],  # Z
-            [0, 0, 255],  # J
-            [255, 165, 0],  # L
-        ],
-        dtype=np.uint8,
-    )
-    pixels = palette[np.clip(board_visible(board), 0, len(palette) - 1)]
+    pixels = PALETTE[np.clip(board_visible(board), 0, len(PALETTE) - 1)]
     return np.repeat(np.repeat(pixels, 20, axis=0), 20, axis=1)
+
+
+def render_piece_preview(piece_id: int, *, scale: int = 16) -> np.ndarray:
+    canvas = np.zeros((4 * scale, 4 * scale, 3), dtype=np.uint8)
+    if piece_id < 0:
+        return canvas
+    matrix = PIECE_ROTATIONS[piece_id][0]
+    color = PALETTE[piece_id + 1]
+    for r in range(matrix.shape[0]):
+        for c in range(matrix.shape[1]):
+            if matrix[r, c]:
+                canvas[r * scale : (r + 1) * scale, c * scale : (c + 1) * scale] = color
+    border = 2
+    canvas[:border, :, :] = 40
+    canvas[-border:, :, :] = 40
+    canvas[:, :border, :] = 40
+    canvas[:, -border:, :] = 40
+    return canvas

@@ -34,6 +34,8 @@ class ModernTetrisEnv(gym.Env):
         super().__init__()
         self.render_mode = render_mode
         self.reward_mode = reward_mode
+        if time_limit_seconds is None and reward_mode == "score":
+            time_limit_seconds = 180.0
         self._frame_limit = (
             None if time_limit_seconds is None else int(time_limit_seconds * self.metadata["render_fps"])
         )
@@ -98,12 +100,20 @@ class ModernTetrisEnv(gym.Env):
                 "Combo": int(observation["combo"]),
                 "Pending": int(observation["pending_garbage"]),
             }
+            if self._frame_limit:
+                remaining = max(self._frame_limit - self._frames, 0)
+                seconds = remaining / self.metadata["render_fps"]
+                hud["Time"] = f"{int(seconds // 60)}:{int(seconds % 60):02d}"
+            hold_id = int(observation["hold"])
+            hold_image = utils.render_piece_preview(hold_id) if hold_id >= 0 else None
+            queue_ids = list(self._rules._queue)[:3]
+            queue_images = [utils.render_piece_preview(pid) for pid in queue_ids]
             if self._renderer is None:
                 self._renderer = PygameBoardRenderer(
                     title="Modern Tetris",
                     board_shape=rgb.shape[:2],
                 )
-            self._renderer.draw(rgb, hud)
+            self._renderer.draw(rgb, hud, hold_image=hold_image, queue_images=queue_images)
         return None
 
     def close(self):
