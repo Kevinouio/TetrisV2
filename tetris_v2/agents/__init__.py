@@ -1,1 +1,1 @@
-"""Agent training & evaluation (skeleton)."""
+"""Grouped reinforcement-learning agents and supporting modules for Tetris."""

@@ -9,7 +9,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from tetris_v2.rendering import PygameBoardRenderer
-from tetris_v2.agents.random_agent import RandomTetrisAgent
+from tetris_v2.agents.heuristics.random_agent import RandomTetrisAgent
 from tetris_v2.envs import utils
 from tetris_v2.envs.modern_ruleset import ModernRuleset
 
