@@ -238,6 +238,46 @@ def lines_to_next_level(level: int) -> int:
     return 10
 
 
+def is_perfect_clear(board: np.ndarray) -> bool:
+    visible = board_visible(board)
+    return not np.any(visible)
+
+
+def _t_spin_center(piece_state: PieceState) -> Tuple[int, int]:
+    return piece_state.row + 1, piece_state.col + 1
+
+
+def detect_t_spin(board: np.ndarray, piece_state: PieceState, last_action: str) -> str | None:
+    """Return 'tspin', 'mini', or None if the placement is not a T-Spin."""
+    if piece_state.piece_id != NAME_TO_ID["T"]:
+        return None
+    if last_action not in {"rotate_cw", "rotate_ccw"}:
+        return None
+    center_row, center_col = _t_spin_center(piece_state)
+    corner_offsets = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+    filled_corners = 0
+    for dr, dc in corner_offsets:
+        r, c = center_row + dr, center_col + dc
+        if r < 0 or not within_bounds(r, c) or board[r, c] != 0:
+            filled_corners += 1
+    if filled_corners < 3:
+        return None
+    front_offsets = {
+        0: [(1, -1), (1, 1)],
+        1: [(-1, 1), (1, 1)],
+        2: [(-1, -1), (-1, 1)],
+        3: [(-1, -1), (1, -1)],
+    }
+    rotation = piece_state.rotation % 4
+    filled_front = 0
+    for dr, dc in front_offsets[rotation]:
+        r, c = center_row + dr, center_col + dc
+        if r < 0 or not within_bounds(r, c) or board[r, c] != 0:
+            filled_front += 1
+    is_mini = filled_front < 2
+    return "mini" if is_mini else "tspin"
+
+
 def create_board() -> np.ndarray:
     return np.zeros((TOTAL_ROWS, BOARD_WIDTH), dtype=np.int8)
 

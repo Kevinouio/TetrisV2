@@ -10,6 +10,7 @@ from gymnasium import spaces
 from gymnasium.utils import seeding
 
 from . import utils
+from tetris_v2.rendering import PygameBoardRenderer
 
 Action = int
 
@@ -32,11 +33,18 @@ class NesTetrisEnv(gym.Env):
         seed: Optional[int] = None,
         start_level: int = 0,
         max_steps: Optional[int] = None,
+        reward_mode: str = "score",
+        blitz_seconds: Optional[float] = None,
     ):
         super().__init__()
         self.render_mode = render_mode
         self.start_level = start_level
         self.max_steps = max_steps
+        self.reward_mode = reward_mode
+        self._frame_limit = (
+            None if blitz_seconds is None else int(blitz_seconds * self.metadata["render_fps"])
+        )
+        self._frames = 0
 
         self.observation_space = spaces.Dict(
             {
@@ -62,6 +70,7 @@ class NesTetrisEnv(gym.Env):
         self._steps = 0
         self._gravity_timer = 0
         self._top_out = False
+        self._renderer: Optional[PygameBoardRenderer] = None
 
     # ------------------------------------------------------------------
     # Gym API
@@ -86,6 +95,7 @@ class NesTetrisEnv(gym.Env):
         self._next_piece = utils.uniform_piece_id(self._rng)
         if utils.collides(self._board, self._current):
             self._top_out = True
+        self._frames = 0
         return self._observe(), {}
 
     def step(self, action: Action):
@@ -170,12 +180,20 @@ class NesTetrisEnv(gym.Env):
 
         terminated = self._top_out
         truncated = bool(self.max_steps and self._steps >= self.max_steps)
+        self._frames += 1
+        if self._frame_limit is not None and self._frames >= self._frame_limit:
+            truncated = True
+            info["time_limit_reached"] = True
 
         obs = self._observe()
         info["level"] = int(self._level)
         info["score"] = int(self._score)
         info["lines"] = int(self._lines)
         info["top_out"] = terminated
+        if self._frame_limit:
+            info["time_remaining_frames"] = max(self._frame_limit - self._frames, 0)
+
+        reward = self._select_reward(score_delta, lines_cleared, reward)
         return obs, float(reward), terminated, truncated, info
 
     # ------------------------------------------------------------------
@@ -214,16 +232,33 @@ class NesTetrisEnv(gym.Env):
     # ------------------------------------------------------------------
     def render(self):
         if self.render_mode == "rgb_array":
-            board = self._board.copy()
-            if not self._top_out and self._current is not None:
-                board = utils.lock_piece(board, self._current)
-            return utils.render_board_rgb(board)
+            return utils.render_board_rgb(self._board_with_current())
         if self.render_mode == "human":
-            obs = self._observe()
-            board = obs["board"]
-            display = "\n".join("".join(" .:#%&@AB"[cell] for cell in row) for row in board[::-1])
-            print(display)
+            rgb = utils.render_board_rgb(self._board_with_current())
+            hud = {
+                "Score": self._score,
+                "Lines": self._lines,
+                "Level": self._level,
+            }
+            if self._renderer is None:
+                self._renderer = PygameBoardRenderer(title="NES Tetris", board_shape=rgb.shape[:2])
+            self._renderer.draw(rgb, hud)
         return None
 
     def close(self):
-        pass
+        if self._renderer:
+            self._renderer.close()
+            self._renderer = None
+
+    def _board_with_current(self) -> np.ndarray:
+        board = self._board.copy()
+        if not self._top_out and self._current is not None:
+            board = utils.lock_piece(board, self._current)
+        return board
+
+    def _select_reward(self, score_delta: int, lines_cleared: int, default_reward: float) -> float:
+        if self.reward_mode == "score":
+            return score_delta / 100.0
+        if self.reward_mode == "lines":
+            return float(lines_cleared)
+        return float(default_reward)

@@ -19,3 +19,12 @@ def register_envs():
         )
     except Exception:
         pass
+
+    # Versus env
+    try:
+        register(
+            id="KevinVersus/Tetris-v0",
+            entry_point="tetris_v2.adversarial.versus_env:VersusEnv",
+        )
+    except Exception:
+        pass

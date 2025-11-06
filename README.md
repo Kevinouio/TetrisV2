@@ -19,6 +19,23 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Human Play / UI
+```bash
+python -m tetris_v2.scripts.play_human --env modern --fps 60
+```
+- NES rules: `--env nes`
+- Modern rules: `--env modern`
+- Versus (random opponent): `--env versus`
+
+Controls (real-time, DAS/ARR aware):
+- `Left/Right` or `A/D`: lateral movement (auto repeats after DAS+ARR)
+- `Down`/`S`: soft drop
+- `Space`: hard drop
+- `W`/`Up`/`X`: rotate clockwise
+- `Z`/`Ctrl`: rotate counter-clockwise (modern/versus)
+- `C`: hold (modern/versus)
+- `R`: reset, `Esc`/`Q`: quit
+
 ## Milestones
 1. Implement `NesTetrisEnv` under `tetris_v2/envs/nes_tetris_env.py` (Gymnasium)
 2. Add human play loop in `tetris_v2/scripts/play_human.py`
