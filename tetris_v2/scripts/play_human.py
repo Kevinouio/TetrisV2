@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict, List, Optional
 
 import gymnasium as gym
 
@@ -35,9 +35,33 @@ ACTION_SCHEMES: Dict[str, Dict[str, int]] = {
         "soft_drop": 5,
         "hard_drop": 6,
         "hold": 7,
+        "rotate_180": 8,
     },
 }
 ACTION_SCHEMES["versus"] = ACTION_SCHEMES["modern"]
+
+if pygame:
+    KEY_BINDINGS: Dict[str, Dict[str, List[int]]] = {
+        "modern": {
+            "move_left": [pygame.K_a],
+            "move_right": [pygame.K_d],
+            "soft_drop": [pygame.K_LSHIFT, pygame.K_RSHIFT],
+            "hard_drop": [pygame.K_SPACE],
+            "rotate_ccw": [pygame.K_LEFT],
+            "rotate_cw": [pygame.K_RIGHT],
+            "rotate_180": [pygame.K_UP],
+            "hold": [pygame.K_c],
+        },
+        "nes": {
+            "move_left": [pygame.K_LEFT, pygame.K_a],
+            "move_right": [pygame.K_RIGHT, pygame.K_d],
+            "soft_drop": [pygame.K_DOWN, pygame.K_s],
+            "hard_drop": [pygame.K_SPACE],
+            "rotate_cw": [pygame.K_UP, pygame.K_w],
+        },
+    }
+else:
+    KEY_BINDINGS = {}
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -93,11 +117,15 @@ class InputController:
 
     def __init__(self, env_key: str, *, das: int, arr: int) -> None:
         self.env_key = env_key
-        self.scheme = ACTION_SCHEMES["modern" if env_key in ("modern", "versus") else "nes"]
+        scheme_key = "modern" if env_key in ("modern", "versus") else "nes"
+        self.scheme = ACTION_SCHEMES[scheme_key]
+        self.bindings = KEY_BINDINGS.get(scheme_key, {})
         self.left_repeat = KeyRepeat(das=das, arr=arr)
         self.right_repeat = KeyRepeat(das=das, arr=arr)
         self.pending: Deque[str] = deque()
         self.soft_drop_active = False
+        self.left_pressed = False
+        self.right_pressed = False
         self.running = True
         self.reset_requested = False
 
@@ -110,26 +138,26 @@ class InputController:
                     self.running = False
                 elif event.key == pygame.K_r:
                     self.reset_requested = True
-                elif event.key == pygame.K_SPACE:
+                elif self._binding_contains("hard_drop", event.key):
                     self.pending.append("hard_drop")
-                elif event.key in (pygame.K_c,):
-                    if "hold" in self.scheme:
-                        self.pending.append("hold")
-                elif event.key in (pygame.K_UP, pygame.K_w, pygame.K_x):
+                elif self._binding_contains("hold", event.key) and "hold" in self.scheme:
+                    self.pending.append("hold")
+                elif self._binding_contains("rotate_cw", event.key):
                     self.pending.append("rotate_cw")
-                elif event.key in (pygame.K_z, pygame.K_LCTRL, pygame.K_RCTRL):
-                    if "rotate_ccw" in self.scheme:
-                        self.pending.append("rotate_ccw")
+                elif self._binding_contains("rotate_ccw", event.key) and "rotate_ccw" in self.scheme:
+                    self.pending.append("rotate_ccw")
+                elif self._binding_contains("rotate_180", event.key) and "rotate_180" in self.scheme:
+                    self.pending.append("rotate_180")
             elif event.type == pygame.KEYUP:
-                if event.key in (pygame.K_LEFT, pygame.K_a):
+                if self._binding_contains("move_left", event.key):
                     self.left_repeat.tick(False)
-                elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                elif self._binding_contains("move_right", event.key):
                     self.right_repeat.tick(False)
 
         keys = pygame.key.get_pressed()
-        self.soft_drop_active = keys[pygame.K_DOWN] or keys[pygame.K_s]
-        self.left_pressed = keys[pygame.K_LEFT] or keys[pygame.K_a]
-        self.right_pressed = keys[pygame.K_RIGHT] or keys[pygame.K_d]
+        self.soft_drop_active = any(keys[key] for key in self.bindings.get("soft_drop", ()))
+        self.left_pressed = any(keys[key] for key in self.bindings.get("move_left", ()))
+        self.right_pressed = any(keys[key] for key in self.bindings.get("move_right", ()))
 
     def next_action(self) -> int:
         while self.pending:
@@ -149,6 +177,9 @@ class InputController:
 
     def clear_reset(self) -> None:
         self.reset_requested = False
+
+    def _binding_contains(self, action: str, key: int) -> bool:
+        return key in self.bindings.get(action, ())
 
 
 def main(argv=None) -> int:

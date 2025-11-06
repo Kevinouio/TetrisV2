@@ -61,7 +61,7 @@ class VersusEnv(gym.Env):
                 "opponent_back_to_back": spaces.Discrete(2),
             }
         )
-        self.action_space = spaces.Discrete(8)
+        self.action_space = spaces.Discrete(9)
         self._renderer: Optional[PygameBoardRenderer] = None
 
     # ------------------------------------------------------------------

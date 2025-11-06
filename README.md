@@ -28,13 +28,15 @@ python -m tetris_v2.scripts.play_human --env modern --fps 60
 - Versus (random opponent): `--env versus`
 
 Controls (real-time, DAS/ARR aware):
-- `Left/Right` or `A/D`: lateral movement (auto repeats after DAS+ARR)
-- `Down`/`S`: soft drop
-- `Space`: hard drop
-- `W`/`Up`/`X`: rotate clockwise
-- `Z`/`Ctrl`: rotate counter-clockwise (modern/versus)
-- `C`: hold (modern/versus)
+- Modern / Versus:
+  - Move Left `a`, Move Right `d`
+  - Soft Drop `Shift`, Hard Drop `Space`
+  - Rotate Left `←`, Rotate Right `→`, Rotate 180 `↑`
+  - Hold `c`
+- NES keeps the classic bindings (`←/→` move, `↑` rotate, `Space` hard drop, `S`/`↓` soft drop)
 - `R`: reset, `Esc`/`Q`: quit
+
+Want different keys? Edit the `KEY_BINDINGS` dictionary near the top of `tetris_v2/scripts/play_human.py` to remap any action (bindings are grouped per ruleset profile). Save the file and rerun the script to pick up the new layout.
 
 ## Milestones
 1. Implement `NesTetrisEnv` under `tetris_v2/envs/nes_tetris_env.py` (Gymnasium)

@@ -18,6 +18,7 @@ ROTATE_CCW = 4
 SOFT_DROP = 5
 HARD_DROP = 6
 HOLD = 7
+ROTATE_180 = 8
 
 LINE_SCORE = {1: 100, 2: 300, 3: 500, 4: 800}
 TSPIN_SCORE = {
@@ -157,6 +158,10 @@ class ModernRuleset:
             if self._attempt_hold():
                 self._last_action = "hold"
                 self._ground_frames = 0
+        elif action == ROTATE_180:
+            if self._attempt_rotate_180():
+                self._last_action = "rotate_180"
+                _reset_ground_if_touching(True)
 
         score_delta = 0
         touching_ground = False
@@ -310,6 +315,26 @@ class ModernRuleset:
         if utils.collides(self._board, self._current):
             self._top_out = True
         return True
+
+    def _attempt_rotate_180(self) -> bool:
+        original = self._current
+        if self._double_rotate(1):
+            return True
+        self._current = original
+        if self._double_rotate(-1):
+            return True
+        self._current = original
+        return False
+
+    def _double_rotate(self, delta: int) -> bool:
+        first_state = self._current
+        if not self._attempt_rotate(delta):
+            self._current = first_state
+            return False
+        if self._attempt_rotate(delta):
+            return True
+        self._current = first_state
+        return False
 
     def _compute_attack(
         self,
