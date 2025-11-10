@@ -1,4 +1,4 @@
-# TetrisV2 — Research-Grade Tetris RL Suite
+# TetrisV2 
 
 TetrisV2 is a practical playground for building state‑of‑the‑art Tetris agents.
 It provides faithful environments (NES, modern/SRS, and versus), a real‑time
