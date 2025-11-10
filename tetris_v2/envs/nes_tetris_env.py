@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import gymnasium as gym
 import numpy as np
@@ -35,6 +35,7 @@ class NesTetrisEnv(gym.Env):
         max_steps: Optional[int] = None,
         reward_mode: str = "score",
         blitz_seconds: Optional[float] = 180.0,
+        preview_pieces: int = 1,
     ):
         super().__init__()
         self.render_mode = render_mode
@@ -46,11 +47,17 @@ class NesTetrisEnv(gym.Env):
         )
         self._frames = 0
 
+        self.preview_pieces = max(1, int(preview_pieces))
         self.observation_space = spaces.Dict(
             {
                 "board": spaces.Box(low=0, high=7, shape=(20, 10), dtype=np.int8),
                 "current": spaces.Box(low=-10_000, high=10_000, shape=(4,), dtype=np.int16),
-                "next": spaces.Discrete(7),
+                "next": spaces.Box(
+                    low=0,
+                    high=7,
+                    shape=(self.preview_pieces,),
+                    dtype=np.int8,
+                ),
                 "level": spaces.Box(low=0, high=1000, shape=(), dtype=np.int16),
                 "lines": spaces.Box(low=0, high=10_000, shape=(), dtype=np.int16),
                 "score": spaces.Box(low=0, high=2**31 - 1, shape=(), dtype=np.int32),
@@ -62,7 +69,8 @@ class NesTetrisEnv(gym.Env):
 
         self._board = utils.create_board()
         self._current = utils.spawn_piece(utils.uniform_piece_id(self._rng))
-        self._next_piece = utils.uniform_piece_id(self._rng)
+        self._preview_queue: List[int] = []
+        self._refill_preview_queue()
         self._level = start_level
         self._lines = 0
         self._lines_until_level_up = utils.lines_to_next_level(self._level)
@@ -92,7 +100,7 @@ class NesTetrisEnv(gym.Env):
         self._gravity_timer = 0
         self._top_out = False
         self._current = utils.spawn_piece(utils.uniform_piece_id(self._rng))
-        self._next_piece = utils.uniform_piece_id(self._rng)
+        self._refill_preview_queue()
         if utils.collides(self._board, self._current):
             self._top_out = True
         self._frames = 0
@@ -104,7 +112,8 @@ class NesTetrisEnv(gym.Env):
 
         assert self.action_space.contains(action), f"invalid action {action}"
 
-        reward = 0.0
+        drop_reward = 0.0  # shaped reward for agent incentives
+        drop_score = 0  # integer points added to NES scoreboard for drops
         info: Dict[str, float] = {}
         self._steps += 1
 
@@ -130,7 +139,9 @@ class NesTetrisEnv(gym.Env):
             distance = utils.hard_drop_distance(self._board, self._current)
             self._current = self._current.moved(d_row=distance)
             if distance > 0:
-                reward += utils.soft_drop_points(distance) * 2.0
+                drop_points = utils.soft_drop_points(distance) * 2
+                drop_reward += float(drop_points)
+                drop_score += drop_points
             locked = True
         else:
             if action == self.SOFT_DROP:
@@ -152,7 +163,9 @@ class NesTetrisEnv(gym.Env):
                     self._gravity_timer = 0
 
         if distance_soft:
-            reward += utils.soft_drop_points(distance_soft)
+            drop_points = utils.soft_drop_points(distance_soft)
+            drop_reward += float(drop_points)
+            drop_score += drop_points
 
         lines_cleared = 0
         score_delta = 0
@@ -172,8 +185,10 @@ class NesTetrisEnv(gym.Env):
             if utils.collides(self._board, self._current):
                 self._top_out = True
 
+        if drop_score:
+            self._score += drop_score
+            info["drop_points"] = int(drop_score)
         if score_delta:
-            reward += score_delta / 100.0
             info["score_delta"] = float(score_delta)
         if lines_cleared:
             info["lines_cleared"] = int(lines_cleared)
@@ -193,15 +208,25 @@ class NesTetrisEnv(gym.Env):
         if self._frame_limit:
             info["time_remaining_frames"] = max(self._frame_limit - self._frames, 0)
 
-        reward = self._select_reward(score_delta, lines_cleared, reward)
+        reward = self._select_reward(score_delta, lines_cleared, drop_reward, drop_score)
         return obs, float(reward), terminated, truncated, info
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _spawn_next(self) -> None:
-        self._current = utils.spawn_piece(self._next_piece)
-        self._next_piece = utils.uniform_piece_id(self._rng)
+        next_piece = self._consume_preview()
+        self._current = utils.spawn_piece(next_piece)
+
+    def _refill_preview_queue(self) -> None:
+        self._preview_queue = [utils.uniform_piece_id(self._rng) for _ in range(self.preview_pieces)]
+
+    def _consume_preview(self) -> int:
+        if not self._preview_queue:
+            self._refill_preview_queue()
+        next_piece = self._preview_queue.pop(0)
+        self._preview_queue.append(utils.uniform_piece_id(self._rng))
+        return next_piece
 
     def _observe(self) -> Dict[str, np.ndarray]:
         board = utils.board_visible(self._board)
@@ -210,6 +235,7 @@ class NesTetrisEnv(gym.Env):
             for row, col in utils.iter_filled_cells(current):
                 if row >= utils.HIDDEN_ROWS:
                     board[row - utils.HIDDEN_ROWS, col] = current.piece_id + 1
+        preview = np.array(self._preview_queue, dtype=np.int8)
         return {
             "board": board.astype(np.int8),
             "current": np.array(
@@ -221,7 +247,7 @@ class NesTetrisEnv(gym.Env):
                 ],
                 dtype=np.int16,
             ),
-            "next": np.int8(self._next_piece),
+            "next": preview,
             "level": np.int16(self._level),
             "lines": np.int16(self._lines),
             "score": np.int32(self._score),
@@ -246,7 +272,10 @@ class NesTetrisEnv(gym.Env):
                 hud["Time"] = f"{int(seconds // 60)}:{int(seconds % 60):02d}"
             if self._renderer is None:
                 self._renderer = PygameBoardRenderer(title="NES Tetris", board_shape=rgb.shape[:2])
-            self._renderer.draw(rgb, hud)
+            queue_images = [
+                utils.render_piece_preview(pid) for pid in self._preview_queue[: self.preview_pieces]
+            ]
+            self._renderer.draw(rgb, hud, queue_images=queue_images)
         return None
 
     def close(self):
@@ -260,9 +289,15 @@ class NesTetrisEnv(gym.Env):
             board = utils.lock_piece(board, self._current)
         return board
 
-    def _select_reward(self, score_delta: int, lines_cleared: int, default_reward: float) -> float:
+    def _select_reward(
+        self,
+        score_delta: int,
+        lines_cleared: int,
+        drop_reward: float,
+        drop_score: int,
+    ) -> float:
         if self.reward_mode == "score":
-            return score_delta / 100.0
+            return (score_delta + drop_score) / 100.0
         if self.reward_mode == "lines":
             return float(lines_cleared)
-        return float(default_reward)
+        return float(drop_reward)

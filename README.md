@@ -13,9 +13,9 @@ The goal is twofold:
 
 ## What’s In The Box
 - Environments (`tetris_v2/envs/`)
-  - NES ruleset: gravity table, scoring, no hold, no kicks.
-  - Modern ruleset: SRS kicks, 7‑bag, hold, combos/B2B, ghost piece, lock delay,
-    soft‑drop factor, rgb/console rendering.
+  - NES ruleset: gravity table, scoring, no hold/kicks, single next-piece preview.
+  - Modern ruleset: SRS kicks, 7‑bag, hold, **5-piece preview queue**, combos/B2B,
+    ghost piece, lock delay, soft-drop factor, rgb/console rendering.
   - Versus: two modern boards with garbage exchange and a default random
     sparring partner.
 - Real‑time play (`tetris_v2/scripts/play_human.py`)
@@ -54,14 +54,14 @@ python -m tetris_v2.scripts.play_human --env modern --fps 60
   `soft_drop_factor` (see code) and score‑blitz timers.
 
 ## Train (quick examples)
-Baseline DQN with SB3 (compat shim kept while native agents are developed):
+Scratch DQN trainer (fully native PyTorch implementation):
 ```bash
 python -m tetris_v2.agents.dqn.train --env modern --total-timesteps 500000 \
-  --learning-rate 2.5e-4 --n-envs 1 --seed 42 --log-dir runs/dqn
+  --learning-rate 2.5e-4 --seed 42 --log-dir runs/dqn_modern
 ```
-Evaluate a checkpoint:
+Evaluate a saved policy:
 ```bash
-python -m tetris_v2.agents.dqn.eval path/to/checkpoint.zip --env modern --render
+python -m tetris_v2.agents.dqn.eval runs/dqn_modern/final_model.pt --env modern --render
 ```
 
 ## Repository Layout

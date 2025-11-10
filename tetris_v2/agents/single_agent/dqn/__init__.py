@@ -1,3 +1,10 @@
-"""DQN utilities for TetrisV2."""
+"""Native DQN toolkit exports."""
 
-from .models import build_dqn_agent
+from .models import AgentConfig, DQNAgent, ObservationProcessor, ReplayBuffer
+
+__all__ = [
+    "AgentConfig",
+    "DQNAgent",
+    "ObservationProcessor",
+    "ReplayBuffer",
+]

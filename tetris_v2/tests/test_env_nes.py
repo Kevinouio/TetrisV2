@@ -9,6 +9,7 @@ def test_nes_env_step():
     env = NesTetrisEnv()
     obs, _ = env.reset(seed=0)
     assert obs["board"].shape == (20, 10)
+    assert obs["next"].shape == (1,)
     next_obs, reward, terminated, truncated, info = env.step(0)
     assert "board" in next_obs
     assert isinstance(reward, float)

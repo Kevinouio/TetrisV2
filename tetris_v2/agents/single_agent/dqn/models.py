@@ -1,107 +1,299 @@
-"""Utilities for building DQN agents tailored to Tetris observations."""
+"""Native PyTorch DQN utilities (observation encoder, replay buffer, agent)."""
 
 from __future__ import annotations
 
-import sys
-from typing import Any, Dict, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
 from gymnasium import spaces
-
-try:
-    import torch as th
-    from torch import nn
-    from stable_baselines3 import DQN
-    from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-except ImportError as exc:  # pragma: no cover - optional dependency
-    DQN = None  # type: ignore[assignment]
-    BaseFeaturesExtractor = object  # type: ignore[assignment]
-    th = None  # type: ignore[assignment]
-    nn = None  # type: ignore[assignment]
-    OPTIONAL_IMPORT_ERROR = exc
-else:
-    OPTIONAL_IMPORT_ERROR = None
+from torch import nn
+from torch.nn import functional as F
 
 
-def _flatten_dim(space: spaces.Space) -> int:
-    if isinstance(space, spaces.Discrete):
-        return 1
-    return int(np.prod(space.shape))
+DEFAULT_NORMALISATION_FACTORS: Dict[str, np.ndarray | float] = {
+    "current": np.array([6.0, 3.0, 20.0, 10.0], dtype=np.float32),
+    "next": 6.0,
+    "queue": 6.0,
+    "hold": 6.0,
+    "combo": 10.0,
+    "back_to_back": 1.0,
+    "level": 30.0,
+    "lines": 200.0,
+    "score": 100_000.0,
+    "pending_garbage": 20.0,
+    "opponent_pending": 20.0,
+    "opponent_combo": 10.0,
+    "opponent_back_to_back": 1.0,
+}
 
 
-if DQN is not None:
+class ObservationProcessor:
+    """Flattens and normalises dict observations for the agent."""
 
-    class BoardFeatureExtractor(BaseFeaturesExtractor):
-        """Simple feature extractor that flattens dict observations."""
+    def __init__(
+        self,
+        observation_space: spaces.Dict,
+        *,
+        normalization_overrides: Optional[Dict[str, np.ndarray | float]] = None,
+        clip_range: Tuple[float, float] = (-1.0, 1.0),
+    ):
+        if not isinstance(observation_space, spaces.Dict):
+            raise TypeError("ObservationProcessor requires a Dict observation space.")
+        self.observation_space = observation_space
+        self.keys = tuple(observation_space.spaces.keys())
+        self._sizes: Dict[str, int] = {}
+        flat_dim = 0
+        for key in self.keys:
+            space = observation_space.spaces[key]
+            if isinstance(space, spaces.Discrete):
+                size = 1
+            else:
+                shape = getattr(space, "shape", ()) or ()
+                size = int(np.prod(shape, dtype=int)) if shape else 1
+            self._sizes[key] = size
+            flat_dim += size
+        self.flat_dim = flat_dim
+        self._clip_range = clip_range
+        self._normalisers: Dict[str, np.ndarray] = {}
+        overrides = normalization_overrides or {}
+        for key in self.keys:
+            factor = overrides.get(key, DEFAULT_NORMALISATION_FACTORS.get(key))
+            if factor is None:
+                continue
+            arr = np.asarray(factor, dtype=np.float32)
+            arr = np.where(arr == 0.0, 1.0, np.abs(arr))
+            self._normalisers[key] = arr
 
-        def __init__(self, observation_space: spaces.Dict):
-            total_dim = sum(_flatten_dim(space) for space in observation_space.spaces.values())
-            super().__init__(observation_space, features_dim=total_dim)
+    def flatten(self, observation: Dict[str, Any]) -> np.ndarray:
+        """Convert a dict observation into a flat, scaled float32 vector."""
+        flat = np.zeros(self.flat_dim, dtype=np.float32)
+        offset = 0
+        low, high = self._clip_range
+        for key in self.keys:
+            value = observation[key]
+            arr = np.asarray(value, dtype=np.float32).reshape(-1)
+            norm = self._normalisers.get(key)
+            if norm is not None:
+                arr = arr / norm
+            arr = np.clip(arr, low, high)
+            target = self._sizes[key]
+            if arr.size < target:
+                padded = np.zeros(target, dtype=np.float32)
+                padded[: arr.size] = arr
+                arr = padded
+            elif arr.size > target:
+                arr = arr[:target]
+            flat[offset : offset + target] = arr
+            offset += target
+        return flat
 
-        def forward(self, observations: Dict[str, th.Tensor]) -> th.Tensor:
-            parts = []
-            for key, value in observations.items():
-                tensor = value
-                if tensor.dim() > 2:
-                    tensor = tensor.flatten(start_dim=1)
-                else:
-                    tensor = tensor.float().view(tensor.shape[0], -1)
-                # Basic scaling for discrete signals
-                if key == "board":
-                    tensor = tensor / 7.0
-                parts.append(tensor)
-            return th.cat(parts, dim=1)
 
-else:  # pragma: no cover - fallback for missing deps
+class ReplayBuffer:
+    """Simple uniform replay buffer."""
 
-    class BoardFeatureExtractor:  # type: ignore[misc]
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            raise OPTIONAL_IMPORT_ERROR  # type: ignore[misc]
+    def __init__(self, capacity: int, obs_dim: int):
+        self.capacity = int(capacity)
+        self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.next_obs = np.zeros((capacity, obs_dim), dtype=np.float32)
+        self.actions = np.zeros((capacity,), dtype=np.int64)
+        self.rewards = np.zeros((capacity,), dtype=np.float32)
+        self.dones = np.zeros((capacity,), dtype=np.float32)
+        self.size = 0
+        self.pos = 0
+
+    def add(self, obs: np.ndarray, action: int, reward: float, next_obs: np.ndarray, done: bool) -> None:
+        idx = self.pos
+        self.obs[idx] = obs
+        self.next_obs[idx] = next_obs
+        self.actions[idx] = action
+        self.rewards[idx] = reward
+        self.dones[idx] = float(done)
+        self.pos = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int) -> Dict[str, np.ndarray]:
+        if self.size == 0:
+            raise ValueError("Cannot sample from an empty buffer.")
+        batch_indices = np.random.randint(0, self.size, size=int(batch_size))
+        return {
+            "obs": self.obs[batch_indices],
+            "next_obs": self.next_obs[batch_indices],
+            "actions": self.actions[batch_indices],
+            "rewards": self.rewards[batch_indices],
+            "dones": self.dones[batch_indices],
+        }
 
 
-def build_dqn_agent(
-    env,
-    *,
-    learning_rate: float = 2.5e-4,
-    buffer_size: int = 200_000,
-    exploration_fraction: float = 0.2,
-    exploration_final_eps: float = 0.05,
-    batch_size: int = 256,
-    gamma: float = 0.99,
-    target_update_interval: int = 10_000,
-    net_arch: Sequence[int] = (512, 256),
-    device: Optional[str] = None,
-    **kwargs: Any,
-):
-    """Construct a configured SB3 DQN agent.
+class QNetwork(nn.Module):
+    """Feed-forward Q-network with optional dueling heads."""
 
-    Parameters mirror ``stable_baselines3.DQN`` for convenience.
-    """
-    if DQN is None or OPTIONAL_IMPORT_ERROR is not None:  # pragma: no cover - optional
-        raise ImportError(
-            "stable-baselines3[DQN] and PyTorch are required for training. "
-            "Install them with `pip install stable-baselines3[extra] torch`."
-        ) from OPTIONAL_IMPORT_ERROR
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_sizes: Sequence[int],
+        *,
+        dueling: bool = True,
+    ):
+        super().__init__()
+        layers: list[nn.Module] = []
+        dims = [input_dim] + list(hidden_sizes)
+        for i in range(len(hidden_sizes)):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            layers.append(nn.ReLU())
+        self.feature_extractor = nn.Sequential(*layers) if layers else nn.Identity()
+        last_dim = dims[-1] if hidden_sizes else input_dim
+        self.dueling = dueling
+        if dueling:
+            self.value_head = nn.Linear(last_dim, 1)
+            self.advantage_head = nn.Linear(last_dim, output_dim)
+        else:
+            self.output_head = nn.Linear(last_dim, output_dim)
 
-    policy_kwargs: Dict[str, Any] = dict(
-        features_extractor_class=BoardFeatureExtractor,
-        net_arch=list(net_arch),
-        activation_fn=nn.ReLU,
-    )
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_uniform_(module.weight, nonlinearity="relu")
+                nn.init.zeros_(module.bias)
 
-    model = DQN(
-        "MultiInputPolicy",
-        env,
-        learning_rate=learning_rate,
-        buffer_size=buffer_size,
-        exploration_fraction=exploration_fraction,
-        exploration_final_eps=exploration_final_eps,
-        batch_size=batch_size,
-        gamma=gamma,
-        target_update_interval=target_update_interval,
-        policy_kwargs=policy_kwargs,
-        verbose=1,
-        device=device or ("cuda" if th and th.cuda.is_available() else "cpu"),
-        **kwargs,
-    )
-    return model
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        features = self.feature_extractor(x)
+        if self.dueling:
+            advantage = self.advantage_head(features)
+            value = self.value_head(features)
+            advantage = advantage - advantage.mean(dim=1, keepdim=True)
+            return value + advantage
+        return self.output_head(features)
+
+
+@dataclass
+class AgentConfig:
+    obs_dim: int
+    action_dim: int
+    hidden_sizes: Tuple[int, ...] = (512, 256)
+    gamma: float = 0.99
+    learning_rate: float = 2.5e-4
+    target_sync_interval: int = 1_000
+    max_grad_norm: float = 5.0
+    device: Optional[str] = None
+    use_dueling: bool = True
+    use_double_q: bool = True
+
+
+class DQNAgent:
+    """Minimal DQN agent with hard target updates."""
+
+    def __init__(self, config: AgentConfig):
+        self.config = config
+        device = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device)
+        self.obs_dim = int(config.obs_dim)
+        self.action_dim = int(config.action_dim)
+        self.hidden_sizes = tuple(config.hidden_sizes)
+        self.gamma = float(config.gamma)
+        self.learning_rate = float(config.learning_rate)
+        self.target_sync_interval = int(config.target_sync_interval)
+        self.max_grad_norm = float(config.max_grad_norm)
+        self.use_dueling = bool(config.use_dueling)
+        self.use_double_q = bool(config.use_double_q)
+
+        self.q_network = QNetwork(
+            self.obs_dim,
+            self.action_dim,
+            self.hidden_sizes,
+            dueling=self.use_dueling,
+        ).to(self.device)
+        self.target_network = QNetwork(
+            self.obs_dim,
+            self.action_dim,
+            self.hidden_sizes,
+            dueling=self.use_dueling,
+        ).to(self.device)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=self.learning_rate)
+        self.train_steps = 0
+
+    def act(
+        self,
+        obs: np.ndarray,
+        *,
+        epsilon: float = 0.0,
+        rng: Optional[np.random.Generator] = None,
+    ) -> int:
+        if rng is None:
+            rng = np.random.default_rng()
+        if rng.random() < epsilon:
+            return int(rng.integers(0, self.action_dim))
+        obs_tensor = torch.from_numpy(obs).to(self.device).unsqueeze(0)
+        with torch.no_grad():
+            q_values = self.q_network(obs_tensor)
+        return int(torch.argmax(q_values, dim=1).item())
+
+    def update(self, batch: Dict[str, np.ndarray]) -> float:
+        obs = torch.from_numpy(batch["obs"]).to(self.device)
+        next_obs = torch.from_numpy(batch["next_obs"]).to(self.device)
+        actions = torch.from_numpy(batch["actions"]).long().to(self.device)
+        rewards = torch.from_numpy(batch["rewards"]).to(self.device)
+        dones = torch.from_numpy(batch["dones"]).to(self.device)
+
+        q_values = self.q_network(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
+        with torch.no_grad():
+            if self.use_double_q:
+                next_actions = self.q_network(next_obs).argmax(dim=1, keepdim=True)
+                target_q = self.target_network(next_obs)
+                next_q = target_q.gather(1, next_actions).squeeze(1)
+            else:
+                next_q = self.target_network(next_obs).max(1).values
+            targets = rewards + (1.0 - dones) * self.gamma * next_q
+        loss = F.smooth_l1_loss(q_values, targets)
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+        self.train_steps += 1
+        if self.train_steps % self.target_sync_interval == 0:
+            self.target_network.load_state_dict(self.q_network.state_dict())
+        return float(loss.item())
+
+    def save(self, path: str, *, metadata: Optional[Dict[str, Any]] = None) -> None:
+        payload = {
+            "config": {
+                "obs_dim": self.obs_dim,
+                "action_dim": self.action_dim,
+                "hidden_sizes": self.hidden_sizes,
+                "gamma": self.gamma,
+                "learning_rate": self.learning_rate,
+                "target_sync_interval": self.target_sync_interval,
+                "max_grad_norm": self.max_grad_norm,
+            },
+            "state_dict": self.q_network.state_dict(),
+            "target_state_dict": self.target_network.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "train_steps": self.train_steps,
+            "metadata": metadata or {},
+        }
+        torch.save(payload, path)
+
+    @classmethod
+    def load(cls, path: str, *, device: Optional[str] = None) -> Tuple["DQNAgent", Dict[str, Any]]:
+        payload = torch.load(path, map_location=device or "cpu")
+        config_dict = payload["config"]
+        config = AgentConfig(
+            obs_dim=config_dict["obs_dim"],
+            action_dim=config_dict["action_dim"],
+            hidden_sizes=tuple(config_dict["hidden_sizes"]),
+            gamma=config_dict["gamma"],
+            learning_rate=config_dict["learning_rate"],
+            target_sync_interval=config_dict["target_sync_interval"],
+            max_grad_norm=config_dict["max_grad_norm"],
+            device=device,
+        )
+        agent = cls(config)
+        agent.q_network.load_state_dict(payload["state_dict"])
+        agent.target_network.load_state_dict(payload["target_state_dict"])
+        agent.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        agent.train_steps = payload.get("train_steps", 0)
+        metadata = payload.get("metadata", {})
+        return agent, metadata

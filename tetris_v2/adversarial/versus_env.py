@@ -135,7 +135,10 @@ class VersusEnv(gym.Env):
                 hud["Time"] = f"{int(seconds // 60)}:{int(seconds % 60):02d}"
             hold_id = int(player_snapshot["hold"])
             hold_image = utils.render_piece_preview(hold_id) if hold_id >= 0 else None
-            queue_images = [utils.render_piece_preview(pid) for pid in list(self._player._queue)[:3]]
+            queue_images = [
+                utils.render_piece_preview(pid)
+                for pid in list(self._player._queue)[: self._player.queue_size]
+            ]
             if self._renderer is None:
                 self._renderer = PygameBoardRenderer(title="Tetris Versus", board_shape=frame.shape[:2])
             self._renderer.draw(frame, hud, hold_image=hold_image, queue_images=queue_images)

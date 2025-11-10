@@ -24,7 +24,7 @@ class ModernTetrisEnv(gym.Env):
         self,
         *,
         render_mode: Optional[str] = None,
-        queue_size: int = 5,
+        preview_pieces: int = 5,
         lock_delay_frames: int = 30,
         line_clear_delay_frames: int = 0,
         reward_mode: str = "score",
@@ -35,6 +35,7 @@ class ModernTetrisEnv(gym.Env):
         super().__init__()
         self.render_mode = render_mode
         self.reward_mode = reward_mode
+        self.preview_pieces = max(1, int(preview_pieces))
         if time_limit_seconds is None and reward_mode == "score":
             time_limit_seconds = 180.0
         self._frame_limit = (
@@ -42,7 +43,7 @@ class ModernTetrisEnv(gym.Env):
         )
         self._frames = 0
         self._rules = ModernRuleset(
-            queue_size=queue_size,
+            queue_size=self.preview_pieces,
             lock_delay_frames=lock_delay_frames,
             line_clear_delay_frames=line_clear_delay_frames,
             soft_drop_factor=soft_drop_factor,
@@ -52,7 +53,7 @@ class ModernTetrisEnv(gym.Env):
             {
                 "board": spaces.Box(low=0, high=8, shape=(20, 10), dtype=np.int8),
                 "current": spaces.Box(low=-10_000, high=10_000, shape=(4,), dtype=np.int16),
-                "queue": spaces.Box(low=0, high=7, shape=(queue_size,), dtype=np.int8),
+                "queue": spaces.Box(low=0, high=7, shape=(self.preview_pieces,), dtype=np.int8),
                 "hold": spaces.Box(low=-1, high=7, shape=(), dtype=np.int8),
                 "combo": spaces.Box(low=0, high=10_000, shape=(), dtype=np.int16),
                 "back_to_back": spaces.Discrete(2),
@@ -115,7 +116,7 @@ class ModernTetrisEnv(gym.Env):
                 hud["Time"] = f"{int(seconds // 60)}:{int(seconds % 60):02d}"
             hold_id = int(observation["hold"])
             hold_image = utils.render_piece_preview(hold_id) if hold_id >= 0 else None
-            queue_ids = list(self._rules._queue)[:3]
+            queue_ids = list(self._rules._queue)[: self.preview_pieces]
             queue_images = [utils.render_piece_preview(pid) for pid in queue_ids]
             if self._renderer is None:
                 self._renderer = PygameBoardRenderer(
