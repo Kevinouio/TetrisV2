@@ -1,4 +1,4 @@
-"""Evaluate a trained scratch DQN checkpoint."""
+"""Evaluate a trained PPO checkpoint."""
 
 from __future__ import annotations
 
@@ -9,19 +9,20 @@ from typing import Optional
 import gymnasium as gym
 
 from tetris_v2.agents.single_agent.common import build_advanced_reward_config
+from tetris_v2.agents.single_agent.dqn.models import ObservationProcessor
 from tetris_v2.envs.registration import register_envs
 from tetris_v2.envs.wrappers import AdvancedRewardWrapper, FloatBoardWrapper, RewardScaleWrapper
-from .models import DQNAgent, ObservationProcessor
+from .models import PPOAgent
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a native DQN checkpoint.")
+    parser = argparse.ArgumentParser(description="Evaluate a PPO agent checkpoint.")
     parser.add_argument("checkpoint", type=Path, help="Path to the saved .pt checkpoint.")
     parser.add_argument("--env", choices=("nes", "modern", "custom"), default="nes")
     parser.add_argument("--env-id", help="Gymnasium id when --env=custom.")
     parser.add_argument("--episodes", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--render", action="store_true", help="Render gameplay to the pygame window.")
+    parser.add_argument("--seed", type=int, default=321)
+    parser.add_argument("--render", action="store_true")
     parser.add_argument("--device", help="Torch device override for loading the checkpoint.")
     parser.add_argument("--reward-scale", type=float, default=1.0)
     parser.add_argument("--rotation-penalty", type=float, default=0.0)
@@ -98,8 +99,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     processor = ObservationProcessor(env.observation_space)
-    agent, _ = DQNAgent.load(str(args.checkpoint), device=args.device)
-    if agent.obs_dim != processor.flat_dim or agent.action_dim != env.action_space.n:
+    agent, _ = PPOAgent.load(str(args.checkpoint), device=args.device)
+    if agent.config.obs_dim != processor.flat_dim or agent.config.action_dim != env.action_space.n:
         raise SystemExit("Checkpoint is incompatible with the selected environment.")
 
     returns = []
@@ -110,7 +111,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         total_reward = 0.0
         last_score = 0.0
         while not (terminated or truncated):
-            action = agent.act(flat, epsilon=0.0)
+            action, _, _ = agent.act(flat, temperature=1e-6, epsilon=0.0, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             flat = processor.flatten(obs)
             total_reward += reward

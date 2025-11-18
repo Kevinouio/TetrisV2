@@ -1,4 +1,4 @@
 """Single-agent (score maximisation) algorithm implementations."""
 
-# Re-export baseline DQN so existing imports continue to work.
-from . import dqn  # noqa: F401
+# Re-export modules so existing imports continue to work.
+from . import dqn, ppo  # noqa: F401

@@ -323,16 +323,29 @@ class DQNAgent:
         obs: np.ndarray,
         *,
         epsilon: float = 0.0,
+        temperature: float = 1.0,
+        strategy: str = "epsilon",
         rng: Optional[np.random.Generator] = None,
     ) -> int:
         if rng is None:
             rng = np.random.default_rng()
-        if rng.random() < epsilon:
-            return int(rng.integers(0, self.action_dim))
         obs_tensor = torch.from_numpy(obs).to(self.device).unsqueeze(0)
         with torch.no_grad():
-            q_values = self.q_network(obs_tensor)
-        return int(torch.argmax(q_values, dim=1).item())
+            q_values = self.q_network(obs_tensor).squeeze(0)
+        strategy = strategy.lower()
+        if strategy == "epsilon":
+            if rng.random() < epsilon:
+                return int(rng.integers(0, self.action_dim))
+            return int(torch.argmax(q_values, dim=0).item())
+        if strategy == "boltzmann":
+            scale = max(float(temperature), 1e-6)
+            logits = q_values / scale
+            probs = torch.softmax(logits, dim=0).cpu().numpy()
+            if epsilon > 0:
+                probs = (1.0 - epsilon) * probs + epsilon / self.action_dim
+            probs = probs / probs.sum()
+            return int(rng.choice(self.action_dim, p=probs))
+        raise ValueError(f"Unsupported exploration strategy '{strategy}'.")
 
     def update(self, batch: Dict[str, np.ndarray]) -> Tuple[float, np.ndarray]:
         obs = torch.from_numpy(batch["obs"]).to(self.device)

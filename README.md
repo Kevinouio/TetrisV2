@@ -70,6 +70,25 @@ Evaluate a saved policy:
 python -m tetris_v2.agents.dqn.eval runs/dqn_modern/final_model.pt --env modern --render
 ```
 
+Need more directed exploration or richer shaping? Toggle Boltzmann sampling and the
+new hole/survival reward wrapper:
+```bash
+python -m tetris_v2.agents.dqn.train --env modern --exploration-strategy boltzmann \
+  --boltzmann-temp-start 2.0 --boltzmann-temp-end 0.2 --advanced-reward \
+  --advanced-reward-weight hole_penalty=1.2 --log-dir runs/dqn_adv_reward
+```
+
+Native PPO baseline (same observation encoder, actor-critic head, and reward extras):
+```bash
+python -m tetris_v2.agents.ppo.train --env modern --total-timesteps 1500000 \
+  --n-steps 4096 --minibatch-size 1024 --policy-temperature-start 1.25 \
+  --advanced-reward --log-dir runs/ppo_modern
+```
+Evaluate PPO checkpoints via:
+```bash
+python -m tetris_v2.agents.ppo.eval runs/ppo_modern/final_model.pt --env modern --render
+```
+
 ## Repository Layout
 - `envs/`  environments and utilities
 - `scripts/` CLI tools (`play_human`, training/eval helpers)

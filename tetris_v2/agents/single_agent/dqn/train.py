@@ -10,8 +10,17 @@ from typing import Any, Deque, Dict, Optional, Tuple
 import gymnasium as gym
 import numpy as np
 
+from tetris_v2.agents.single_agent.common import (
+    build_advanced_reward_config,
+    linear_schedule,
+)
 from tetris_v2.envs.registration import register_envs
-from tetris_v2.envs.wrappers import FloatBoardWrapper, RewardScaleWrapper
+from tetris_v2.envs.wrappers import (
+    AdvancedRewardConfig,
+    AdvancedRewardWrapper,
+    FloatBoardWrapper,
+    RewardScaleWrapper,
+)
 from .models import AgentConfig, DQNAgent, ObservationProcessor, PrioritizedReplayBuffer, ReplayBuffer
 
 
@@ -31,6 +40,20 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--epsilon-start", type=float, default=1.0)
     parser.add_argument("--epsilon-end", type=float, default=0.05)
     parser.add_argument("--epsilon-decay", type=int, default=200_000)
+    parser.add_argument(
+        "--exploration-strategy",
+        choices=("epsilon", "boltzmann"),
+        default="epsilon",
+        help="Choose epsilon-greedy or Boltzmann action sampling.",
+    )
+    parser.add_argument("--boltzmann-temp-start", type=float, default=1.5, help="Initial Boltzmann temperature.")
+    parser.add_argument("--boltzmann-temp-end", type=float, default=0.3, help="Final Boltzmann temperature.")
+    parser.add_argument(
+        "--boltzmann-temp-decay",
+        type=int,
+        default=200_000,
+        help="Steps over which the Boltzmann temperature is annealed.",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=5.0)
     parser.add_argument("--reward-scale", type=float, default=1.0)
     parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[512, 256])
@@ -65,6 +88,18 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=1e-6,
         help="Increment applied to beta after each sample when using prioritized replay.",
     )
+    parser.add_argument(
+        "--advanced-reward",
+        action="store_true",
+        help="Enable shaped rewards that penalise holes/height and reward survival.",
+    )
+    parser.add_argument(
+        "--advanced-reward-weight",
+        dest="advanced_reward_weights",
+        metavar="KEY=VALUE",
+        action="append",
+        help="Override AdvancedRewardConfig fields (requires --advanced-reward).",
+    )
     return parser.parse_args(argv)
 
 
@@ -78,16 +113,17 @@ def _resolve_env_id(args: argparse.Namespace) -> str:
     return args.env_id
 
 
-def _linear_schedule(start: float, end: float, duration: int, step: int) -> float:
-    if duration <= 0:
-        return end
-    mix = min(max(step, 0), duration) / float(duration)
-    return start + mix * (end - start)
-
-
-def _make_env(env_id: str, *, reward_scale: float, env_kwargs: Optional[Dict[str, Any]] = None) -> gym.Env:
+def _make_env(
+    env_id: str,
+    *,
+    reward_scale: float,
+    env_kwargs: Optional[Dict[str, Any]] = None,
+    advanced_reward: Optional[AdvancedRewardConfig] = None,
+) -> gym.Env:
     kwargs = dict(env_kwargs or {})
     env = gym.make(env_id, **kwargs)
+    if advanced_reward is not None:
+        env = AdvancedRewardWrapper(env, config=advanced_reward)
     env = FloatBoardWrapper(env)
     if reward_scale != 1.0:
         env = RewardScaleWrapper(env, scale=reward_scale)
@@ -103,8 +139,14 @@ def _evaluate_policy(
     seed: Optional[int],
     reward_scale: float,
     env_kwargs: Optional[Dict[str, Any]] = None,
+    advanced_reward: Optional[AdvancedRewardConfig] = None,
 ) -> Tuple[float, float]:
-    env = _make_env(env_id, reward_scale=reward_scale, env_kwargs=env_kwargs)
+    env = _make_env(
+        env_id,
+        reward_scale=reward_scale,
+        env_kwargs=env_kwargs,
+        advanced_reward=advanced_reward,
+    )
     returns: list[float] = []
     scores: list[float] = []
     for episode in range(episodes):
@@ -138,7 +180,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             env_kwargs["step_penalty"] = args.step_penalty
         if args.line_clear_reward:
             env_kwargs["line_clear_reward"] = args.line_clear_reward
-    env = _make_env(env_id, reward_scale=args.reward_scale, env_kwargs=env_kwargs)
+    try:
+        advanced_reward_cfg = build_advanced_reward_config(
+            args.advanced_reward,
+            args.advanced_reward_weights,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+    env = _make_env(
+        env_id,
+        reward_scale=args.reward_scale,
+        env_kwargs=env_kwargs,
+        advanced_reward=advanced_reward_cfg,
+    )
     processor = ObservationProcessor(env.observation_space)
     if args.prioritized_replay:
         buffer = PrioritizedReplayBuffer(
@@ -196,8 +251,25 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     while global_step < args.total_timesteps:
-        epsilon = _linear_schedule(args.epsilon_start, args.epsilon_end, args.epsilon_decay, global_step)
-        action = agent.act(flat, epsilon=epsilon, rng=rng)
+        epsilon = linear_schedule(args.epsilon_start, args.epsilon_end, args.epsilon_decay, global_step)
+        temperature = None
+        if args.exploration_strategy == "epsilon":
+            action = agent.act(flat, epsilon=epsilon, rng=rng, strategy="epsilon")
+        else:
+            temp_value = linear_schedule(
+                args.boltzmann_temp_start,
+                args.boltzmann_temp_end,
+                args.boltzmann_temp_decay,
+                global_step,
+            )
+            temperature = max(temp_value, 1e-3)
+            action = agent.act(
+                flat,
+                epsilon=epsilon,
+                temperature=temperature,
+                strategy="boltzmann",
+                rng=rng,
+            )
         next_obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         next_flat = processor.flatten(next_obs)
@@ -241,8 +313,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             avg_return = float(np.mean(recent_returns)) if recent_returns else 0.0
             avg_len = float(np.mean(recent_lengths)) if recent_lengths else 0.0
             avg_loss = float(np.mean(recent_losses)) if recent_losses else 0.0
+            if temperature is None:
+                explore_msg = f"eps={epsilon:.3f}"
+            else:
+                explore_msg = f"temp={temperature:.3f} eps-mix={epsilon:.3f}"
             print(
-                f"[step {global_step:,} | episode {episodes_run:,}] eps={epsilon:.3f} "
+                f"[step {global_step:,} | episode {episodes_run:,}] {explore_msg} "
                 f"return={avg_return:.1f} len={avg_len:.1f} "
                 f"loss={avg_loss:.4f} buffer={buffer.size:,}"
             )
@@ -256,6 +332,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 seed=args.seed,
                 reward_scale=args.reward_scale,
                 env_kwargs=env_kwargs,
+                advanced_reward=advanced_reward_cfg,
             )
             print(
                 f"[eval step {global_step:,}] avg_return={eval_return:.1f} "

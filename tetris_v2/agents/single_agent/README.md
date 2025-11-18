@@ -36,3 +36,4 @@ Planned implementations:
 Existing modules:
 
 - `dqn/` – baseline DQN trainer, models, and evaluation scripts.
+- `ppo/` – native PPO actor-critic (rollout buffer, trainer, evaluation).
