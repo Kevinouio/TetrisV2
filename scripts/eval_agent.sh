@@ -14,7 +14,9 @@ Options:
   --seed N                  RNG seed for eval (default: 321)
   --device DEV              Torch device override (e.g., cuda:0 or cpu)
   --render                  Enable pygame window rendering
-  --reward-weight KEY=VAL   Override AdvancedRewardConfig field (repeatable)
+  --reward-weight KEY=VAL   Override AgentRewardConfig field (repeatable)
+  --agent-reward-weight     Alias for --reward-weight (repeatable)
+  --env-reward-weight       Override EnvironmentRewardConfig field (repeatable)
 
 All additional arguments after "--" are appended verbatim to the python command.
 EOF
@@ -28,7 +30,8 @@ EPISODES=10
 SEED=321
 DEVICE=""
 RENDER=0
-REWARD_WEIGHTS=()
+AGENT_REWARD_WEIGHTS=()
+ENV_REWARD_WEIGHTS=()
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -70,7 +73,15 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --reward-weight)
-      REWARD_WEIGHTS+=("$2")
+      AGENT_REWARD_WEIGHTS+=("$2")
+      shift 2
+      ;;
+    --agent-reward-weight)
+      AGENT_REWARD_WEIGHTS+=("$2")
+      shift 2
+      ;;
+    --env-reward-weight)
+      ENV_REWARD_WEIGHTS+=("$2")
       shift 2
       ;;
     --)
@@ -120,8 +131,11 @@ if [[ $RENDER -eq 1 ]]; then
   CMD+=(--render)
 fi
 
-for weight in "${REWARD_WEIGHTS[@]}"; do
-  CMD+=(--advanced-reward-weight "$weight")
+for weight in "${AGENT_REWARD_WEIGHTS[@]}"; do
+  CMD+=(--agent-reward-weight "$weight")
+done
+for weight in "${ENV_REWARD_WEIGHTS[@]}"; do
+  CMD+=(--environment-reward-weight "$weight")
 done
 
 CMD+=("${EXTRA_ARGS[@]}")

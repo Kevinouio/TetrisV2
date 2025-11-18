@@ -51,8 +51,8 @@ class RewardScaleWrapper(RewardWrapper):
 
 
 @dataclass
-class AdvancedRewardConfig:
-    """Configuration for AdvancedRewardWrapper."""
+class AgentRewardConfig:
+    """Common activity-focused reward weights shared across environments."""
 
     base_reward_scale: float = 1.0
     line_clear_bonus: float = 0.5
@@ -65,6 +65,21 @@ class AdvancedRewardConfig:
     bumpiness_penalty: float = 0.02
     bumpiness_drop_reward: float = 0.01
     idle_penalty: float = 0.05
+    board_change_bonus: float = 0.1
+
+
+@dataclass
+class EnvironmentRewardConfig:
+    """Environment-specific shaping weights."""
+
+    combo_reward: float = 0.05
+    attack_reward: float = 0.02
+    perfect_clear_reward: float = 2.0
+    tspin_reward: float = 0.5
+    pending_garbage_penalty: float = 0.01
+    hard_drop_reward: float = 0.02
+    drop_bonus_scale: float = 0.005
+    level_reward: float = 0.0
 
 
 @dataclass
@@ -96,18 +111,22 @@ def _compute_board_metrics(board: np.ndarray) -> _BoardMetrics:
     return _BoardMetrics(holes=holes, aggregate_height=aggregate_height, bumpiness=int(bumpiness))
 
 
-class AdvancedRewardWrapper(RewardWrapper):
-    """Adds penalties for holes/height while rewarding survival/line clears."""
+class UniversalRewardWrapper(RewardWrapper):
+    """Combines agent-level activity shaping with environment-aware bonuses."""
 
     def __init__(
         self,
         env,
         *,
-        config: Optional[AdvancedRewardConfig] = None,
+        env_kind: str = "generic",
+        agent_config: Optional[AgentRewardConfig] = None,
+        env_config: Optional[EnvironmentRewardConfig] = None,
         board_key: str = "board",
     ):
         super().__init__(env)
-        self.config = config or AdvancedRewardConfig()
+        self.agent_config = agent_config or AgentRewardConfig()
+        self.env_config = env_config or EnvironmentRewardConfig()
+        self.env_kind = (env_kind or "generic").lower()
         self.board_key = board_key
         self._previous_metrics: Optional[_BoardMetrics] = None
 
@@ -139,43 +158,87 @@ class AdvancedRewardWrapper(RewardWrapper):
     ) -> float:
         metrics = self._extract_metrics(observation)
         prev = self._previous_metrics or metrics
-        total = reward * self.config.base_reward_scale
-
-        hole_delta = metrics.holes - prev.holes
-        if hole_delta > 0:
-            total -= self.config.hole_penalty * hole_delta
-        elif hole_delta < 0:
-            total += self.config.hole_clear_reward * (-hole_delta)
-
-        height_delta = metrics.aggregate_height - prev.aggregate_height
-        if height_delta > 0:
-            total -= self.config.height_penalty * height_delta
-        elif height_delta < 0:
-            total += self.config.height_drop_reward * (-height_delta)
-
-        bump_delta = metrics.bumpiness - prev.bumpiness
-        if bump_delta > 0:
-            total -= self.config.bumpiness_penalty * bump_delta
-        elif bump_delta < 0:
-            total += self.config.bumpiness_drop_reward * (-bump_delta)
-
-        idle_step = (
-            self._previous_metrics is not None
-            and hole_delta == 0
-            and height_delta == 0
-            and bump_delta == 0
-            and not terminated
-            and not truncated
-            and int(info.get("lines_cleared", 0)) == 0
-        )
-        if idle_step:
-            total -= self.config.idle_penalty
-
-        total += self.config.line_clear_bonus * float(info.get("lines_cleared", 0))
-        if not terminated and not truncated:
-            total += self.config.survival_reward
-        if terminated:
-            total -= self.config.top_out_penalty
-
+        total = reward * self.agent_config.base_reward_scale
+        total += self._agent_activity_reward(prev, metrics, terminated, truncated, info)
+        total += self._environment_reward(info)
         self._previous_metrics = metrics
         return total
+
+    def _agent_activity_reward(
+        self,
+        prev: _BoardMetrics,
+        current: _BoardMetrics,
+        terminated: bool,
+        truncated: bool,
+        info: Dict[str, Any],
+    ) -> float:
+        cfg = self.agent_config
+        total = 0.0
+
+        hole_delta = current.holes - prev.holes
+        if hole_delta > 0:
+            total -= cfg.hole_penalty * hole_delta
+        elif hole_delta < 0:
+            total += cfg.hole_clear_reward * (-hole_delta)
+
+        height_delta = current.aggregate_height - prev.aggregate_height
+        if height_delta > 0:
+            total -= cfg.height_penalty * height_delta
+        elif height_delta < 0:
+            total += cfg.height_drop_reward * (-height_delta)
+
+        bump_delta = current.bumpiness - prev.bumpiness
+        if bump_delta > 0:
+            total -= cfg.bumpiness_penalty * bump_delta
+        elif bump_delta < 0:
+            total += cfg.bumpiness_drop_reward * (-bump_delta)
+
+        board_changed = (
+            hole_delta != 0 or height_delta != 0 or bump_delta != 0 or int(info.get("lines_cleared", 0)) > 0
+        )
+        if board_changed:
+            total += cfg.board_change_bonus
+        elif self._previous_metrics is not None and not terminated and not truncated:
+            total -= cfg.idle_penalty
+
+        total += cfg.line_clear_bonus * float(info.get("lines_cleared", 0))
+        if not terminated and not truncated:
+            total += cfg.survival_reward
+        if terminated:
+            total -= cfg.top_out_penalty
+        return total
+
+    def _environment_reward(self, info: Dict[str, Any]) -> float:
+        cfg = self.env_config
+        reward = 0.0
+        combo = info.get("combo")
+        if combo:
+            reward += cfg.combo_reward * float(combo)
+        attack = info.get("attack")
+        if attack:
+            reward += cfg.attack_reward * float(attack)
+        if info.get("perfect_clear"):
+            reward += cfg.perfect_clear_reward
+        if info.get("t_spin"):
+            reward += cfg.tspin_reward
+        pending = info.get("pending_garbage")
+        if pending:
+            reward -= cfg.pending_garbage_penalty * float(pending)
+        hard_drop = info.get("hard_drop_distance")
+        if hard_drop:
+            reward += cfg.hard_drop_reward * float(hard_drop)
+
+        if "nes" in self.env_kind:
+            drop_points = info.get("drop_points")
+            if drop_points:
+                reward += cfg.drop_bonus_scale * float(drop_points) / 100.0
+            level = info.get("level")
+            if level:
+                reward += cfg.level_reward * float(level)
+
+        return reward
+
+
+# Backwards compatibility aliases.
+AdvancedRewardConfig = AgentRewardConfig
+AdvancedRewardWrapper = UniversalRewardWrapper

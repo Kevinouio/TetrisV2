@@ -15,7 +15,11 @@ General options:
   --device DEV              Torch device override, e.g. cuda:0 or cpu
   --seed N                  RNG seed (default: 123)
   --num-envs N              Parallel env workers (default: 8)
-  --reward-weight KEY=VAL   Override AdvancedRewardConfig field (repeatable)
+  --reward-weight KEY=VAL   Override AgentRewardConfig field (repeatable)
+  --agent-reward-weight     Alias for --reward-weight (repeatable)
+  --env-reward-weight       Override EnvironmentRewardConfig field (repeatable)
+  --curriculum              Enable staged curriculum schedule
+  --board-preset-file PATH  JSON file containing custom board presets
 
 PPO-specific defaults (overridable):
   --n-steps N               Rollout horizon per update (default: 4096)
@@ -44,7 +48,10 @@ PPO_MINIBATCH=2048
 DQN_BUFFER=400000
 DQN_BATCH=256
 EXTRA_ARGS=()
-REWARD_WEIGHTS=()
+AGENT_REWARD_WEIGHTS=()
+ENV_REWARD_WEIGHTS=()
+CURRICULUM=0
+BOARD_PRESET_FILE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -105,7 +112,23 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --reward-weight)
-      REWARD_WEIGHTS+=("$2")
+      AGENT_REWARD_WEIGHTS+=("$2")
+      shift 2
+      ;;
+    --agent-reward-weight)
+      AGENT_REWARD_WEIGHTS+=("$2")
+      shift 2
+      ;;
+    --env-reward-weight)
+      ENV_REWARD_WEIGHTS+=("$2")
+      shift 2
+      ;;
+    --curriculum)
+      CURRICULUM=1
+      shift
+      ;;
+    --board-preset-file)
+      BOARD_PRESET_FILE="$2"
       shift 2
       ;;
     --)
@@ -165,10 +188,19 @@ fi
 if [[ -n "$DEVICE" ]]; then
   CMD+=(--device "$DEVICE")
 fi
+if [[ -n "$BOARD_PRESET_FILE" ]]; then
+  CMD+=(--board-preset-file "$BOARD_PRESET_FILE")
+fi
 
-for weight in "${REWARD_WEIGHTS[@]}"; do
-  CMD+=(--advanced-reward-weight "$weight")
+for weight in "${AGENT_REWARD_WEIGHTS[@]}"; do
+  CMD+=(--agent-reward-weight "$weight")
 done
+for weight in "${ENV_REWARD_WEIGHTS[@]}"; do
+  CMD+=(--environment-reward-weight "$weight")
+done
+if [[ $CURRICULUM -eq 1 ]]; then
+  CMD+=(--curriculum)
+fi
 
 CMD+=("${EXTRA_ARGS[@]}")
 

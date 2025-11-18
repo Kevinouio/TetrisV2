@@ -74,6 +74,11 @@ Prefer not to retype dozens of flags? Use the helper wrappers:
 ./scripts/train_agent.sh --algo ppo --env nes --num-envs 8 --log-dir runs/ppo_nes_fast
 ./scripts/eval_agent.sh  --algo ppo --env nes --checkpoint runs/ppo_nes_fast/best_model.pt --render
 ```
+On Windows PowerShell, call the `.ps1` equivalents:
+```powershell
+.\scripts\train_agent.ps1 --algo dqn --env modern --num-envs 4 --log-dir runs\dqn_modern
+.\scripts\eval_agent.ps1  --algo dqn --env modern --checkpoint runs\dqn_modern\final_model.pt
+```
 
 Need more directed exploration or richer shaping? Toggle Boltzmann sampling and the
 new hole/survival reward wrapper:
