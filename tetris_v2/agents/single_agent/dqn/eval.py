@@ -23,6 +23,15 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--render", action="store_true", help="Render gameplay to the pygame window.")
     parser.add_argument("--device", help="Torch device override for loading the checkpoint.")
     parser.add_argument("--reward-scale", type=float, default=1.0)
+    parser.add_argument("--rotation-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--line-clear-reward",
+        type=float,
+        nargs=4,
+        metavar=("SINGLE", "DOUBLE", "TRIPLE", "TETRIS"),
+        help="Additional reward (NES score units) per line clear type.",
+    )
+    parser.add_argument("--step-penalty", type=float, default=0.0)
     return parser.parse_args(argv)
 
 
@@ -40,7 +49,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     register_envs()
     env_id = _resolve_env_id(args)
-    env = gym.make(env_id, render_mode="human" if args.render else None)
+    env_kwargs = {}
+    if env_id.startswith("KevinNES"):
+        if args.rotation_penalty:
+            env_kwargs["rotation_penalty"] = args.rotation_penalty
+        if args.step_penalty:
+            env_kwargs["step_penalty"] = args.step_penalty
+        if args.line_clear_reward:
+            env_kwargs["line_clear_reward"] = args.line_clear_reward
+    env = gym.make(env_id, render_mode="human" if args.render else None, **env_kwargs)
     env = FloatBoardWrapper(env)
     if args.reward_scale != 1.0:
         env = RewardScaleWrapper(env, scale=args.reward_scale)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
@@ -36,12 +36,18 @@ class NesTetrisEnv(gym.Env):
         reward_mode: str = "score",
         blitz_seconds: Optional[float] = 180.0,
         preview_pieces: int = 1,
+        rotation_penalty: float = 0.0,
+        line_clear_reward: Optional[Sequence[float]] = None,
+        step_penalty: float = 0.0,
     ):
         super().__init__()
         self.render_mode = render_mode
         self.start_level = start_level
         self.max_steps = max_steps
         self.reward_mode = reward_mode
+        self.rotation_penalty = max(0.0, float(rotation_penalty))
+        self._line_clear_reward = self._build_line_clear_reward(line_clear_reward)
+        self.step_penalty = max(0.0, float(step_penalty))
         self._frame_limit = (
             None if blitz_seconds is None else int(blitz_seconds * self.metadata["render_fps"])
         )
@@ -79,6 +85,7 @@ class NesTetrisEnv(gym.Env):
         self._gravity_timer = 0
         self._top_out = False
         self._renderer: Optional[PygameBoardRenderer] = None
+        self._consecutive_rotations = 0
 
     # ------------------------------------------------------------------
     # Gym API
@@ -104,6 +111,7 @@ class NesTetrisEnv(gym.Env):
         if utils.collides(self._board, self._current):
             self._top_out = True
         self._frames = 0
+        self._consecutive_rotations = 0
         return self._observe(), {}
 
     def step(self, action: Action):
@@ -112,13 +120,15 @@ class NesTetrisEnv(gym.Env):
 
         assert self.action_space.contains(action), f"invalid action {action}"
 
-        drop_reward = 0.0  # shaped reward for agent incentives
+        drop_reward = 0.0  # drop-based shaping in score units (scaled)
+        extra_reward = 0.0  # other shaping (bonuses/penalties) in score units
         drop_score = 0  # integer points added to NES scoreboard for drops
         info: Dict[str, float] = {}
         self._steps += 1
 
         locked = False
         distance_soft = 0
+        rotated_this_step = False
 
         # lateral movement
         if action == self.MOVE_LEFT:
@@ -133,6 +143,15 @@ class NesTetrisEnv(gym.Env):
             candidate = self._current.rotated(delta=1)
             if not utils.collides(self._board, candidate):
                 self._current = candidate
+                rotated_this_step = True
+
+        if rotated_this_step:
+            self._consecutive_rotations += 1
+            if self.rotation_penalty and self._consecutive_rotations > 1:
+                extra_reward -= self.rotation_penalty / 100.0
+                info["rotation_penalty"] = info.get("rotation_penalty", 0.0) - self.rotation_penalty
+        else:
+            self._consecutive_rotations = 0
 
         # dropping logic
         if action == self.HARD_DROP:
@@ -140,7 +159,7 @@ class NesTetrisEnv(gym.Env):
             self._current = self._current.moved(d_row=distance)
             if distance > 0:
                 drop_points = utils.soft_drop_points(distance) * 2
-                drop_reward += float(drop_points)
+                drop_reward += drop_points / 100.0
                 drop_score += drop_points
             locked = True
         else:
@@ -164,7 +183,7 @@ class NesTetrisEnv(gym.Env):
 
         if distance_soft:
             drop_points = utils.soft_drop_points(distance_soft)
-            drop_reward += float(drop_points)
+            drop_reward += drop_points / 100.0
             drop_score += drop_points
 
         lines_cleared = 0
@@ -190,8 +209,16 @@ class NesTetrisEnv(gym.Env):
             info["drop_points"] = int(drop_score)
         if score_delta:
             info["score_delta"] = float(score_delta)
+        line_bonus = self._line_clear_reward.get(lines_cleared, 0.0)
+        if line_bonus:
+            extra_reward += line_bonus / 100.0
+            info["line_bonus"] = float(line_bonus)
         if lines_cleared:
             info["lines_cleared"] = int(lines_cleared)
+
+        if self.step_penalty:
+            extra_reward -= self.step_penalty / 100.0
+            info["step_penalty"] = info.get("step_penalty", 0.0) - self.step_penalty
 
         terminated = self._top_out
         truncated = bool(self.max_steps and self._steps >= self.max_steps)
@@ -208,7 +235,7 @@ class NesTetrisEnv(gym.Env):
         if self._frame_limit:
             info["time_remaining_frames"] = max(self._frame_limit - self._frames, 0)
 
-        reward = self._select_reward(score_delta, lines_cleared, drop_reward, drop_score)
+        reward = self._select_reward(score_delta, lines_cleared, drop_reward, extra_reward, drop_score)
         return obs, float(reward), terminated, truncated, info
 
     # ------------------------------------------------------------------
@@ -294,10 +321,20 @@ class NesTetrisEnv(gym.Env):
         score_delta: int,
         lines_cleared: int,
         drop_reward: float,
+        extra_reward: float,
         drop_score: int,
     ) -> float:
+        base = (score_delta + drop_score) / 100.0
         if self.reward_mode == "score":
-            return (score_delta + drop_score) / 100.0
+            return base + drop_reward + extra_reward
         if self.reward_mode == "lines":
             return float(lines_cleared)
-        return float(drop_reward)
+        return float(drop_reward + extra_reward)
+
+    def _build_line_clear_reward(self, values: Optional[Sequence[float]]) -> Dict[int, float]:
+        rewards: Dict[int, float] = {i: 0.0 for i in range(1, 5)}
+        if values is None:
+            return rewards
+        for idx, val in enumerate(values[:4], start=1):
+            rewards[idx] = float(val)
+        return rewards

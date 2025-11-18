@@ -45,6 +45,9 @@ class ObservationProcessor:
         self.keys = tuple(observation_space.spaces.keys())
         self._sizes: Dict[str, int] = {}
         flat_dim = 0
+        self.slices: Dict[str, Tuple[int, int]] = {}
+        self.board_shape: Optional[Tuple[int, int]] = None
+        self.board_dim: int = 0
         for key in self.keys:
             space = observation_space.spaces[key]
             if isinstance(space, spaces.Discrete):
@@ -54,6 +57,10 @@ class ObservationProcessor:
                 size = int(np.prod(shape, dtype=int)) if shape else 1
             self._sizes[key] = size
             flat_dim += size
+            self.slices[key] = (flat_dim - size, flat_dim)
+            if key == "board" and getattr(space, "shape", None):
+                self.board_shape = tuple(int(dim) for dim in space.shape)  # type: ignore[arg-type]
+                self.board_dim = size
         self.flat_dim = flat_dim
         self._clip_range = clip_range
         self._normalisers: Dict[str, np.ndarray] = {}
@@ -113,17 +120,76 @@ class ReplayBuffer:
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int) -> Dict[str, np.ndarray]:
+    def _sample_indices(self, batch_size: int) -> np.ndarray:
         if self.size == 0:
             raise ValueError("Cannot sample from an empty buffer.")
-        batch_indices = np.random.randint(0, self.size, size=int(batch_size))
+        return np.random.randint(0, self.size, size=int(batch_size))
+
+    def _gather_batch(self, indices: np.ndarray) -> Dict[str, np.ndarray]:
         return {
-            "obs": self.obs[batch_indices],
-            "next_obs": self.next_obs[batch_indices],
-            "actions": self.actions[batch_indices],
-            "rewards": self.rewards[batch_indices],
-            "dones": self.dones[batch_indices],
+            "obs": self.obs[indices],
+            "next_obs": self.next_obs[indices],
+            "actions": self.actions[indices],
+            "rewards": self.rewards[indices],
+            "dones": self.dones[indices],
+            "indices": indices,
         }
+
+    def sample(self, batch_size: int) -> Dict[str, np.ndarray]:
+        indices = self._sample_indices(batch_size)
+        return self._gather_batch(indices)
+
+    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        # Uniform buffer ignores priority updates.
+        return
+
+
+class PrioritizedReplayBuffer(ReplayBuffer):
+    """Simple proportional prioritized replay buffer."""
+
+    def __init__(
+        self,
+        capacity: int,
+        obs_dim: int,
+        alpha: float = 0.6,
+        beta: float = 0.4,
+        beta_increment: float = 1e-6,
+    ):
+        super().__init__(capacity, obs_dim)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.beta_increment = float(beta_increment)
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
+        self.epsilon = 1e-6
+
+    def add(self, obs: np.ndarray, action: int, reward: float, next_obs: np.ndarray, done: bool) -> None:
+        prev_pos = self.pos
+        super().add(obs, action, reward, next_obs, done)
+        idx = (prev_pos) % self.capacity
+        max_prio = self.priorities.max() if self.size > 0 else 1.0
+        self.priorities[idx] = max(max_prio, self.epsilon)
+
+    def _sample_indices(self, batch_size: int) -> np.ndarray:
+        if self.size == 0:
+            raise ValueError("Cannot sample from an empty buffer.")
+        scaled = self.priorities[: self.size] ** self.alpha
+        probs = scaled / np.sum(scaled)
+        return np.random.default_rng().choice(self.size, size=int(batch_size), p=probs)
+
+    def sample(self, batch_size: int) -> Dict[str, np.ndarray]:
+        indices = self._sample_indices(batch_size)
+        scaled = self.priorities[: self.size] ** self.alpha
+        probs = scaled / np.sum(scaled)
+        weights = (self.size * probs[indices]) ** (-self.beta)
+        weights /= weights.max() if weights.max() > 0 else 1.0
+        self.beta = min(1.0, self.beta + self.beta_increment)
+        batch = self._gather_batch(indices)
+        batch["weights"] = weights.astype(np.float32)
+        return batch
+
+    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        priorities = np.abs(priorities) + self.epsilon
+        self.priorities[indices] = priorities
 
 
 class QNetwork(nn.Module):
@@ -136,15 +202,35 @@ class QNetwork(nn.Module):
         hidden_sizes: Sequence[int],
         *,
         dueling: bool = True,
+        board_dim: int = 0,
+        board_shape: Optional[Tuple[int, int]] = None,
     ):
         super().__init__()
+        self.board_dim = int(board_dim)
+        self.board_shape = board_shape
+        vector_dim = input_dim - self.board_dim
+        if self.board_dim and self.board_shape is not None:
+            channels = 32
+            self.board_extractor = nn.Sequential(
+                nn.Conv2d(1, channels, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(channels, channels * 2, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Flatten(),
+            )
+            conv_out_dim = (channels * 2) * self.board_shape[0] * self.board_shape[1]
+        else:
+            self.board_extractor = None
+            conv_out_dim = 0
+
         layers: list[nn.Module] = []
-        dims = [input_dim] + list(hidden_sizes)
+        mlp_input = conv_out_dim + max(vector_dim, 0)
+        dims = [mlp_input] + list(hidden_sizes)
         for i in range(len(hidden_sizes)):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
             layers.append(nn.ReLU())
         self.feature_extractor = nn.Sequential(*layers) if layers else nn.Identity()
-        last_dim = dims[-1] if hidden_sizes else input_dim
+        last_dim = dims[-1] if hidden_sizes else mlp_input
         self.dueling = dueling
         if dueling:
             self.value_head = nn.Linear(last_dim, 1)
@@ -158,7 +244,17 @@ class QNetwork(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        features = self.feature_extractor(x)
+        if self.board_extractor is not None and self.board_dim > 0:
+            board = x[:, : self.board_dim].view(-1, 1, *self.board_shape)  # type: ignore[arg-type]
+            rest = x[:, self.board_dim :]
+            board_features = self.board_extractor(board)
+            if rest.shape[1] > 0:
+                features_input = torch.cat([board_features, rest], dim=1)
+            else:
+                features_input = board_features
+        else:
+            features_input = x
+        features = self.feature_extractor(features_input)
         if self.dueling:
             advantage = self.advantage_head(features)
             value = self.value_head(features)
@@ -179,6 +275,8 @@ class AgentConfig:
     device: Optional[str] = None
     use_dueling: bool = True
     use_double_q: bool = True
+    board_dim: int = 0
+    board_shape: Optional[Tuple[int, int]] = None
 
 
 class DQNAgent:
@@ -197,18 +295,24 @@ class DQNAgent:
         self.max_grad_norm = float(config.max_grad_norm)
         self.use_dueling = bool(config.use_dueling)
         self.use_double_q = bool(config.use_double_q)
+        self.board_dim = int(config.board_dim)
+        self.board_shape = config.board_shape
 
         self.q_network = QNetwork(
             self.obs_dim,
             self.action_dim,
             self.hidden_sizes,
             dueling=self.use_dueling,
+            board_dim=self.board_dim,
+            board_shape=self.board_shape,
         ).to(self.device)
         self.target_network = QNetwork(
             self.obs_dim,
             self.action_dim,
             self.hidden_sizes,
             dueling=self.use_dueling,
+            board_dim=self.board_dim,
+            board_shape=self.board_shape,
         ).to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=self.learning_rate)
@@ -230,12 +334,17 @@ class DQNAgent:
             q_values = self.q_network(obs_tensor)
         return int(torch.argmax(q_values, dim=1).item())
 
-    def update(self, batch: Dict[str, np.ndarray]) -> float:
+    def update(self, batch: Dict[str, np.ndarray]) -> Tuple[float, np.ndarray]:
         obs = torch.from_numpy(batch["obs"]).to(self.device)
         next_obs = torch.from_numpy(batch["next_obs"]).to(self.device)
         actions = torch.from_numpy(batch["actions"]).long().to(self.device)
         rewards = torch.from_numpy(batch["rewards"]).to(self.device)
         dones = torch.from_numpy(batch["dones"]).to(self.device)
+        weights_np = batch.get("weights")
+        if weights_np is not None:
+            weights = torch.from_numpy(weights_np).to(self.device)
+        else:
+            weights = torch.ones(len(actions), device=self.device)
 
         q_values = self.q_network(obs).gather(1, actions.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
@@ -246,7 +355,8 @@ class DQNAgent:
             else:
                 next_q = self.target_network(next_obs).max(1).values
             targets = rewards + (1.0 - dones) * self.gamma * next_q
-        loss = F.smooth_l1_loss(q_values, targets)
+        elementwise_loss = F.smooth_l1_loss(q_values, targets, reduction="none")
+        loss = (weights * elementwise_loss).mean()
         self.optimizer.zero_grad()
         loss.backward()
         if self.max_grad_norm > 0:
@@ -255,7 +365,8 @@ class DQNAgent:
         self.train_steps += 1
         if self.train_steps % self.target_sync_interval == 0:
             self.target_network.load_state_dict(self.q_network.state_dict())
-        return float(loss.item())
+        td_errors = (targets - q_values).detach().cpu().numpy()
+        return float(loss.item()), td_errors
 
     def save(self, path: str, *, metadata: Optional[Dict[str, Any]] = None) -> None:
         payload = {
@@ -267,6 +378,8 @@ class DQNAgent:
                 "learning_rate": self.learning_rate,
                 "target_sync_interval": self.target_sync_interval,
                 "max_grad_norm": self.max_grad_norm,
+                "board_dim": self.board_dim,
+                "board_shape": self.board_shape,
             },
             "state_dict": self.q_network.state_dict(),
             "target_state_dict": self.target_network.state_dict(),
@@ -289,6 +402,8 @@ class DQNAgent:
             target_sync_interval=config_dict["target_sync_interval"],
             max_grad_norm=config_dict["max_grad_norm"],
             device=device,
+            board_dim=config_dict.get("board_dim", 0),
+            board_shape=tuple(config_dict["board_shape"]) if config_dict.get("board_shape") else None,
         )
         agent = cls(config)
         agent.q_network.load_state_dict(payload["state_dict"])

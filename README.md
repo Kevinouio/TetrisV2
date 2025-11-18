@@ -59,6 +59,12 @@ Scratch DQN trainer (fully native PyTorch implementation):
 python -m tetris_v2.agents.dqn.train --env modern --total-timesteps 500000 \
   --learning-rate 2.5e-4 --seed 42 --log-dir runs/dqn_modern
 ```
+Nes-specific shaping options are available, e.g.:
+```bash
+python -m tetris_v2.agents.dqn.train --env nes --rotation-penalty 5 \
+  --line-clear-reward 0 25 50 150 --step-penalty 1 \
+  --prioritized-replay --per-alpha 0.6 --per-beta 0.4
+```
 Evaluate a saved policy:
 ```bash
 python -m tetris_v2.agents.dqn.eval runs/dqn_modern/final_model.pt --env modern --render

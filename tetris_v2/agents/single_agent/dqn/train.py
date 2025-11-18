@@ -5,14 +5,14 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from pathlib import Path
-from typing import Deque, Dict, Optional, Tuple
+from typing import Any, Deque, Dict, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
 
 from tetris_v2.envs.registration import register_envs
 from tetris_v2.envs.wrappers import FloatBoardWrapper, RewardScaleWrapper
-from .models import AgentConfig, DQNAgent, ObservationProcessor, ReplayBuffer
+from .models import AgentConfig, DQNAgent, ObservationProcessor, PrioritizedReplayBuffer, ReplayBuffer
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -42,6 +42,29 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--checkpoint-frequency", type=int, default=100_000)
     parser.add_argument("--log-dir", type=Path, default=Path("runs/dqn_native"))
     parser.add_argument("--resume-from", type=Path, help="Resume training from a saved .pt checkpoint.")
+    parser.add_argument("--rotation-penalty", type=float, default=0.0, help="Per extra rotation penalty .")
+    parser.add_argument(
+        "--line-clear-reward",
+        type=float,
+        nargs=4,
+        metavar=("SINGLE", "DOUBLE", "TRIPLE", "TETRIS"),
+        help="Additional reward (NES score units) per line clear type.",
+    )
+    parser.add_argument(
+        "--step-penalty",
+        type=float,
+        default=0.0,
+        help="Penalty (NES score units) applied every step to discourage stalling.",
+    )
+    parser.add_argument("--prioritized-replay", action="store_true", help="Enable prioritized experience replay.")
+    parser.add_argument("--per-alpha", type=float, default=0.6, help="Prioritized replay alpha.")
+    parser.add_argument("--per-beta", type=float, default=0.4, help="Initial prioritized replay beta.")
+    parser.add_argument(
+        "--per-beta-anneal",
+        type=float,
+        default=1e-6,
+        help="Increment applied to beta after each sample when using prioritized replay.",
+    )
     return parser.parse_args(argv)
 
 
@@ -62,8 +85,9 @@ def _linear_schedule(start: float, end: float, duration: int, step: int) -> floa
     return start + mix * (end - start)
 
 
-def _make_env(env_id: str, *, reward_scale: float) -> gym.Env:
-    env = gym.make(env_id)
+def _make_env(env_id: str, *, reward_scale: float, env_kwargs: Optional[Dict[str, Any]] = None) -> gym.Env:
+    kwargs = dict(env_kwargs or {})
+    env = gym.make(env_id, **kwargs)
     env = FloatBoardWrapper(env)
     if reward_scale != 1.0:
         env = RewardScaleWrapper(env, scale=reward_scale)
@@ -78,8 +102,9 @@ def _evaluate_policy(
     episodes: int,
     seed: Optional[int],
     reward_scale: float,
+    env_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[float, float]:
-    env = _make_env(env_id, reward_scale=reward_scale)
+    env = _make_env(env_id, reward_scale=reward_scale, env_kwargs=env_kwargs)
     returns: list[float] = []
     scores: list[float] = []
     for episode in range(episodes):
@@ -105,9 +130,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     register_envs()
     np.random.seed(args.seed)
     env_id = _resolve_env_id(args)
-    env = _make_env(env_id, reward_scale=args.reward_scale)
+    env_kwargs: Dict[str, Any] = {}
+    if env_id.startswith("KevinNES"):
+        if args.rotation_penalty:
+            env_kwargs["rotation_penalty"] = args.rotation_penalty
+        if args.step_penalty:
+            env_kwargs["step_penalty"] = args.step_penalty
+        if args.line_clear_reward:
+            env_kwargs["line_clear_reward"] = args.line_clear_reward
+    env = _make_env(env_id, reward_scale=args.reward_scale, env_kwargs=env_kwargs)
     processor = ObservationProcessor(env.observation_space)
-    buffer = ReplayBuffer(capacity=args.buffer_size, obs_dim=processor.flat_dim)
+    if args.prioritized_replay:
+        buffer = PrioritizedReplayBuffer(
+            capacity=args.buffer_size,
+            obs_dim=processor.flat_dim,
+            alpha=args.per_alpha,
+            beta=args.per_beta,
+            beta_increment=args.per_beta_anneal,
+        )
+    else:
+        buffer = ReplayBuffer(capacity=args.buffer_size, obs_dim=processor.flat_dim)
     rng = np.random.default_rng(args.seed)
 
     if not args.hidden_sizes:
@@ -129,6 +171,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             target_sync_interval=args.target_sync_interval,
             max_grad_norm=args.max_grad_norm,
             device=args.device,
+            board_dim=processor.board_dim,
+            board_shape=processor.board_shape,
         )
         agent = DQNAgent(config)
         start_step = 0
@@ -140,6 +184,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     episodic_return = 0.0
     episodic_length = 0
     episodic_score = 0.0
+    episodes_run = 0
     recent_returns: Deque[float] = deque(maxlen=100)
     recent_lengths: Deque[int] = deque(maxlen=100)
     recent_losses: Deque[float] = deque(maxlen=1_000)
@@ -172,12 +217,20 @@ def main(argv: Optional[list[str]] = None) -> int:
         if should_learn:
             for _ in range(args.gradient_steps):
                 batch = buffer.sample(args.batch_size)
-                loss = agent.update(batch)
+                loss, td_errors = agent.update(batch)
                 recent_losses.append(loss)
+                if args.prioritized_replay:
+                    buffer.update_priorities(batch["indices"], np.abs(td_errors))
 
         if done:
             recent_returns.append(episodic_return)
             recent_lengths.append(episodic_length)
+            episodes_run += 1
+            if episodes_run % 500 == 0:
+                print(
+                    f"[episode {episodes_run:,}] return={episodic_return:.2f} "
+                    f"len={episodic_length} score={episodic_score:.1f}"
+                )
             obs, _ = env.reset()
             flat = processor.flatten(obs)
             episodic_return = 0.0
@@ -189,7 +242,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             avg_len = float(np.mean(recent_lengths)) if recent_lengths else 0.0
             avg_loss = float(np.mean(recent_losses)) if recent_losses else 0.0
             print(
-                f"[step {global_step:,}] eps={epsilon:.3f} "
+                f"[step {global_step:,} | episode {episodes_run:,}] eps={epsilon:.3f} "
                 f"return={avg_return:.1f} len={avg_len:.1f} "
                 f"loss={avg_loss:.4f} buffer={buffer.size:,}"
             )
@@ -202,6 +255,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 episodes=args.eval_episodes,
                 seed=args.seed,
                 reward_scale=args.reward_scale,
+                env_kwargs=env_kwargs,
             )
             print(
                 f"[eval step {global_step:,}] avg_return={eval_return:.1f} "
