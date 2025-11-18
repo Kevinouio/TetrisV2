@@ -254,7 +254,10 @@ class PPOAgent:
             actions_np = action.cpu().numpy()
             log_probs_np = log_prob.cpu().numpy()
         values_np = values.squeeze(-1).cpu().numpy()
-        return actions_np.astype(np.int64), log_probs_np.astype(np.float32), values_np.astype(np.float32)
+        actions_np = np.asarray(actions_np).reshape(-1).astype(np.int64)
+        log_probs_np = np.asarray(log_probs_np).reshape(-1).astype(np.float32)
+        values_np = np.asarray(values_np).reshape(-1).astype(np.float32)
+        return actions_np, log_probs_np, values_np
 
     def value(self, obs: np.ndarray) -> float:
         return float(self.value_batch(obs[np.newaxis, :])[0])

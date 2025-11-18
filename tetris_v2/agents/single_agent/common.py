@@ -36,12 +36,9 @@ def parse_key_value_overrides(pairs: Optional[Iterable[str]]) -> Dict[str, float
 
 
 def build_advanced_reward_config(
-    enabled: bool,
     overrides: Optional[Iterable[str]] = None,
-) -> Optional[AdvancedRewardConfig]:
-    """Return an AdvancedRewardConfig when enabled, applying any overrides."""
-    if not enabled:
-        return None
+) -> AdvancedRewardConfig:
+    """Return an AdvancedRewardConfig with optional overrides."""
     config = AdvancedRewardConfig()
     mapping = parse_key_value_overrides(overrides)
     for key, value in mapping.items():

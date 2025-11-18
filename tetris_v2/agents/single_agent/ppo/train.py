@@ -50,7 +50,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=10_000)
     parser.add_argument("--eval-frequency", type=int, default=200_000)
     parser.add_argument("--eval-episodes", type=int, default=5)
-    parser.add_argument("--checkpoint-frequency", type=int, default=200_000)
+    parser.add_argument("--checkpoint-frequency", type=int, default=1_000_000)
     parser.add_argument("--log-dir", type=Path, default=Path("runs/ppo_native"))
     parser.add_argument("--resume-from", type=Path, help="Resume PPO training from a saved checkpoint.")
     parser.add_argument("--rotation-penalty", type=float, default=0.0)
@@ -63,16 +63,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--step-penalty", type=float, default=0.0)
     parser.add_argument(
-        "--advanced-reward",
-        action="store_true",
-        help="Enable shaped rewards penalising holes while rewarding survival.",
-    )
-    parser.add_argument(
         "--advanced-reward-weight",
         dest="advanced_reward_weights",
         metavar="KEY=VALUE",
         action="append",
-        help="Override AdvancedRewardConfig fields when --advanced-reward is active.",
+        help="Override AdvancedRewardConfig fields (e.g., hole_penalty=1.2).",
     )
     return parser.parse_args(argv)
 
@@ -152,6 +147,7 @@ def _make_env_factory(
     kwargs = dict(env_kwargs or {})
 
     def _init():
+        register_envs()
         env = gym.make(env_id, **kwargs)
         if advanced_reward is not None:
             env = AdvancedRewardWrapper(env, config=advanced_reward)
@@ -222,10 +218,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             env_kwargs["line_clear_reward"] = args.line_clear_reward
 
     try:
-        advanced_reward_cfg = build_advanced_reward_config(
-            args.advanced_reward,
-            args.advanced_reward_weights,
-        )
+        advanced_reward_cfg = build_advanced_reward_config(args.advanced_reward_weights)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 

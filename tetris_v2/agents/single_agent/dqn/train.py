@@ -117,16 +117,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Increment applied to beta after each sample when using prioritized replay.",
     )
     parser.add_argument(
-        "--advanced-reward",
-        action="store_true",
-        help="Enable shaped rewards that penalise holes/height and reward survival.",
-    )
-    parser.add_argument(
         "--advanced-reward-weight",
         dest="advanced_reward_weights",
         metavar="KEY=VALUE",
         action="append",
-        help="Override AdvancedRewardConfig fields (requires --advanced-reward).",
+        help="Override AdvancedRewardConfig fields (e.g., hole_penalty=1.2).",
     )
     return parser.parse_args(argv)
 
@@ -206,6 +201,7 @@ def _make_env_factory(
     kwargs = dict(env_kwargs or {})
 
     def _init():
+        register_envs()
         env = gym.make(env_id, **kwargs)
         if advanced_reward is not None:
             env = AdvancedRewardWrapper(env, config=advanced_reward)
@@ -269,10 +265,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.line_clear_reward:
             env_kwargs["line_clear_reward"] = args.line_clear_reward
     try:
-        advanced_reward_cfg = build_advanced_reward_config(
-            args.advanced_reward,
-            args.advanced_reward_weights,
-        )
+        advanced_reward_cfg = build_advanced_reward_config(args.advanced_reward_weights)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 

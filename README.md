@@ -69,18 +69,25 @@ Evaluate a saved policy:
 ```bash
 python -m tetris_v2.agents.dqn.eval runs/dqn_modern/final_model.pt --env modern --render
 ```
+Prefer not to retype dozens of flags? Use the helper wrappers:
+```bash
+./scripts/train_agent.sh --algo ppo --env nes --num-envs 8 --log-dir runs/ppo_nes_fast
+./scripts/eval_agent.sh  --algo ppo --env nes --checkpoint runs/ppo_nes_fast/best_model.pt --render
+```
 
 Need more directed exploration or richer shaping? Toggle Boltzmann sampling and the
 new hole/survival reward wrapper:
 ```bash
 python -m tetris_v2.agents.dqn.train --env modern --exploration-strategy boltzmann \
-  --boltzmann-temp-start 2.0 --boltzmann-temp-end 0.2 --advanced-reward \
+  --boltzmann-temp-start 2.0 --boltzmann-temp-end 0.2 \
   --advanced-reward-weight hole_penalty=1.2 --log-dir runs/dqn_adv_reward
 ```
+Advanced reward shaping (holes, survival, idle penalties) is always enabled; use `--advanced-reward-weight KEY=VALUE`
+to tweak individual scalars.
 Scale out experience collection with asynchronous env workers:
 ```bash
 python -m tetris_v2.agents.dqn.train --env modern --num-envs 8 --total-timesteps 2000000 \
-  --prioritized-replay --advanced-reward --log-dir runs/dqn_vector
+  --prioritized-replay --log-dir runs/dqn_vector
 ```
 Switch between vanilla DQN, Double DQN, and Dueling heads on the same CLI:
 ```bash
@@ -93,7 +100,7 @@ Native PPO baseline (same observation encoder, actor-critic head, and reward ext
 ```bash
 python -m tetris_v2.agents.ppo.train --env modern --total-timesteps 1500000 \
   --n-steps 4096 --minibatch-size 1024 --policy-temperature-start 1.25 \
-  --advanced-reward --log-dir runs/ppo_modern
+  --log-dir runs/ppo_modern
 ```
 Need more throughput? Append `--num-envs N` (e.g., `--num-envs 8`) to launch a pool of AsyncVectorEnv workers feeding PPO.
 Evaluate PPO checkpoints via:

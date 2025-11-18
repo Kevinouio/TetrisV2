@@ -36,6 +36,7 @@ Planned implementations:
 Existing modules:
 
 - `dqn/` – baseline DQN trainer, models, and evaluation scripts. Supports Double DQN,
-  dueling heads, prioritized replay, Boltzmann exploration, reward shaping, and
-  AsyncVectorEnv-based parallel data collection.
+  dueling heads, prioritized replay, Boltzmann exploration, reward shaping (enabled
+  by default; tune via `--advanced-reward-weight key=value`), and AsyncVectorEnv-based
+  parallel data collection.
 - `ppo/` – native PPO actor-critic (rollout buffer, trainer, evaluation).

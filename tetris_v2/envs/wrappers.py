@@ -64,6 +64,7 @@ class AdvancedRewardConfig:
     height_drop_reward: float = 0.005
     bumpiness_penalty: float = 0.02
     bumpiness_drop_reward: float = 0.01
+    idle_penalty: float = 0.05
 
 
 @dataclass
@@ -157,6 +158,18 @@ class AdvancedRewardWrapper(RewardWrapper):
             total -= self.config.bumpiness_penalty * bump_delta
         elif bump_delta < 0:
             total += self.config.bumpiness_drop_reward * (-bump_delta)
+
+        idle_step = (
+            self._previous_metrics is not None
+            and hole_delta == 0
+            and height_delta == 0
+            and bump_delta == 0
+            and not terminated
+            and not truncated
+            and int(info.get("lines_cleared", 0)) == 0
+        )
+        if idle_step:
+            total -= self.config.idle_penalty
 
         total += self.config.line_clear_bonus * float(info.get("lines_cleared", 0))
         if not terminated and not truncated:

@@ -34,16 +34,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--step-penalty", type=float, default=0.0)
     parser.add_argument(
-        "--advanced-reward",
-        action="store_true",
-        help="Enable the shaped reward wrapper during evaluation.",
-    )
-    parser.add_argument(
         "--advanced-reward-weight",
         dest="advanced_reward_weights",
         metavar="KEY=VALUE",
         action="append",
-        help="Override AdvancedRewardConfig fields when --advanced-reward is set.",
+        help="Override AdvancedRewardConfig fields (e.g., hole_penalty=1.2).",
     )
     return parser.parse_args(argv)
 
@@ -62,15 +57,13 @@ def _wrap_env(
     env: gym.Env,
     *,
     reward_scale: float,
-    use_advanced: bool,
     advanced_reward_weights: Optional[list[str]],
 ):
     try:
-        config = build_advanced_reward_config(use_advanced, advanced_reward_weights)
+        config = build_advanced_reward_config(advanced_reward_weights)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    if config is not None:
-        env = AdvancedRewardWrapper(env, config=config)
+    env = AdvancedRewardWrapper(env, config=config)
     env = FloatBoardWrapper(env)
     if reward_scale != 1.0:
         env = RewardScaleWrapper(env, scale=reward_scale)
@@ -93,7 +86,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     env = _wrap_env(
         env,
         reward_scale=args.reward_scale,
-        use_advanced=args.advanced_reward,
         advanced_reward_weights=args.advanced_reward_weights,
     )
 
