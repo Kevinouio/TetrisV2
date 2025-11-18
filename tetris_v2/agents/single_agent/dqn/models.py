@@ -444,7 +444,7 @@ class DQNAgent:
 
     @classmethod
     def load(cls, path: str, *, device: Optional[str] = None) -> Tuple["DQNAgent", Dict[str, Any]]:
-        payload = torch.load(path, map_location=device or "cpu")
+        payload = torch.load(path, map_location=device or "cpu", weights_only=False)
         config_dict = payload["config"]
         config = AgentConfig(
             obs_dim=config_dict["obs_dim"],

@@ -341,7 +341,7 @@ class PPOAgent:
 
     @classmethod
     def load(cls, path: str, *, device: Optional[str] = None) -> Tuple["PPOAgent", Dict[str, float]]:
-        payload = torch.load(path, map_location=device or "cpu")
+        payload = torch.load(path, map_location=device or "cpu", weights_only=False)
         cfg = payload["config"]
         config = PPOConfig(
             obs_dim=cfg["obs_dim"],
