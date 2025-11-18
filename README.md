@@ -77,6 +77,17 @@ python -m tetris_v2.agents.dqn.train --env modern --exploration-strategy boltzma
   --boltzmann-temp-start 2.0 --boltzmann-temp-end 0.2 --advanced-reward \
   --advanced-reward-weight hole_penalty=1.2 --log-dir runs/dqn_adv_reward
 ```
+Scale out experience collection with asynchronous env workers:
+```bash
+python -m tetris_v2.agents.dqn.train --env modern --num-envs 8 --total-timesteps 2000000 \
+  --prioritized-replay --advanced-reward --log-dir runs/dqn_vector
+```
+Switch between vanilla DQN, Double DQN, and Dueling heads on the same CLI:
+```bash
+python -m tetris_v2.agents.dqn.train --env nes --no-double-dqn --no-dueling  # classic DQN
+python -m tetris_v2.agents.dqn.train --env modern --double-dqn --dueling    # Rainbow-style core
+python -m tetris_v2.agents.dqn.train --env modern --prioritized-replay      # enables PER buffer
+```
 
 Native PPO baseline (same observation encoder, actor-critic head, and reward extras):
 ```bash
@@ -84,6 +95,7 @@ python -m tetris_v2.agents.ppo.train --env modern --total-timesteps 1500000 \
   --n-steps 4096 --minibatch-size 1024 --policy-temperature-start 1.25 \
   --advanced-reward --log-dir runs/ppo_modern
 ```
+Need more throughput? Append `--num-envs N` (e.g., `--num-envs 8`) to launch a pool of AsyncVectorEnv workers feeding PPO.
 Evaluate PPO checkpoints via:
 ```bash
 python -m tetris_v2.agents.ppo.eval runs/ppo_modern/final_model.pt --env modern --render

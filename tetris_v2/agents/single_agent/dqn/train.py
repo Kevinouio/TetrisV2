@@ -5,9 +5,10 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv
 import numpy as np
 
 from tetris_v2.agents.single_agent.common import (
@@ -31,6 +32,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--buffer-size", type=int, default=200_000)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--num-envs", type=int, default=1, help="How many parallel env workers to launch.")
     parser.add_argument("--learning-starts", type=int, default=20_000)
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -55,6 +57,32 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Steps over which the Boltzmann temperature is annealed.",
     )
     parser.add_argument("--max-grad-norm", type=float, default=5.0)
+    parser.add_argument(
+        "--double-dqn",
+        dest="double_dqn",
+        action="store_true",
+        default=True,
+        help="Enable Double DQN target selection (on by default).",
+    )
+    parser.add_argument(
+        "--no-double-dqn",
+        dest="double_dqn",
+        action="store_false",
+        help="Disable Double DQN; fall back to vanilla DQN targets.",
+    )
+    parser.add_argument(
+        "--dueling",
+        dest="dueling",
+        action="store_true",
+        default=True,
+        help="Use dueling value/advantage heads (default).",
+    )
+    parser.add_argument(
+        "--no-dueling",
+        dest="dueling",
+        action="store_false",
+        help="Use a single shared head (vanilla DQN).",
+    )
     parser.add_argument("--reward-scale", type=float, default=1.0)
     parser.add_argument("--hidden-sizes", type=int, nargs="+", default=[512, 256])
     parser.add_argument("--seed", type=int, default=42)
@@ -167,8 +195,68 @@ def _evaluate_policy(
     return float(np.mean(returns)), float(np.mean(scores))
 
 
+def _make_env_factory(
+    env_id: str,
+    *,
+    env_kwargs: Optional[Dict[str, Any]],
+    reward_scale: float,
+    advanced_reward: Optional[AdvancedRewardConfig],
+    seed: Optional[int],
+) -> Callable[[], gym.Env]:
+    kwargs = dict(env_kwargs or {})
+
+    def _init():
+        env = gym.make(env_id, **kwargs)
+        if advanced_reward is not None:
+            env = AdvancedRewardWrapper(env, config=advanced_reward)
+        env = FloatBoardWrapper(env)
+        if reward_scale != 1.0:
+            env = RewardScaleWrapper(env, scale=reward_scale)
+        if seed is not None:
+            env.reset(seed=seed)
+        return env
+
+    return _init
+
+
+def _split_observations(obs_batch: Dict[str, np.ndarray]) -> List[Dict[str, Any]]:
+    num_envs = len(next(iter(obs_batch.values())))
+    result: List[Dict[str, Any]] = []
+    for idx in range(num_envs):
+        obs = {key: np.array(value[idx]) for key, value in obs_batch.items()}
+        result.append(obs)
+    return result
+
+
+def _flatten_batch(processor: ObservationProcessor, obs_batch: Dict[str, np.ndarray]) -> np.ndarray:
+    obs_list = _split_observations(obs_batch)
+    flats = [processor.flatten(observation) for observation in obs_list]
+    return np.stack(flats, axis=0)
+
+
+def _split_infos(infos: Any, num_envs: int) -> List[Dict[str, Any]]:
+    if isinstance(infos, (list, tuple)):
+        items = list(infos)
+        if len(items) == num_envs:
+            return [dict(item) for item in items]
+    if isinstance(infos, dict):
+        split: List[Dict[str, Any]] = [dict() for _ in range(num_envs)]
+        for key, value in infos.items():
+            if key in {"final_observation", "final_info"} and isinstance(value, dict):
+                for idx in range(num_envs):
+                    split[idx][key] = {kk: np.array(vv)[idx] for kk, vv in value.items()}
+                continue
+            arr = list(value) if isinstance(value, (list, tuple)) else np.array(value)
+            for idx in range(num_envs):
+                split[idx][key] = arr[idx]
+        return split
+    return [dict() for _ in range(num_envs)]
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
+    if args.num_envs <= 0:
+        raise SystemExit("--num-envs must be at least 1.")
     register_envs()
     np.random.seed(args.seed)
     env_id = _resolve_env_id(args)
@@ -188,13 +276,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
-    env = _make_env(
+    reference_env = _make_env(
         env_id,
         reward_scale=args.reward_scale,
         env_kwargs=env_kwargs,
         advanced_reward=advanced_reward_cfg,
     )
-    processor = ObservationProcessor(env.observation_space)
+    processor = ObservationProcessor(reference_env.observation_space)
+    action_dim = reference_env.action_space.n
+    reference_env.close()
+
     if args.prioritized_replay:
         buffer = PrioritizedReplayBuffer(
             capacity=args.buffer_size,
@@ -212,7 +303,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.resume_from:
         agent, metadata = DQNAgent.load(str(args.resume_from), device=args.device)
-        if agent.obs_dim != processor.flat_dim or agent.action_dim != env.action_space.n:
+        if agent.obs_dim != processor.flat_dim or agent.action_dim != action_dim:
             raise SystemExit("Checkpoint is incompatible with the selected environment.")
         start_step = int(metadata.get("global_step", 0))
         best_eval = float(metadata.get("best_eval_return", float("-inf")))
@@ -228,34 +319,52 @@ def main(argv: Optional[list[str]] = None) -> int:
             device=args.device,
             board_dim=processor.board_dim,
             board_shape=processor.board_shape,
+            use_double_q=args.double_dqn,
+            use_dueling=args.dueling,
         )
         agent = DQNAgent(config)
         start_step = 0
         best_eval = float("-inf")
 
     args.log_dir.mkdir(parents=True, exist_ok=True)
-    obs, _ = env.reset(seed=args.seed)
-    flat = processor.flatten(obs)
-    episodic_return = 0.0
-    episodic_length = 0
-    episodic_score = 0.0
+
+    env_fns = []
+    for idx in range(args.num_envs):
+        seed_val = None if args.seed is None else args.seed + idx
+        env_fns.append(
+            _make_env_factory(
+                env_id,
+                env_kwargs=env_kwargs,
+                reward_scale=args.reward_scale,
+                advanced_reward=advanced_reward_cfg,
+                seed=seed_val,
+            )
+        )
+    train_env = AsyncVectorEnv(env_fns)
+    seed_seq = None if args.seed is None else [args.seed + idx for idx in range(args.num_envs)]
+    obs_batch, _ = train_env.reset(seed=seed_seq)
+    flat_batch = _flatten_batch(processor, obs_batch)
+    episode_returns = np.zeros(args.num_envs, dtype=np.float32)
+    episode_lengths = np.zeros(args.num_envs, dtype=np.int32)
+    episode_scores = np.zeros(args.num_envs, dtype=np.float32)
     episodes_run = 0
     recent_returns: Deque[float] = deque(maxlen=100)
     recent_lengths: Deque[int] = deque(maxlen=100)
     recent_losses: Deque[float] = deque(maxlen=1_000)
 
     global_step = start_step
+    next_log = args.log_interval if args.log_interval else None
+    next_eval = args.eval_frequency if args.eval_frequency else None
+    next_checkpoint = args.checkpoint_frequency if args.checkpoint_frequency else None
     if global_step >= args.total_timesteps:
         print("Checkpoint already reached requested total timesteps; exiting.")
-        env.close()
+        train_env.close()
         return 0
 
     while global_step < args.total_timesteps:
         epsilon = linear_schedule(args.epsilon_start, args.epsilon_end, args.epsilon_decay, global_step)
         temperature = None
-        if args.exploration_strategy == "epsilon":
-            action = agent.act(flat, epsilon=epsilon, rng=rng, strategy="epsilon")
-        else:
+        if args.exploration_strategy == "boltzmann":
             temp_value = linear_schedule(
                 args.boltzmann_temp_start,
                 args.boltzmann_temp_end,
@@ -263,23 +372,42 @@ def main(argv: Optional[list[str]] = None) -> int:
                 global_step,
             )
             temperature = max(temp_value, 1e-3)
-            action = agent.act(
-                flat,
-                epsilon=epsilon,
-                temperature=temperature,
-                strategy="boltzmann",
-                rng=rng,
-            )
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
-        next_flat = processor.flatten(next_obs)
-        buffer.add(flat, action, float(reward), next_flat, done)
+        actions = agent.act_batch(
+            flat_batch,
+            epsilon=epsilon,
+            temperature=temperature or 1.0,
+            strategy=args.exploration_strategy,
+            rng=rng,
+        )
+        next_obs_batch, rewards, terminated, truncated, infos = train_env.step(actions)
+        done = np.logical_or(terminated, truncated)
+        info_list = _split_infos(infos, args.num_envs)
+        next_flat_batch = _flatten_batch(processor, next_obs_batch)
+        rewards = np.asarray(rewards, dtype=np.float32)
+        episode_returns += rewards
+        episode_lengths += 1
+        for idx, info in enumerate(info_list):
+            if "score" in info and info["score"] is not None:
+                episode_scores[idx] = float(info["score"])
 
-        episodic_return += reward
-        episodic_length += 1
-        episodic_score = float(info.get("score", episodic_score))
-        flat = next_flat
-        global_step += 1
+        for env_idx in range(args.num_envs):
+            actual_next = next_flat_batch[env_idx]
+            if done[env_idx]:
+                final_obs = info_list[env_idx].get("final_observation")
+                if final_obs is not None:
+                    actual_next = processor.flatten(final_obs)
+            buffer.add(
+                flat_batch[env_idx],
+                int(actions[env_idx]),
+                float(rewards[env_idx]),
+                actual_next,
+                bool(done[env_idx]),
+            )
+            global_step += 1
+
+        flat_batch = next_flat_batch
+        if global_step >= args.total_timesteps:
+            break
 
         should_learn = (
             buffer.size >= args.batch_size
@@ -294,22 +422,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                 if args.prioritized_replay:
                     buffer.update_priorities(batch["indices"], np.abs(td_errors))
 
-        if done:
-            recent_returns.append(episodic_return)
-            recent_lengths.append(episodic_length)
-            episodes_run += 1
-            if episodes_run % 500 == 0:
-                print(
-                    f"[episode {episodes_run:,}] return={episodic_return:.2f} "
-                    f"len={episodic_length} score={episodic_score:.1f}"
-                )
-            obs, _ = env.reset()
-            flat = processor.flatten(obs)
-            episodic_return = 0.0
-            episodic_length = 0
-            episodic_score = 0.0
+        for env_idx in range(args.num_envs):
+            if done[env_idx]:
+                final_info = info_list[env_idx].get("final_info") or info_list[env_idx]
+                score_val = float(final_info.get("score", episode_scores[env_idx]))
+                recent_returns.append(float(episode_returns[env_idx]))
+                recent_lengths.append(int(episode_lengths[env_idx]))
+                episodes_run += 1
+                if episodes_run % 500 == 0:
+                    print(
+                        f"[episode {episodes_run:,}] return={episode_returns[env_idx]:.2f} "
+                        f"len={episode_lengths[env_idx]} score={score_val:.1f}"
+                    )
+                episode_returns[env_idx] = 0.0
+                episode_lengths[env_idx] = 0
+                episode_scores[env_idx] = 0.0
 
-        if args.log_interval and global_step % args.log_interval == 0:
+        if next_log and global_step >= next_log:
             avg_return = float(np.mean(recent_returns)) if recent_returns else 0.0
             avg_len = float(np.mean(recent_lengths)) if recent_lengths else 0.0
             avg_loss = float(np.mean(recent_losses)) if recent_losses else 0.0
@@ -322,8 +451,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"return={avg_return:.1f} len={avg_len:.1f} "
                 f"loss={avg_loss:.4f} buffer={buffer.size:,}"
             )
+            next_log += args.log_interval
 
-        if args.eval_frequency and global_step % args.eval_frequency == 0:
+        if next_eval and global_step >= next_eval:
             eval_return, eval_score = _evaluate_policy(
                 agent,
                 processor,
@@ -342,14 +472,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                 best_eval = eval_return
                 best_path = args.log_dir / "best_model.pt"
                 agent.save(str(best_path), metadata={"global_step": global_step, "best_eval_return": best_eval})
+            next_eval += args.eval_frequency
 
-        if args.checkpoint_frequency and global_step % args.checkpoint_frequency == 0:
+        if next_checkpoint and global_step >= next_checkpoint:
             ckpt_path = args.log_dir / f"checkpoint_step_{global_step}.pt"
             agent.save(str(ckpt_path), metadata={"global_step": global_step, "best_eval_return": best_eval})
+            next_checkpoint += args.checkpoint_frequency
 
     final_path = args.log_dir / "final_model.pt"
     agent.save(str(final_path), metadata={"global_step": global_step, "best_eval_return": best_eval})
-    env.close()
+    train_env.close()
     print(f"Training complete. Final checkpoint saved to {final_path}")
     return 0
 

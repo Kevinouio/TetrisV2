@@ -93,83 +93,93 @@ class PPOConfig:
 
 
 class RolloutBuffer:
-    """Fixed-size rollout storage for on-policy updates."""
+    """Fixed-size rollout storage for on-policy updates supporting vector envs."""
 
-    def __init__(self, capacity: int, obs_dim: int):
-        self.capacity = int(capacity)
-        self.obs = np.zeros((capacity, obs_dim), dtype=np.float32)
-        self.actions = np.zeros((capacity,), dtype=np.int64)
-        self.log_probs = np.zeros((capacity,), dtype=np.float32)
-        self.rewards = np.zeros((capacity,), dtype=np.float32)
-        self.dones = np.zeros((capacity,), dtype=np.float32)
-        self.values = np.zeros((capacity,), dtype=np.float32)
-        self.advantages = np.zeros((capacity,), dtype=np.float32)
-        self.returns = np.zeros((capacity,), dtype=np.float32)
-        self.pos = 0
+    def __init__(self, n_steps: int, num_envs: int, obs_dim: int):
+        self.n_steps = int(n_steps)
+        self.num_envs = int(num_envs)
+        self.obs = np.zeros((self.n_steps, self.num_envs, obs_dim), dtype=np.float32)
+        self.actions = np.zeros((self.n_steps, self.num_envs), dtype=np.int64)
+        self.log_probs = np.zeros((self.n_steps, self.num_envs), dtype=np.float32)
+        self.rewards = np.zeros((self.n_steps, self.num_envs), dtype=np.float32)
+        self.dones = np.zeros((self.n_steps, self.num_envs), dtype=np.float32)
+        self.values = np.zeros((self.n_steps, self.num_envs), dtype=np.float32)
+        self.advantages = np.zeros((self.n_steps, self.num_envs), dtype=np.float32)
+        self.returns = np.zeros((self.n_steps, self.num_envs), dtype=np.float32)
+        self.step = 0
 
     def reset(self) -> None:
-        self.pos = 0
+        self.step = 0
 
     def add(
         self,
         obs: np.ndarray,
-        action: int,
-        reward: float,
-        done: bool,
-        value: float,
-        log_prob: float,
+        actions: np.ndarray,
+        rewards: np.ndarray,
+        dones: np.ndarray,
+        values: np.ndarray,
+        log_probs: np.ndarray,
     ) -> None:
-        if self.pos >= self.capacity:
+        if self.step >= self.n_steps:
             raise ValueError("RolloutBuffer overflow. Did you forget to reset after an update?")
-        self.obs[self.pos] = obs
-        self.actions[self.pos] = action
-        self.rewards[self.pos] = reward
-        self.dones[self.pos] = float(done)
-        self.values[self.pos] = value
-        self.log_probs[self.pos] = log_prob
-        self.pos += 1
+        self.obs[self.step] = obs
+        self.actions[self.step] = actions
+        self.rewards[self.step] = rewards
+        self.dones[self.step] = dones
+        self.values[self.step] = values
+        self.log_probs[self.step] = log_probs
+        self.step += 1
 
     def compute_returns_and_advantages(
         self,
-        last_value: float,
-        last_done: bool,
+        last_values: np.ndarray,
+        last_dones: np.ndarray,
         gamma: float,
         gae_lambda: float,
     ) -> None:
-        last_gae = 0.0
-        for step in reversed(range(self.pos)):
-            if step == self.pos - 1:
-                next_non_terminal = 1.0 - float(last_done)
-                next_value = last_value
+        if self.step == 0:
+            return
+        last_gae = np.zeros(self.num_envs, dtype=np.float32)
+        for step in reversed(range(self.step)):
+            if step == self.step - 1:
+                next_non_terminal = 1.0 - last_dones.astype(np.float32)
+                next_value = last_values
             else:
                 next_non_terminal = 1.0 - self.dones[step + 1]
                 next_value = self.values[step + 1]
             delta = self.rewards[step] + gamma * next_value * next_non_terminal - self.values[step]
             last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
             self.advantages[step] = last_gae
-        returns = self.advantages[: self.pos] + self.values[: self.pos]
-        advantages = self.advantages[: self.pos]
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        self.advantages[: self.pos] = advantages
-        self.returns[: self.pos] = returns
+        returns = self.advantages[: self.step] + self.values[: self.step]
+        flat_adv = self.advantages[: self.step].reshape(-1)
+        norm_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
+        self.advantages[: self.step] = norm_adv.reshape(self.step, self.num_envs)
+        self.returns[: self.step] = returns
 
     def num_samples(self) -> int:
-        return self.pos
+        return self.step * self.num_envs
 
     def iter_minibatches(self, batch_size: int) -> Iterable[Dict[str, np.ndarray]]:
-        if self.pos == 0:
+        total = self.num_samples()
+        if total == 0:
             return
-        indices = np.arange(self.pos)
+        obs = self.obs[: self.step].reshape(total, -1)
+        actions = self.actions[: self.step].reshape(total)
+        log_probs = self.log_probs[: self.step].reshape(total)
+        advantages = self.advantages[: self.step].reshape(total)
+        returns = self.returns[: self.step].reshape(total)
+        values = self.values[: self.step].reshape(total)
+        indices = np.arange(total)
         np.random.shuffle(indices)
-        for start in range(0, self.pos, batch_size):
+        for start in range(0, total, batch_size):
             batch_idx = indices[start : start + batch_size]
             yield {
-                "obs": self.obs[batch_idx],
-                "actions": self.actions[batch_idx],
-                "log_probs": self.log_probs[batch_idx],
-                "advantages": self.advantages[batch_idx],
-                "returns": self.returns[batch_idx],
-                "values": self.values[batch_idx],
+                "obs": obs[batch_idx],
+                "actions": actions[batch_idx],
+                "log_probs": log_probs[batch_idx],
+                "advantages": advantages[batch_idx],
+                "returns": returns[batch_idx],
+                "values": values[batch_idx],
             }
 
 
@@ -198,9 +208,31 @@ class PPOAgent:
         deterministic: bool = False,
         rng: Optional[np.random.Generator] = None,
     ) -> Tuple[int, float, float]:
+        if obs.ndim == 1:
+            batch = obs[np.newaxis, :]
+        else:
+            batch = obs
+        actions, log_probs, values = self.act_batch(
+            batch,
+            temperature=temperature,
+            epsilon=epsilon,
+            deterministic=deterministic,
+            rng=rng,
+        )
+        return int(actions[0]), float(log_probs[0]), float(values[0])
+
+    def act_batch(
+        self,
+        obs_batch: np.ndarray,
+        *,
+        temperature: float = 1.0,
+        epsilon: float = 0.0,
+        deterministic: bool = False,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if rng is None:
             rng = np.random.default_rng()
-        obs_tensor = torch.from_numpy(obs).to(self.device).unsqueeze(0)
+        obs_tensor = torch.from_numpy(obs_batch).to(self.device)
         with torch.no_grad():
             logits, values = self.policy(obs_tensor)
         scale = max(float(temperature), 1e-6)
@@ -210,24 +242,28 @@ class PPOAgent:
             uniform = torch.ones_like(probs) / probs.shape[-1]
             probs = (1.0 - epsilon) * probs + epsilon * uniform
         if deterministic:
-            action = torch.argmax(probs, dim=-1)
-            selected = probs.gather(-1, action.unsqueeze(-1)).clamp(min=1e-8)
+            action = torch.argmax(probs, dim=-1, keepdim=True)
+            selected = probs.gather(-1, action).clamp(min=1e-8)
             log_prob = selected.log().squeeze(-1)
+            actions_np = action.squeeze(-1).cpu().numpy()
+            log_probs_np = log_prob.cpu().numpy()
         else:
             dist = Categorical(probs=probs)
             action = dist.sample()
             log_prob = dist.log_prob(action)
-        return (
-            int(action.item()),
-            float(log_prob.item()),
-            float(values.squeeze(0).item()),
-        )
+            actions_np = action.cpu().numpy()
+            log_probs_np = log_prob.cpu().numpy()
+        values_np = values.squeeze(-1).cpu().numpy()
+        return actions_np.astype(np.int64), log_probs_np.astype(np.float32), values_np.astype(np.float32)
 
     def value(self, obs: np.ndarray) -> float:
-        obs_tensor = torch.from_numpy(obs).to(self.device).unsqueeze(0)
+        return float(self.value_batch(obs[np.newaxis, :])[0])
+
+    def value_batch(self, obs_batch: np.ndarray) -> np.ndarray:
+        obs_tensor = torch.from_numpy(obs_batch).to(self.device)
         with torch.no_grad():
-            _, value = self.policy(obs_tensor)
-        return float(value.squeeze(0).item())
+            _, values = self.policy(obs_tensor)
+        return values.squeeze(-1).cpu().numpy()
 
     def update(self, buffer: RolloutBuffer, batch_size: int, epochs: int) -> Dict[str, float]:
         if buffer.num_samples() == 0:

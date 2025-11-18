@@ -347,6 +347,44 @@ class DQNAgent:
             return int(rng.choice(self.action_dim, p=probs))
         raise ValueError(f"Unsupported exploration strategy '{strategy}'.")
 
+    def act_batch(
+        self,
+        obs_batch: np.ndarray,
+        *,
+        epsilon: float = 0.0,
+        temperature: float = 1.0,
+        strategy: str = "epsilon",
+        rng: Optional[np.random.Generator] = None,
+    ) -> np.ndarray:
+        if rng is None:
+            rng = np.random.default_rng()
+        if obs_batch.ndim != 2:
+            raise ValueError("obs_batch must be 2D (batch, features).")
+        obs_tensor = torch.from_numpy(obs_batch).to(self.device)
+        with torch.no_grad():
+            q_values = self.q_network(obs_tensor)
+        batch_size = q_values.shape[0]
+        strategy = strategy.lower()
+        if strategy == "epsilon":
+            greedy = torch.argmax(q_values, dim=1).cpu().numpy()
+            if epsilon <= 0.0:
+                return greedy.astype(np.int64)
+            random_actions = rng.integers(0, self.action_dim, size=batch_size)
+            masks = rng.random(batch_size) < epsilon
+            actions = np.where(masks, random_actions, greedy)
+            return actions.astype(np.int64)
+        if strategy == "boltzmann":
+            scale = max(float(temperature), 1e-6)
+            logits = q_values / scale
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            if epsilon > 0:
+                probs = (1.0 - epsilon) * probs + epsilon / self.action_dim
+            actions = np.empty(batch_size, dtype=np.int64)
+            for idx in range(batch_size):
+                actions[idx] = int(rng.choice(self.action_dim, p=probs[idx] / probs[idx].sum()))
+            return actions
+        raise ValueError(f"Unsupported exploration strategy '{strategy}'.")
+
     def update(self, batch: Dict[str, np.ndarray]) -> Tuple[float, np.ndarray]:
         obs = torch.from_numpy(batch["obs"]).to(self.device)
         next_obs = torch.from_numpy(batch["next_obs"]).to(self.device)
@@ -393,6 +431,8 @@ class DQNAgent:
                 "max_grad_norm": self.max_grad_norm,
                 "board_dim": self.board_dim,
                 "board_shape": self.board_shape,
+                "use_double_q": self.use_double_q,
+                "use_dueling": self.use_dueling,
             },
             "state_dict": self.q_network.state_dict(),
             "target_state_dict": self.target_network.state_dict(),
@@ -417,6 +457,8 @@ class DQNAgent:
             device=device,
             board_dim=config_dict.get("board_dim", 0),
             board_shape=tuple(config_dict["board_shape"]) if config_dict.get("board_shape") else None,
+            use_double_q=config_dict.get("use_double_q", True),
+            use_dueling=config_dict.get("use_dueling", True),
         )
         agent = cls(config)
         agent.q_network.load_state_dict(payload["state_dict"])
