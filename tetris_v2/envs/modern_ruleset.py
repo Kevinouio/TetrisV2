@@ -55,6 +55,8 @@ class ModernRuleset:
         line_clear_delay_frames: int = 0,
         soft_drop_factor: float = 6.0,
         max_steps: Optional[int] = None,
+        das_frames: int = 10,  # Delayed Auto Shift
+        arr_frames: int = 2,   # Auto Repeat Rate
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.queue_size = queue_size
@@ -62,6 +64,8 @@ class ModernRuleset:
         self.line_clear_delay_frames = line_clear_delay_frames
         self.max_steps = max_steps
         self.soft_drop_factor = float(max(1.0, soft_drop_factor))
+        self.das_frames = das_frames
+        self.arr_frames = arr_frames
         self._rng = rng or np.random.default_rng()
         self._bag_iter = utils.bag_sequence(self._rng)
         self._queue: Deque[int] = deque()
@@ -76,11 +80,21 @@ class ModernRuleset:
         self._combo = 0
         self._back_to_back = False
         self._top_out = False
-        self._level = 0
+        self._level = 1  # Start at level 1 for modern
         self._line_clear_timer = 0
         self._ground_frames = 0
         self._gravity_progress = 0.0
         self._last_action = "none"
+        
+        # Extended Placement
+        self._manipulation_count = 0
+        self._lock_reset_limit = 15
+        
+        # DAS/ARR
+        self._das_timer = 0
+        self._arr_timer = 0
+        self._last_move_input = MOVE_NONE
+        
         self._fill_queue()
         self.reset()
 
@@ -103,11 +117,15 @@ class ModernRuleset:
         self._combo = 0
         self._back_to_back = False
         self._top_out = False
-        self._level = 0
+        self._level = 1
         self._line_clear_timer = 0
         self._ground_frames = 0
         self._gravity_progress = 0.0
         self._last_action = "none"
+        self._manipulation_count = 0
+        self._das_timer = 0
+        self._arr_timer = 0
+        self._last_move_input = MOVE_NONE
         return self._observe()
 
     # ------------------------------------------------------------------
@@ -143,21 +161,59 @@ class ModernRuleset:
 
         def _reset_ground_if_touching(did_move: bool) -> None:
             nonlocal lock_reset
-            if did_move and self._is_touching_ground():
-                self._ground_frames = 0
-                lock_reset = True
+            if did_move:
+                if self._is_touching_ground():
+                    if self._manipulation_count < self._lock_reset_limit:
+                        self._ground_frames = 0
+                        self._manipulation_count += 1
+                        lock_reset = True
+                else:
+                    # If we moved off ground, reset ground frames but NOT manipulation count
+                    # (Standard: manipulation count only resets on step down)
+                    self._ground_frames = 0
 
+        # --- DAS/ARR Handling ---
+        move_dir = 0
         if action == MOVE_LEFT:
-            moved = self._attempt_move(-1)
-            if moved:
-                self._last_action = "move"
-            _reset_ground_if_touching(moved)
+            move_dir = -1
         elif action == MOVE_RIGHT:
-            moved = self._attempt_move(1)
-            if moved:
-                self._last_action = "move"
-            _reset_ground_if_touching(moved)
-        elif action == ROTATE_CW:
+            move_dir = 1
+        
+        if move_dir != 0:
+            if action != self._last_move_input:
+                # Initial Press
+                self._das_timer = 0
+                self._arr_timer = 0
+                self._last_move_input = action
+                moved = self._attempt_move(move_dir)
+                if moved:
+                    self._last_action = "move"
+                _reset_ground_if_touching(moved)
+            else:
+                # Held
+                self._das_timer += 1
+                if self._das_timer >= self.das_frames:
+                    self._arr_timer += 1
+                    if self._arr_timer >= self.arr_frames:
+                        # ARR Trigger
+                        # If ARR is 0, we shift instantly to wall
+                        if self.arr_frames == 0:
+                            while self._attempt_move(move_dir):
+                                self._last_action = "move"
+                                _reset_ground_if_touching(True)
+                        else:
+                            moved = self._attempt_move(move_dir)
+                            if moved:
+                                self._last_action = "move"
+                            _reset_ground_if_touching(moved)
+                            self._arr_timer = 0
+        else:
+            # Released move input
+            self._last_move_input = MOVE_NONE
+            self._das_timer = 0
+            self._arr_timer = 0
+
+        if action == ROTATE_CW:
             rotated = self._attempt_rotate(1)
             if rotated:
                 self._last_action = "rotate_cw"
@@ -171,6 +227,7 @@ class ModernRuleset:
             if self._attempt_hold():
                 self._last_action = "hold"
                 self._ground_frames = 0
+                self._manipulation_count = 0 # New piece, reset
                 lock_reset = True
         elif action == ROTATE_180:
             if self._attempt_rotate_180():
@@ -179,8 +236,9 @@ class ModernRuleset:
 
         score_delta = 0
         touching_ground = False
-        gravity_interval = self._gravity_interval()
+        gravity_per_frame = self._gravity_per_frame()
         moved_down = False
+        
         if action == HARD_DROP:
             distance = utils.hard_drop_distance(self._board, self._current)
             self._current = self._current.moved(d_row=distance)
@@ -189,26 +247,54 @@ class ModernRuleset:
             touching_ground = True
             locked = True
             self._gravity_progress = 0.0
+            self._manipulation_count = 0
         else:
             increment = self.soft_drop_factor if action == SOFT_DROP else 1.0
-            self._gravity_progress += increment
-            while self._gravity_progress >= gravity_interval:
+            # Apply gravity (G per frame)
+            # If soft dropping, we multiply the G force
+            # Note: Standard soft drop is usually 20G or similar fixed speed, 
+            # but factor * gravity is a reasonable approximation if gravity is low.
+            # However, if gravity is very low, soft drop should still be fast.
+            # Let's use max(gravity * factor, 1/2G) or similar?
+            # For now, keeping existing factor logic but applied to G.
+            
+            # Actually, standard soft drop is 1G (1 row per frame) or faster.
+            # If we use factor, we just add to progress.
+            
+            # Calculate rows to drop this frame
+            rows_to_drop = 0.0
+            if action == SOFT_DROP:
+                 # Soft drop usually guarantees at least some speed. 
+                 # Let's say soft drop adds 0.5G (1 row every 2 frames) minimum, or factor * gravity.
+                 # A simple way: Soft drop = 20x gravity or 1G, whichever is faster?
+                 # Let's stick to factor for now to preserve config.
+                 rows_to_drop = gravity_per_frame * self.soft_drop_factor
+                 # Ensure soft drop is at least somewhat fast (e.g. 1/60 rows per frame is too slow if factor is 6)
+                 # If gravity is 0.01, factor 6 -> 0.06. Still slow.
+                 # Let's enforce a minimum soft drop speed of 0.5 rows/frame?
+                 rows_to_drop = max(rows_to_drop, 0.5)
+                 score_delta += 1 # 1 point per soft drop step (approx)
+                 self._last_action = "soft_drop"
+            else:
+                rows_to_drop = gravity_per_frame
+            
+            self._gravity_progress += rows_to_drop
+            
+            while self._gravity_progress >= 1.0:
                 candidate = self._current.moved(d_row=1)
                 if utils.collides(self._board, candidate):
                     touching_ground = True
-                    self._gravity_progress = gravity_interval
+                    self._gravity_progress = 0.0 # Stop accumulating if we hit ground
                     break
                 self._current = candidate
                 moved_down = True
                 lock_reset = True
-                self._gravity_progress -= gravity_interval
-                if action == SOFT_DROP:
-                    score_delta += utils.soft_drop_points(1)
-                    self._last_action = "soft_drop"
+                self._gravity_progress -= 1.0
+                # Reset manipulation count on step down
+                self._manipulation_count = 0
+            
             if moved_down:
                 self._ground_frames = 0
-            else:
-                self._gravity_progress = min(self._gravity_progress, gravity_interval)
 
         if not touching_ground and self._is_touching_ground():
             touching_ground = True
@@ -247,7 +333,7 @@ class ModernRuleset:
             else:
                 self._back_to_back = False
             self._lines += lines_cleared
-            self._level = self._lines // 10
+            self._level = 1 + self._lines // 10 # Level starts at 1
             attack = self._compute_attack(lines_cleared, t_spin_result, perfect_clear, is_b2b_event)
             if lines_cleared:
                 self._combo += 1
@@ -263,6 +349,7 @@ class ModernRuleset:
             self._hold_available = True
             self._ground_frames = 0
             self._gravity_progress = 0.0
+            self._manipulation_count = 0
             info["lines_cleared"] = lines_cleared
             if t_spin_result:
                 info["t_spin"] = t_spin_result
@@ -306,6 +393,8 @@ class ModernRuleset:
         candidate = self._current.rotated(delta)
         to_rotation = candidate.rotation % 4
         if piece_id == utils.NAME_TO_ID["O"]:
+            # O piece doesn't rotate, but we still check collision just in case
+            # (though it should be safe if it didn't move)
             if utils.collides(self._board, candidate):
                 return False
             self._current = candidate
@@ -370,8 +459,21 @@ class ModernRuleset:
             attack += 1
         return attack
 
-    def _gravity_interval(self) -> int:
-        return max(1, utils.gravity_frames(min(self._level, 29)))
+    def _gravity_per_frame(self) -> float:
+        # Modern Guideline Gravity
+        # Seconds per row = (0.8 - ((Level-1)*0.007))^(Level-1)
+        # Frames per row = Seconds * 60
+        # Rows per frame = 1 / Frames
+        
+        lvl = max(1, self._level)
+        if lvl >= 20:
+            return 20.0 # 20G (instant drop)
+            
+        seconds_per_row = pow(0.8 - ((lvl - 1) * 0.007), lvl - 1)
+        frames_per_row = seconds_per_row * 60.0
+        if frames_per_row <= 0.0001:
+             return 20.0
+        return 1.0 / frames_per_row
 
     def _is_touching_ground(self) -> bool:
         candidate = self._current.moved(d_row=1)
@@ -389,6 +491,8 @@ class ModernRuleset:
         piece_id = self._queue.popleft()
         self._current = utils.spawn_piece(piece_id)
         self._queue.append(next(self._bag_iter))
+        self._manipulation_count = 0
+        self._ground_frames = 0
         if utils.collides(self._board, self._current):
             self._top_out = True
 

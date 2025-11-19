@@ -103,118 +103,40 @@ def _base_shapes() -> List[np.ndarray]:
     return [I, O, T, S, Z, J, L]
 
 
-def _unique_rotations(shape: np.ndarray) -> List[np.ndarray]:
+def _unique_rotations(shape: np.ndarray, size: int = 4) -> List[np.ndarray]:
     rotations: List[np.ndarray] = []
-    for k in range(4):
-        rotated = np.rot90(shape, k=-k)
-        if not rotations or not any(np.array_equal(rotated, existing) for existing in rotations):
-            rotations.append(rotated)
+    base = shape
+    for _ in range(4):
+        rotations.append(base)
+        if size == 3:
+            # Rotate only the top-left 3x3
+            sub = base[:3, :3]
+            rotated_sub = np.rot90(sub, k=-1)
+            new_shape = base.copy()
+            new_shape[:3, :3] = rotated_sub
+            base = new_shape
+        else:
+            # Rotate full 4x4
+            base = np.rot90(base, k=-1)
+            
     return rotations
 
 
-PIECE_ROTATIONS: List[List[np.ndarray]] = [_unique_rotations(shape) for shape in _base_shapes()]
-
-# NES spawn positions (row includes hidden rows)
-NES_SPAWN_ROW = HIDDEN_ROWS - 2  # -2 relative to visible board
-NES_SPAWN_COL = 3
-
-# Modern spawn row/col can reuse NES defaults (with kicks handling externally).
-
-NES_LINE_SCORES = {1: 40, 2: 100, 3: 300, 4: 1200}
-
-
-@dataclass
-class PieceState:
-    """Runtime description of the falling piece."""
-
-    piece_id: int
-    rotation: int
-    row: int
-    col: int
-
-    def rotated(self, delta: int) -> "PieceState":
-        rotations = len(PIECE_ROTATIONS[self.piece_id])
-        return PieceState(
-            piece_id=self.piece_id,
-            rotation=(self.rotation + delta) % rotations,
-            row=self.row,
-            col=self.col,
-        )
-
-    def moved(self, d_row: int = 0, d_col: int = 0) -> "PieceState":
-        return PieceState(
-            piece_id=self.piece_id,
-            rotation=self.rotation,
-            row=self.row + d_row,
-            col=self.col + d_col,
-        )
-
-
-def get_piece_matrix(piece_state: PieceState) -> np.ndarray:
-    rotations = PIECE_ROTATIONS[piece_state.piece_id]
-    return rotations[piece_state.rotation % len(rotations)]
-
-
-def iter_filled_cells(piece_state: PieceState) -> Generator[Tuple[int, int], None, None]:
-    matrix = get_piece_matrix(piece_state)
-    for r in range(matrix.shape[0]):
-        for c in range(matrix.shape[1]):
-            if matrix[r, c]:
-                yield piece_state.row + r, piece_state.col + c
-
-
-def within_bounds(row: int, col: int) -> bool:
-    return 0 <= col < BOARD_WIDTH and row < TOTAL_ROWS
-
-
-def collides(board: np.ndarray, piece_state: PieceState) -> bool:
-    for row, col in iter_filled_cells(piece_state):
-        if col < 0 or col >= BOARD_WIDTH or row >= TOTAL_ROWS:
-            return True
-        if row >= 0 and board[row, col] != 0:
-            return True
-    return False
-
-
-def lock_piece(board: np.ndarray, piece_state: PieceState) -> np.ndarray:
-    locked = board.copy()
-    for row, col in iter_filled_cells(piece_state):
-        if row >= 0:
-            locked[row, col] = piece_state.piece_id + 1
-    return locked
-
-
-def clear_lines(board: np.ndarray) -> Tuple[np.ndarray, int, Sequence[int]]:
-    to_keep: List[np.ndarray] = []
-    cleared_indices: List[int] = []
-    for idx in range(TOTAL_ROWS):
-        row = board[idx]
-        if idx < HIDDEN_ROWS:
-            to_keep.append(row)
-            continue
-        if np.all(row):
-            cleared_indices.append(idx)
-        else:
-            to_keep.append(row)
-    lines_cleared = len(cleared_indices)
-    if lines_cleared == 0:
-        return board, 0, ()
-    new_rows = [np.zeros(BOARD_WIDTH, dtype=np.int8) for _ in range(lines_cleared)]
-    new_board = np.vstack(new_rows + to_keep)  # type: ignore[arg-type]
-    return new_board, lines_cleared, tuple(cleared_indices)
-
-
-def board_visible(board: np.ndarray) -> np.ndarray:
-    return board[HIDDEN_ROWS:].copy()
-
-
-def spawn_piece(piece_id: int) -> PieceState:
-    return PieceState(piece_id=piece_id, rotation=0, row=NES_SPAWN_ROW, col=NES_SPAWN_COL)
-
-
-def nes_score_for_lines(lines_cleared: int, level: int) -> int:
-    base = NES_LINE_SCORES.get(lines_cleared, 0)
-    return base * (level + 1)
+# Define rotation sizes: I=4, O=4 (invariant), others=3
+# Note: O is 4x4 invariant, so size=4 or 3 doesn't matter much if centered, 
+# but O is centered at (1.5, 1.5) in 4x4, so size=4 is correct.
+# Define rotation sizes: I=4, O=4 (invariant), others=3
+# Note: O is 4x4 invariant, so size=4 or 3 doesn't matter much if centered, 
+# but O is centered at (1.5, 1.5) in 4x4, so size=4 is correct.
+PIECE_SIZES = {
+    "I": 4,
+    "O": 4,
+    "T": 3,
+    "S": 3,
+    "Z": 3,
+    "J": 3,
+    "L": 3,
+}
 
 
 def soft_drop_points(dist: int) -> int:

@@ -31,6 +31,8 @@ class ModernTetrisEnv(gym.Env):
         time_limit_seconds: Optional[float] = None,
         max_steps: Optional[int] = None,
         soft_drop_factor: float = 6.0,
+        das_frames: int = 10,
+        arr_frames: int = 2,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
@@ -48,6 +50,8 @@ class ModernTetrisEnv(gym.Env):
             line_clear_delay_frames=line_clear_delay_frames,
             soft_drop_factor=soft_drop_factor,
             max_steps=max_steps,
+            das_frames=das_frames,
+            arr_frames=arr_frames,
         )
         self.observation_space = spaces.Dict(
             {

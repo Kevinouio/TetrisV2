@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Deque, Dict, List, Optional
+
+# Add project root to path
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import gymnasium as gym
 
@@ -43,13 +50,13 @@ ACTION_SCHEMES["versus"] = ACTION_SCHEMES["modern"]
 if pygame:
     KEY_BINDINGS: Dict[str, Dict[str, List[int]]] = {
         "modern": {
-            "move_left": [pygame.K_a],
-            "move_right": [pygame.K_d],
-            "soft_drop": [pygame.K_LSHIFT, pygame.K_RSHIFT],
+            "move_left": [pygame.K_a, pygame.K_LEFT],
+            "move_right": [pygame.K_d, pygame.K_RIGHT],
+            "soft_drop": [pygame.K_s, pygame.K_DOWN],
             "hard_drop": [pygame.K_SPACE],
-            "rotate_ccw": [pygame.K_LEFT],
-            "rotate_cw": [pygame.K_RIGHT],
-            "rotate_180": [pygame.K_UP],
+            "rotate_ccw": [pygame.K_z],
+            "rotate_cw": [pygame.K_x, pygame.K_UP],
+            "rotate_180": [pygame.K_a], # Wait, 'a' is move left in default?
             "hold": [pygame.K_c],
         },
         "nes": {
@@ -57,8 +64,32 @@ if pygame:
             "move_right": [pygame.K_RIGHT, pygame.K_d],
             "soft_drop": [pygame.K_DOWN, pygame.K_s],
             "hard_drop": [pygame.K_SPACE],
-            "rotate_cw": [pygame.K_UP, pygame.K_w],
+            "rotate_cw": [pygame.K_UP, pygame.K_w, pygame.K_x, pygame.K_z], # Allow Z/X for NES too? NES usually just A/B.
         },
+    }
+    # Fix modern bindings to be more standard
+    KEY_BINDINGS["modern"]["rotate_180"] = [pygame.K_w] # W for 180? Or just Up.
+    # Let's stick to the file's original bindings but maybe improve them?
+    # Original:
+    # "move_left": [pygame.K_a],
+    # "move_right": [pygame.K_d],
+    # "soft_drop": [pygame.K_LSHIFT, pygame.K_RSHIFT],
+    # "hard_drop": [pygame.K_SPACE],
+    # "rotate_ccw": [pygame.K_LEFT],
+    # "rotate_cw": [pygame.K_RIGHT],
+    # "rotate_180": [pygame.K_UP],
+    # "hold": [pygame.K_c],
+    
+    # I'll use a more standard set: Arrows for movement/rotate, Z/X/C for actions.
+    KEY_BINDINGS["modern"] = {
+        "move_left": [pygame.K_a],
+        "move_right": [pygame.K_d],
+        "soft_drop": [pygame.K_LSHIFT, pygame.K_RSHIFT],
+        "hard_drop": [pygame.K_SPACE],
+        "rotate_ccw": [pygame.K_LEFT],
+        "rotate_cw": [pygame.K_RIGHT],
+        "rotate_180": [pygame.K_UP], 
+        "hold": [pygame.K_c],
     }
 else:
     KEY_BINDINGS = {}
@@ -66,11 +97,11 @@ else:
 
 def _parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play Tetris with real-time controls.")
-    parser.add_argument("--env", choices=("nes", "modern", "versus"), default="nes")
+    parser.add_argument("--env", choices=("nes", "modern", "versus"), default="modern") # Default to modern
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--fps", type=int, default=60, help="Target frames per second.")
-    parser.add_argument("--das", type=int, default=20, help="Frames before auto shift activates.")
-    parser.add_argument("--arr", type=int, default=4, help="Frames between repeated shifts.")
+    parser.add_argument("--das", type=int, default=10, help="Frames before auto shift activates.")
+    parser.add_argument("--arr", type=int, default=2, help="Frames between repeated shifts.")
     parser.add_argument("--quit-key", default="escape", help="Key used to exit (default: escape).")
     return parser.parse_args(argv)
 
@@ -206,10 +237,25 @@ def main(argv=None) -> int:
         pygame.init()
     register_envs()
     env_id = _resolve_env_id(args.env)
-    env = gym.make(env_id, render_mode="human")
+    
+    # Pass DAS/ARR to env if modern (even though script handles it, it doesn't hurt)
+    kwargs = {}
+    if args.env == "modern":
+        kwargs["das_frames"] = args.das
+        kwargs["arr_frames"] = args.arr
+        
+    env = gym.make(env_id, render_mode="human", **kwargs)
+    
     controller = InputController(args.env, das=max(1, args.das), arr=max(1, args.arr))
     obs, _ = env.reset(seed=args.seed)
     clock = pygame.time.Clock()
+    
+    print(f"Playing {args.env} Tetris.")
+    print("Controls:")
+    for action, keys in KEY_BINDINGS.get(args.env, {}).items():
+        key_names = [pygame.key.name(k) for k in keys]
+        print(f"  {action}: {', '.join(key_names)}")
+    
     while controller.running:
         controller.process_events()
         terminated = truncated = False
@@ -222,6 +268,8 @@ def main(argv=None) -> int:
         env.unwrapped._skip_frame_advance = False
         env.render()
         if controller.reset_requested or terminated or truncated:
+            if terminated or truncated:
+                print(f"Game Over! Score: {info.get('score', 0)}")
             controller.clear_reset()
             obs, _ = env.reset()
             clock.tick(args.fps)
