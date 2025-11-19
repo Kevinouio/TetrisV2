@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generator, List, Optional, Sequence, Tuple
+from typing import Generator, Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -12,6 +12,8 @@ BOARD_WIDTH = 10
 VISIBLE_HEIGHT = 20
 HIDDEN_ROWS = 2  # spawn buffer (kept for collision only)
 TOTAL_ROWS = VISIBLE_HEIGHT + HIDDEN_ROWS
+NES_SPAWN_ROW = 0
+NES_SPAWN_COL = 3
 
 # Piece ids (match observation expectations: 0 == I, ..., 6 == L)
 PIECE_NAMES = ("I", "O", "T", "S", "Z", "J", "L")
@@ -137,6 +139,103 @@ PIECE_SIZES = {
     "J": 3,
     "L": 3,
 }
+
+PIECE_ROTATIONS: Tuple[Tuple[np.ndarray, ...], ...] = tuple(
+    tuple(_unique_rotations(shape, PIECE_SIZES[name]))
+    for name, shape in zip(PIECE_NAMES, _base_shapes())
+)
+
+
+@dataclass(frozen=True)
+class PieceState:
+    piece_id: int
+    rotation: int
+    row: int
+    col: int
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.piece_id < len(PIECE_ROTATIONS)):
+            raise ValueError(f"Invalid piece_id {self.piece_id}")
+
+    @property
+    def _rotation_count(self) -> int:
+        return len(PIECE_ROTATIONS[self.piece_id])
+
+    @property
+    def matrix(self) -> np.ndarray:
+        return PIECE_ROTATIONS[self.piece_id][self.rotation % self._rotation_count]
+
+    def moved(self, *, d_row: int = 0, d_col: int = 0) -> "PieceState":
+        return PieceState(
+            piece_id=self.piece_id,
+            rotation=self.rotation,
+            row=self.row + d_row,
+            col=self.col + d_col,
+        )
+
+    def rotated(self, delta: int) -> "PieceState":
+        return PieceState(
+            piece_id=self.piece_id,
+            rotation=(self.rotation + delta) % self._rotation_count,
+            row=self.row,
+            col=self.col,
+        )
+
+
+def within_bounds(row: int, col: int) -> bool:
+    return 0 <= row < TOTAL_ROWS and 0 <= col < BOARD_WIDTH
+
+
+def board_visible(board: np.ndarray) -> np.ndarray:
+    return board[HIDDEN_ROWS:, :].copy()
+
+
+def iter_filled_cells(piece_state: PieceState) -> Iterable[Tuple[int, int]]:
+    matrix = piece_state.matrix
+    for r in range(matrix.shape[0]):
+        for c in range(matrix.shape[1]):
+            if matrix[r, c]:
+                yield piece_state.row + r, piece_state.col + c
+
+
+def spawn_piece(piece_id: int, *, row: int = NES_SPAWN_ROW, col: int = NES_SPAWN_COL) -> PieceState:
+    if not (0 <= piece_id < len(PIECE_NAMES)):
+        raise ValueError(f"Invalid piece id {piece_id}")
+    return PieceState(piece_id=piece_id, rotation=0, row=row, col=col)
+
+
+def collides(board: np.ndarray, piece_state: PieceState) -> bool:
+    for row, col in iter_filled_cells(piece_state):
+        if col < 0 or col >= BOARD_WIDTH or row >= TOTAL_ROWS:
+            return True
+        if row >= 0 and board[row, col] != 0:
+            return True
+    return False
+
+
+def lock_piece(board: np.ndarray, piece_state: PieceState) -> np.ndarray:
+    new_board = board.copy()
+    for row, col in iter_filled_cells(piece_state):
+        if within_bounds(row, col):
+            new_board[row, col] = piece_state.piece_id + 1
+    return new_board
+
+
+def clear_lines(board: np.ndarray) -> Tuple[np.ndarray, int, np.ndarray]:
+    filled = np.all(board != 0, axis=1)
+    lines_cleared = int(np.count_nonzero(filled))
+    if not lines_cleared:
+        return board, 0, np.array([], dtype=int)
+    remaining = board[~filled]
+    cleared = np.vstack(
+        [np.zeros((lines_cleared, BOARD_WIDTH), dtype=board.dtype), remaining]
+    )
+    return cleared, lines_cleared, np.where(filled)[0]
+
+
+def nes_score_for_lines(lines: int, level: int) -> int:
+    table = {1: 40, 2: 100, 3: 300, 4: 1200}
+    return table.get(lines, 0) * (level + 1)
 
 
 def soft_drop_points(dist: int) -> int:
