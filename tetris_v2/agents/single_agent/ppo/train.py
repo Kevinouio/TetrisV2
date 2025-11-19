@@ -21,7 +21,7 @@ from tetris_v2.agents.single_agent.dqn.models import ObservationProcessor
 from tetris_v2.envs.curriculum import CurriculumEpisodeWrapper, CurriculumManager, CurriculumStage, apply_overrides, build_default_curriculum
 from tetris_v2.envs.registration import register_envs
 from tetris_v2.envs.state_presets import BoardPresetLibrary, load_board_presets
-from tetris_v2.envs.wrappers import AgentRewardConfig, EnvironmentRewardConfig, FloatBoardWrapper, RewardScaleWrapper, UniversalRewardWrapper
+from tetris_v2.envs.wrappers import AgentRewardConfig, EnvironmentRewardConfig, FloatBoardWrapper, PlacementActionWrapper, RewardScaleWrapper, UniversalRewardWrapper
 from .models import PPOAgent, PPOConfig, RolloutBuffer
 
 
@@ -85,6 +85,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Enable staged curriculum learning (line clears -> survival -> full game).",
     )
     parser.add_argument(
+        "--placement-actions",
+        action="store_true",
+        help="Collapse controls into discrete placement actions (rotate/move/drop per piece).",
+    )
+    parser.add_argument(
         "--agent-reward-weight",
         dest="agent_reward_weights",
         metavar="KEY=VALUE",
@@ -129,6 +134,7 @@ def _make_env(
     env_reward: Optional[EnvironmentRewardConfig] = None,
     curriculum_stage: Optional[CurriculumStage] = None,
     preset_library: Optional[BoardPresetLibrary] = None,
+    use_placement_actions: bool = False,
 ) -> gym.Env:
     kwargs = dict(env_kwargs or {})
     env = gym.make(env_id, **kwargs)
@@ -144,6 +150,8 @@ def _make_env(
         env = RewardScaleWrapper(env, scale=reward_scale)
     if curriculum_stage is not None:
         env = CurriculumEpisodeWrapper(env, stage=curriculum_stage, presets=preset_library)
+    if use_placement_actions:
+        env = PlacementActionWrapper(env, allow_hold=(env_kind != "nes"))
     return env
 
 
@@ -161,6 +169,7 @@ def _evaluate_policy(
     env_reward: Optional[EnvironmentRewardConfig],
     curriculum_stage: Optional[CurriculumStage],
     preset_library: Optional[BoardPresetLibrary],
+    use_placement_actions: bool,
 ) -> Tuple[float, float]:
     env = _make_env(
         env_id,
@@ -171,6 +180,7 @@ def _evaluate_policy(
         env_reward=env_reward,
         curriculum_stage=curriculum_stage,
         preset_library=preset_library,
+        use_placement_actions=use_placement_actions,
     )
     returns: list[float] = []
     scores: list[float] = []
@@ -203,6 +213,7 @@ def _make_env_factory(
     seed: Optional[int],
     curriculum_stage: Optional[CurriculumStage],
     preset_library: Optional[BoardPresetLibrary],
+    use_placement_actions: bool,
 ) -> Callable[[], gym.Env]:
     kwargs = dict(env_kwargs or {})
 
@@ -221,6 +232,8 @@ def _make_env_factory(
             env = RewardScaleWrapper(env, scale=reward_scale)
         if curriculum_stage is not None:
             env = CurriculumEpisodeWrapper(env, stage=curriculum_stage, presets=preset_library)
+        if use_placement_actions:
+            env = PlacementActionWrapper(env, allow_hold=(env_kind != "nes"))
         if seed is not None:
             env.reset(seed=seed)
         return env
@@ -346,6 +359,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         env_reward=stage_runtime.env_reward,
         curriculum_stage=stage_runtime.stage,
         preset_library=preset_library,
+        use_placement_actions=args.placement_actions,
     )
     processor = ObservationProcessor(reference_env.observation_space)
     action_dim = reference_env.action_space.n
@@ -387,16 +401,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             env_fns.append(
                 _make_env_factory(
                     env_id,
-                env_kwargs=stage_rt.env_kwargs,
-                reward_scale=args.reward_scale,
-                env_kind=env_kind,
-                agent_reward=stage_rt.agent_reward,
-                env_reward=stage_rt.env_reward,
-                seed=seed_val,
-                curriculum_stage=stage_rt.stage,
-                preset_library=preset_library,
+                    env_kwargs=stage_rt.env_kwargs,
+                    reward_scale=args.reward_scale,
+                    env_kind=env_kind,
+                    agent_reward=stage_rt.agent_reward,
+                    env_reward=stage_rt.env_reward,
+                    seed=seed_val,
+                    curriculum_stage=stage_rt.stage,
+                    preset_library=preset_library,
+                    use_placement_actions=args.placement_actions,
+                )
             )
-        )
         vector = AsyncVectorEnv(env_fns)
         seed_seq = None if args.seed is None else [args.seed + idx for idx in range(args.num_envs)]
         obs_batch, _ = vector.reset(seed=seed_seq)
@@ -538,6 +553,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 env_reward=stage_runtime.env_reward,
                 curriculum_stage=stage_runtime.stage,
                 preset_library=preset_library,
+                use_placement_actions=args.placement_actions,
             )
             print(
                 f"[eval step {global_step:,}] avg_return={eval_return:.1f} avg_score={eval_score:.1f}"

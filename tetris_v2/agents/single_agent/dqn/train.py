@@ -24,6 +24,7 @@ from tetris_v2.envs.wrappers import (
     AgentRewardConfig,
     EnvironmentRewardConfig,
     FloatBoardWrapper,
+    PlacementActionWrapper,
     RewardScaleWrapper,
     UniversalRewardWrapper,
 )
@@ -157,6 +158,11 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Enable staged curriculum learning (line clears -> survival -> full game).",
     )
     parser.add_argument(
+        "--placement-actions",
+        action="store_true",
+        help="Collapse controls into discrete placement choices (rotate/move/drop per piece).",
+    )
+    parser.add_argument(
         "--board-preset-file",
         type=Path,
         help="JSON file containing named board presets for curriculum stages.",
@@ -184,6 +190,7 @@ def _make_env(
     env_reward: Optional[EnvironmentRewardConfig] = None,
     curriculum_stage: Optional[CurriculumStage] = None,
     preset_library: Optional[BoardPresetLibrary] = None,
+    use_placement_actions: bool = False,
 ) -> gym.Env:
     kwargs = dict(env_kwargs or {})
     env = gym.make(env_id, **kwargs)
@@ -199,6 +206,8 @@ def _make_env(
         env = RewardScaleWrapper(env, scale=reward_scale)
     if curriculum_stage is not None:
         env = CurriculumEpisodeWrapper(env, stage=curriculum_stage, presets=preset_library)
+    if use_placement_actions:
+        env = PlacementActionWrapper(env, allow_hold=(env_kind != "nes"))
     return env
 
 
@@ -216,6 +225,7 @@ def _evaluate_policy(
     env_reward: Optional[EnvironmentRewardConfig] = None,
     curriculum_stage: Optional[CurriculumStage] = None,
     preset_library: Optional[BoardPresetLibrary] = None,
+    use_placement_actions: bool = False,
 ) -> Tuple[float, float]:
     env = _make_env(
         env_id,
@@ -226,6 +236,7 @@ def _evaluate_policy(
         env_reward=env_reward,
         curriculum_stage=curriculum_stage,
         preset_library=preset_library,
+        use_placement_actions=use_placement_actions,
     )
     returns: list[float] = []
     scores: list[float] = []
@@ -258,6 +269,7 @@ def _make_env_factory(
     preset_library: Optional[BoardPresetLibrary],
     curriculum_stage: Optional[CurriculumStage],
     seed: Optional[int],
+    use_placement_actions: bool,
 ) -> Callable[[], gym.Env]:
     kwargs = dict(env_kwargs or {})
 
@@ -276,6 +288,8 @@ def _make_env_factory(
             env = RewardScaleWrapper(env, scale=reward_scale)
         if curriculum_stage is not None:
             env = CurriculumEpisodeWrapper(env, stage=curriculum_stage, presets=preset_library)
+        if use_placement_actions:
+            env = PlacementActionWrapper(env, allow_hold=(env_kind != "nes"))
         if seed is not None:
             env.reset(seed=seed)
         return env
@@ -393,6 +407,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         env_reward=stage_runtime.env_reward,
         curriculum_stage=stage_runtime.stage,
         preset_library=preset_library,
+        use_placement_actions=args.placement_actions,
     )
     processor = ObservationProcessor(reference_env.observation_space)
     action_dim = reference_env.action_space.n
@@ -447,15 +462,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             env_fns.append(
                 _make_env_factory(
                     env_id,
-                env_kwargs=stage_rt.env_kwargs,
-                reward_scale=args.reward_scale,
-                env_kind=env_kind,
-                agent_reward=stage_rt.agent_reward,
-                env_reward=stage_rt.env_reward,
-                preset_library=preset_library,
-                curriculum_stage=stage_rt.stage,
-                seed=seed_val,
-            )
+                    env_kwargs=stage_rt.env_kwargs,
+                    reward_scale=args.reward_scale,
+                    env_kind=env_kind,
+                    agent_reward=stage_rt.agent_reward,
+                    env_reward=stage_rt.env_reward,
+                    preset_library=preset_library,
+                    curriculum_stage=stage_rt.stage,
+                    seed=seed_val,
+                    use_placement_actions=args.placement_actions,
+                )
             )
         vector = AsyncVectorEnv(env_fns)
         seed_seq = None if args.seed is None else [args.seed + idx for idx in range(args.num_envs)]
@@ -605,6 +621,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 env_reward=stage_runtime.env_reward,
                 curriculum_stage=stage_runtime.stage,
                 preset_library=preset_library,
+                use_placement_actions=args.placement_actions,
             )
             print(
                 f"[eval step {global_step:,}] avg_return={eval_return:.1f} "

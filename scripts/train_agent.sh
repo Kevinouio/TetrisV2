@@ -20,6 +20,7 @@ General options:
   --env-reward-weight       Override EnvironmentRewardConfig field (repeatable)
   --curriculum              Enable staged curriculum schedule
   --board-preset-file PATH  JSON file containing custom board presets
+  --placement-actions       Use placement-based macro actions instead of low-level inputs
 
 PPO-specific defaults (overridable):
   --n-steps N               Rollout horizon per update (default: 4096)
@@ -47,6 +48,7 @@ PPO_N_STEPS=4096
 PPO_MINIBATCH=2048
 DQN_BUFFER=400000
 DQN_BATCH=256
+PLACEMENT_ACTIONS=0
 EXTRA_ARGS=()
 AGENT_REWARD_WEIGHTS=()
 ENV_REWARD_WEIGHTS=()
@@ -131,6 +133,10 @@ while [[ $# -gt 0 ]]; do
       BOARD_PRESET_FILE="$2"
       shift 2
       ;;
+    --placement-actions)
+      PLACEMENT_ACTIONS=1
+      shift
+      ;;
     --)
       shift
       EXTRA_ARGS+=("$@")
@@ -190,6 +196,9 @@ if [[ -n "$DEVICE" ]]; then
 fi
 if [[ -n "$BOARD_PRESET_FILE" ]]; then
   CMD+=(--board-preset-file "$BOARD_PRESET_FILE")
+fi
+if [[ "$PLACEMENT_ACTIONS" -eq 1 ]]; then
+  CMD+=(--placement-actions)
 fi
 
 for weight in "${AGENT_REWARD_WEIGHTS[@]}"; do
