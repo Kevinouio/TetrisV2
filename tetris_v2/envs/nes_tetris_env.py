@@ -147,9 +147,13 @@ class NesTetrisEnv(gym.Env):
 
         if rotated_this_step:
             self._consecutive_rotations += 1
-            if self.rotation_penalty and self._consecutive_rotations > 1:
-                extra_reward -= self.rotation_penalty / 100.0
-                info["rotation_penalty"] = info.get("rotation_penalty", 0.0) - self.rotation_penalty
+            max_free_rotations = 2
+            excess = max(0, self._consecutive_rotations - max_free_rotations)
+            if excess > 0:
+                info["excess_rotations"] = excess
+                if self.rotation_penalty:
+                    extra_reward -= self.rotation_penalty / 100.0
+                    info["rotation_penalty"] = info.get("rotation_penalty", 0.0) - self.rotation_penalty
         else:
             self._consecutive_rotations = 0
 
@@ -244,6 +248,7 @@ class NesTetrisEnv(gym.Env):
     def _spawn_next(self) -> None:
         next_piece = self._consume_preview()
         self._current = utils.spawn_piece(next_piece)
+        self._consecutive_rotations = 0
 
     def _refill_preview_queue(self) -> None:
         self._preview_queue = [utils.uniform_piece_id(self._rng) for _ in range(self.preview_pieces)]

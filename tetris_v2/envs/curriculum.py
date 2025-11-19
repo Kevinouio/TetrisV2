@@ -67,6 +67,8 @@ def build_default_curriculum(total_timesteps: int) -> CurriculumManager:
                 "board_change_bonus": 0.5,
                 "hole_penalty": 0.2,
                 "bumpiness_penalty": 0.0,
+                "excess_rotation_penalty": 0.5,
+                "time_decay_penalty": 0.05,
             },
             env_reward_overrides={
                 "combo_reward": 0.0,

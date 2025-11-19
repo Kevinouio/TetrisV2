@@ -66,6 +66,8 @@ class AgentRewardConfig:
     bumpiness_drop_reward: float = 0.01
     idle_penalty: float = 0.05
     board_change_bonus: float = 0.1
+    excess_rotation_penalty: float = 0.0
+    time_decay_penalty: float = 0.0
 
 
 @dataclass
@@ -204,8 +206,14 @@ class UniversalRewardWrapper(RewardWrapper):
         total += cfg.line_clear_bonus * float(info.get("lines_cleared", 0))
         if not terminated and not truncated:
             total += cfg.survival_reward
+            if cfg.time_decay_penalty:
+                total -= cfg.time_decay_penalty
         if terminated:
             total -= cfg.top_out_penalty
+
+        excess_rot = float(info.get("excess_rotations", 0) or 0.0)
+        if excess_rot and cfg.excess_rotation_penalty:
+            total -= cfg.excess_rotation_penalty * excess_rot
         return total
 
     def _environment_reward(self, info: Dict[str, Any]) -> float:

@@ -85,6 +85,7 @@ class ModernRuleset:
         self._ground_frames = 0
         self._gravity_progress = 0.0
         self._last_action = "none"
+        self._rotation_streak = 0
         
         # Extended Placement
         self._manipulation_count = 0
@@ -122,6 +123,7 @@ class ModernRuleset:
         self._ground_frames = 0
         self._gravity_progress = 0.0
         self._last_action = "none"
+        self._rotation_streak = 0
         self._manipulation_count = 0
         self._das_timer = 0
         self._arr_timer = 0
@@ -138,6 +140,7 @@ class ModernRuleset:
 
         self._steps += 1
         info: Dict[str, int | float | bool | str] = {}
+        rotation_performed = False
 
         if self._current is None:
             self._spawn_next()
@@ -217,11 +220,13 @@ class ModernRuleset:
             rotated = self._attempt_rotate(1)
             if rotated:
                 self._last_action = "rotate_cw"
+                rotation_performed = True
             _reset_ground_if_touching(rotated)
         elif action == ROTATE_CCW:
             rotated = self._attempt_rotate(-1)
             if rotated:
                 self._last_action = "rotate_ccw"
+                rotation_performed = True
             _reset_ground_if_touching(rotated)
         elif action == HOLD:
             if self._attempt_hold():
@@ -232,7 +237,16 @@ class ModernRuleset:
         elif action == ROTATE_180:
             if self._attempt_rotate_180():
                 self._last_action = "rotate_180"
+                rotation_performed = True
                 _reset_ground_if_touching(True)
+
+        if rotation_performed:
+            self._rotation_streak += 1
+        else:
+            self._rotation_streak = 0
+        excess_rotations = max(0, self._rotation_streak - 1)
+        if excess_rotations > 0:
+            info["excess_rotations"] = excess_rotations
 
         score_delta = 0
         touching_ground = False
@@ -493,6 +507,7 @@ class ModernRuleset:
         self._queue.append(next(self._bag_iter))
         self._manipulation_count = 0
         self._ground_frames = 0
+        self._rotation_streak = 0
         if utils.collides(self._board, self._current):
             self._top_out = True
 
