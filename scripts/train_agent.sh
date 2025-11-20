@@ -18,7 +18,8 @@ General options:
   --reward-weight KEY=VAL   Override AgentRewardConfig field (repeatable)
   --agent-reward-weight     Alias for --reward-weight (repeatable)
   --env-reward-weight       Override EnvironmentRewardConfig field (repeatable)
-  --curriculum              Enable staged curriculum schedule
+  --curriculum-profile MODE Use staged curriculum (macro/none, default: macro)
+  --no-curriculum          Shortcut for --curriculum-profile none
   --board-preset-file PATH  JSON file containing custom board presets
   --placement-actions       Use placement-based macro actions instead of low-level inputs
 
@@ -52,7 +53,7 @@ PLACEMENT_ACTIONS=0
 EXTRA_ARGS=()
 AGENT_REWARD_WEIGHTS=()
 ENV_REWARD_WEIGHTS=()
-CURRICULUM=0
+CURRICULUM_PROFILE="macro"
 BOARD_PRESET_FILE=""
 
 while [[ $# -gt 0 ]]; do
@@ -125,8 +126,12 @@ while [[ $# -gt 0 ]]; do
       ENV_REWARD_WEIGHTS+=("$2")
       shift 2
       ;;
-    --curriculum)
-      CURRICULUM=1
+    --curriculum-profile)
+      CURRICULUM_PROFILE="$2"
+      shift 2
+      ;;
+    --no-curriculum)
+      CURRICULUM_PROFILE="none"
       shift
       ;;
     --board-preset-file)
@@ -156,7 +161,7 @@ fi
 
 case "$ALGO" in
   ppo)
-    MODULE="tetris_v2.agents.ppo.train"
+    MODULE="tetris_v2.agents.single_agent.ppo.train"
     CMD=(python -m "$MODULE"
       --env "$ENV_NAME"
       --total-timesteps "$TOTAL_STEPS"
@@ -197,21 +202,25 @@ fi
 if [[ -n "$BOARD_PRESET_FILE" ]]; then
   CMD+=(--board-preset-file "$BOARD_PRESET_FILE")
 fi
+CMD+=(--curriculum-profile "$CURRICULUM_PROFILE")
 if [[ "$PLACEMENT_ACTIONS" -eq 1 ]]; then
   CMD+=(--placement-actions)
 fi
 
-for weight in "${AGENT_REWARD_WEIGHTS[@]}"; do
-  CMD+=(--agent-reward-weight "$weight")
-done
-for weight in "${ENV_REWARD_WEIGHTS[@]}"; do
-  CMD+=(--environment-reward-weight "$weight")
-done
-if [[ $CURRICULUM -eq 1 ]]; then
-  CMD+=(--curriculum)
+if [[ ${#AGENT_REWARD_WEIGHTS[@]} -gt 0 ]]; then
+  for weight in "${AGENT_REWARD_WEIGHTS[@]}"; do
+    CMD+=(--agent-reward-weight "$weight")
+  done
+fi
+if [[ ${#ENV_REWARD_WEIGHTS[@]} -gt 0 ]]; then
+  for weight in "${ENV_REWARD_WEIGHTS[@]}"; do
+    CMD+=(--environment-reward-weight "$weight")
+  done
 fi
 
-CMD+=("${EXTRA_ARGS[@]}")
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  CMD+=("${EXTRA_ARGS[@]}")
+fi
 
 echo "Running: ${CMD[*]}"
 exec "${CMD[@]}"

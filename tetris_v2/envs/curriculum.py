@@ -10,6 +10,7 @@ from gymnasium import Wrapper
 
 from . import utils
 from .state_presets import BoardPreset, BoardPresetLibrary, apply_board_preset
+from .wrappers import _ProxyWrapperMixin
 
 
 @dataclass
@@ -25,6 +26,7 @@ class CurriculumStage:
     max_moves: Optional[int] = None
     end_on_line_clear: bool = False
     board_setup: Optional[str] = None
+    max_height: Optional[int] = None
 
 
 class CurriculumManager:
@@ -148,7 +150,128 @@ def build_default_curriculum(total_timesteps: int) -> CurriculumManager:
     return CurriculumManager(stages)
 
 
-class CurriculumEpisodeWrapper(Wrapper):
+def build_modern_placement_curriculum(total_timesteps: int) -> CurriculumManager:
+    """Curriculum tuned for placement-action agents in the modern environment."""
+
+    def _cap(value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        return min(value, total_timesteps)
+
+    stages: List[CurriculumStage] = []
+
+    stage_defs = [
+        (
+            "guided_line_clears",
+            2_000_000,
+            CurriculumStage(
+                name="guided_line_clears",
+                max_global_steps=None,
+                description="Start near line clears with slow pieces and limited bag to learn precise placements.",
+                env_kwargs={
+                    "max_steps": 60,
+                    "allowed_pieces": ("I", "J", "L", "T"),
+                    "das_frames": 14,
+                    "arr_frames": 6,
+                    "soft_drop_factor": 4.0,
+                },
+                agent_reward_overrides={
+                    "line_clear_bonus": 4.0,
+                    "idle_penalty": 0.0,
+                    "hole_penalty": 0.4,
+                    "survival_reward": 0.05,
+                },
+                env_reward_overrides={
+                    "combo_reward": 0.0,
+                    "attack_reward": 0.0,
+                    "hard_drop_reward": 0.01,
+                },
+                board_setup="modern_easy_line_clear",
+                max_moves=60,
+                end_on_line_clear=True,
+                max_height=8,
+            ),
+        ),
+        (
+            "restricted_stack_building",
+            3_500_000,
+            CurriculumStage(
+                name="restricted_stack_building",
+                max_global_steps=None,
+                description="Focus on flat stacking with a limited height cap and reduced piece variety.",
+                env_kwargs={
+                    "max_steps": 140,
+                    "allowed_pieces": ("I", "J", "L", "O", "T"),
+                    "das_frames": 12,
+                    "arr_frames": 4,
+                },
+                agent_reward_overrides={
+                    "line_clear_bonus": 2.5,
+                    "hole_penalty": 0.8,
+                    "bumpiness_penalty": 0.05,
+                    "height_penalty": 0.04,
+                },
+                env_reward_overrides={
+                    "combo_reward": 0.02,
+                    "attack_reward": 0.01,
+                },
+                board_setup="modern_stack_intro",
+                max_moves=140,
+                max_height=12,
+            ),
+        ),
+        (
+            "height_constrained_survival",
+            5_000_000,
+            CurriculumStage(
+                name="height_constrained_survival",
+                max_global_steps=None,
+                description="Increase variety while keeping a reasonable height ceiling to encourage stability.",
+                env_kwargs={
+                    "max_steps": 220,
+                    "allowed_pieces": None,
+                    "das_frames": 10,
+                    "arr_frames": 3,
+                },
+                agent_reward_overrides={
+                    "line_clear_bonus": 1.5,
+                    "hole_penalty": 1.0,
+                    "height_penalty": 0.06,
+                    "bumpiness_penalty": 0.05,
+                },
+                env_reward_overrides={
+                    "combo_reward": 0.04,
+                    "attack_reward": 0.02,
+                },
+                board_setup="modern_column_focus",
+                max_moves=220,
+                max_height=16,
+            ),
+        ),
+    ]
+
+    previous_cap = 0
+    for _, target, template in stage_defs:
+        cap = _cap(target)
+        if cap is not None and cap <= previous_cap:
+            continue
+        stage = replace(template, max_global_steps=cap)
+        stages.append(stage)
+        if cap is not None:
+            previous_cap = cap
+
+    stages.append(
+        CurriculumStage(
+            name="full_gameplay",
+            max_global_steps=None,
+            description="Full-speed modern Tetris with the complete bag and standard speeds.",
+            env_kwargs={},
+        )
+    )
+    return CurriculumManager(stages)
+
+
+class CurriculumEpisodeWrapper(_ProxyWrapperMixin, Wrapper):
     """Limits episode length / termination and injects curriculum board setups."""
 
     def __init__(self, env, stage: CurriculumStage, presets: Optional[BoardPresetLibrary] = None):
@@ -176,6 +299,11 @@ class CurriculumEpisodeWrapper(Wrapper):
         if self.stage.max_moves is not None and self._moves >= self.stage.max_moves:
             truncated = True
             info["curriculum_max_moves"] = True
+        if self.stage.max_height is not None:
+            board = np.asarray(obs.get("board"))
+            if board is not None and _max_column_height(board) >= self.stage.max_height:
+                truncated = True
+                info["curriculum_max_height"] = True
         return obs, reward, terminated, truncated, info
 
 
@@ -193,6 +321,12 @@ def _apply_board_setup(env, preset: str, preset_library: Optional[BoardPresetLib
     preset_lower = preset.lower()
     if preset_lower == "nes_easy_line_clear":
         return _nes_easy_line_clear(env)
+    if preset_lower == "modern_easy_line_clear":
+        return _modern_easy_line_clear(env)
+    if preset_lower == "modern_stack_intro":
+        return _modern_stack_intro(env)
+    if preset_lower == "modern_column_focus":
+        return _modern_column_focus(env)
     if preset_library:
         key = preset
         if preset_lower.startswith("preset:"):
@@ -201,6 +335,21 @@ def _apply_board_setup(env, preset: str, preset_library: Optional[BoardPresetLib
         if preset_obj is not None:
             return apply_board_preset(env, preset_obj)
     return None
+
+
+def _max_column_height(board: np.ndarray) -> int:
+    if board is None:
+        return 0
+    binary = np.where(board > 0, 1, 0)
+    rows, cols = binary.shape
+    max_height = 0
+    for col in range(cols):
+        filled = np.where(binary[:, col] > 0)[0]
+        if filled.size:
+            height = rows - filled[0]
+            if height > max_height:
+                max_height = height
+    return max_height
 
 
 def _lookup_preset(presets: BoardPresetLibrary, key: str) -> Optional[BoardPreset]:
@@ -239,3 +388,71 @@ def _nes_easy_line_clear(env):
     base._consecutive_rotations = 0
     base._top_out = False
     return base._observe()
+
+
+def _modern_easy_line_clear(env):
+    from .modern_tetris_env import ModernTetrisEnv
+
+    base = env.unwrapped
+    if not isinstance(base, ModernTetrisEnv):
+        return None
+    rules = base._rules
+    board = utils.create_board()
+    target_row = utils.TOTAL_ROWS - 1
+    board[target_row] = np.ones_like(board[target_row])
+    board[target_row, 3:7] = 0
+    piece = utils.spawn_piece(utils.NAME_TO_ID["I"])
+    piece = piece.moved(d_col=1)
+    _reset_modern_state(rules, board, piece)
+    return rules._observe()
+
+
+def _modern_stack_intro(env):
+    from .modern_tetris_env import ModernTetrisEnv
+
+    base = env.unwrapped
+    if not isinstance(base, ModernTetrisEnv):
+        return None
+    rules = base._rules
+    board = utils.create_board()
+    for row in range(utils.TOTAL_ROWS - 4, utils.TOTAL_ROWS - 1):
+        board[row, :3] = 2
+    piece = utils.spawn_piece(utils.NAME_TO_ID["L"])
+    _reset_modern_state(rules, board, piece)
+    return rules._observe()
+
+
+def _modern_column_focus(env):
+    from .modern_tetris_env import ModernTetrisEnv
+
+    base = env.unwrapped
+    if not isinstance(base, ModernTetrisEnv):
+        return None
+    rules = base._rules
+    board = utils.create_board()
+    for row in range(utils.TOTAL_ROWS - 8, utils.TOTAL_ROWS - 2):
+        board[row, 4:6] = 3
+    piece = utils.spawn_piece(utils.NAME_TO_ID["T"])
+    _reset_modern_state(rules, board, piece)
+    return rules._observe()
+
+
+def _reset_modern_state(rules, board: np.ndarray, piece: utils.PieceState) -> None:
+    rules._board = board
+    rules._current = piece
+    rules._pending_garbage.clear()
+    rules._queue.clear()
+    rules._fill_queue()
+    rules._hold_piece = None
+    rules._hold_available = True
+    rules._combo = 0
+    rules._back_to_back = False
+    rules._score = 0
+    rules._steps = 0
+    rules._lines = 0
+    rules._level = 1
+    rules._line_clear_timer = 0
+    rules._ground_frames = 0
+    rules._manipulation_count = 0
+    rules._rotation_streak = 0
+    rules._top_out = False

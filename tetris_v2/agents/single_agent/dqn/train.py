@@ -17,7 +17,14 @@ from tetris_v2.agents.single_agent.common import (
     build_environment_reward_config,
     linear_schedule,
 )
-from tetris_v2.envs.curriculum import CurriculumEpisodeWrapper, CurriculumManager, CurriculumStage, apply_overrides, build_default_curriculum
+from tetris_v2.envs.curriculum import (
+    CurriculumEpisodeWrapper,
+    CurriculumManager,
+    CurriculumStage,
+    apply_overrides,
+    build_default_curriculum,
+    build_modern_placement_curriculum,
+)
 from tetris_v2.envs.registration import register_envs
 from tetris_v2.envs.state_presets import BoardPresetLibrary, load_board_presets
 from tetris_v2.envs.wrappers import (
@@ -156,6 +163,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--curriculum",
         action="store_true",
         help="Enable staged curriculum learning (line clears -> survival -> full game).",
+    )
+    parser.add_argument(
+        "--curriculum-profile",
+        choices=("macro", "none"),
+        default="none",
+        help="Optional curriculum preset; overrides --curriculum when set.",
     )
     parser.add_argument(
         "--placement-actions",
@@ -388,8 +401,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         env_reward=base_env_reward_cfg,
         env_kwargs=dict(base_env_kwargs),
     )
-    if args.curriculum:
-        stage_manager = build_default_curriculum(args.total_timesteps)
+    use_curriculum = args.curriculum or args.curriculum_profile != "none"
+    if use_curriculum:
+        if args.curriculum_profile != "none" and env_kind == "modern":
+            stage_manager = build_modern_placement_curriculum(args.total_timesteps)
+        else:
+            stage_manager = build_default_curriculum(args.total_timesteps)
         active_stage = stage_manager.stage_for_step(0)
         stage_runtime = _build_stage_runtime(
             active_stage,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import gymnasium as gym
@@ -33,6 +33,7 @@ class ModernTetrisEnv(gym.Env):
         soft_drop_factor: float = 6.0,
         das_frames: int = 10,
         arr_frames: int = 2,
+        allowed_pieces: Optional[Sequence[str | int]] = None,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
@@ -52,6 +53,7 @@ class ModernTetrisEnv(gym.Env):
             max_steps=max_steps,
             das_frames=das_frames,
             arr_frames=arr_frames,
+            allowed_pieces=allowed_pieces,
         )
         self.observation_space = spaces.Dict(
             {

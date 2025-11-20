@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -58,6 +58,7 @@ class ModernRuleset:
         das_frames: int = 10,  # Delayed Auto Shift
         arr_frames: int = 2,   # Auto Repeat Rate
         rng: Optional[np.random.Generator] = None,
+        allowed_pieces: Optional[Sequence[int | str]] = None,
     ) -> None:
         self.queue_size = queue_size
         self.lock_delay_frames = lock_delay_frames
@@ -67,7 +68,21 @@ class ModernRuleset:
         self.das_frames = das_frames
         self.arr_frames = arr_frames
         self._rng = rng or np.random.default_rng()
-        self._bag_iter = utils.bag_sequence(self._rng)
+        self._allowed_piece_ids: Optional[Tuple[int, ...]] = None
+        if allowed_pieces is not None:
+            ids: list[int] = []
+            for entry in allowed_pieces:
+                if isinstance(entry, str):
+                    name = entry.strip().upper()
+                    if name not in utils.NAME_TO_ID:
+                        raise ValueError(f"Unknown piece '{entry}' in allowed_pieces")
+                    ids.append(utils.NAME_TO_ID[name])
+                else:
+                    ids.append(int(entry))
+            if not ids:
+                raise ValueError("allowed_pieces must contain at least one piece name or id")
+            self._allowed_piece_ids = tuple(ids)
+        self._bag_iter = utils.bag_sequence(self._rng, self._allowed_piece_ids)
         self._queue: Deque[int] = deque()
         self._pending_garbage: Deque[int] = deque()
         self._board = utils.create_board()
@@ -103,7 +118,7 @@ class ModernRuleset:
     def reset(self, seed: Optional[int] = None) -> Dict[str, np.ndarray]:
         if seed is not None:
             self._rng = np.random.default_rng(seed)
-        self._bag_iter = utils.bag_sequence(self._rng)
+        self._bag_iter = utils.bag_sequence(self._rng, self._allowed_piece_ids)
         self._queue.clear()
         self._fill_queue()
         self._current = utils.spawn_piece(self._queue.popleft())

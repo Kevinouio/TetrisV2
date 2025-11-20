@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generator, Iterable, List, Optional, Tuple
+from typing import Generator, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -263,9 +263,21 @@ def uniform_piece_id(rng: np.random.Generator) -> int:
     return rng.integers(0, len(PIECE_NAMES))
 
 
-def bag_sequence(rng: np.random.Generator) -> Generator[int, None, None]:
+def bag_sequence(
+    rng: np.random.Generator,
+    pieces: Optional[Sequence[int]] = None,
+) -> Generator[int, None, None]:
+    """Yield randomised 7-bag (or subset) piece ids indefinitely."""
+
+    if pieces is None:
+        population = list(range(len(PIECE_NAMES)))
+    else:
+        population = [int(pid) for pid in pieces]
+        if not population:
+            raise ValueError("'pieces' must contain at least one piece id.")
+
     while True:
-        bag = list(range(len(PIECE_NAMES)))
+        bag = list(population)
         rng.shuffle(bag)
         for piece in bag:
             yield piece

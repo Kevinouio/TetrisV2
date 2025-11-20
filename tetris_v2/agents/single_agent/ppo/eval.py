@@ -1,4 +1,4 @@
-"""Evaluate a trained PPO checkpoint."""
+"""Evaluate a trained native PPO checkpoint."""
 
 from __future__ import annotations
 
@@ -7,22 +7,23 @@ from pathlib import Path
 from typing import Optional
 
 import gymnasium as gym
+import numpy as np
 
 from tetris_v2.agents.single_agent.common import build_agent_reward_config, build_environment_reward_config
 from tetris_v2.agents.single_agent.dqn.models import ObservationProcessor
 from tetris_v2.envs.registration import register_envs
-from tetris_v2.envs.wrappers import FloatBoardWrapper, RewardScaleWrapper, UniversalRewardWrapper
+from tetris_v2.envs.wrappers import FloatBoardWrapper, PlacementActionWrapper, RewardScaleWrapper, UniversalRewardWrapper
 from .models import PPOAgent
 
 
 def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a PPO agent checkpoint.")
+    parser = argparse.ArgumentParser(description="Evaluate a native PPO checkpoint.")
     parser.add_argument("checkpoint", type=Path, help="Path to the saved .pt checkpoint.")
     parser.add_argument("--env", choices=("nes", "modern", "custom"), default="nes")
     parser.add_argument("--env-id", help="Gymnasium id when --env=custom.")
     parser.add_argument("--episodes", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=321)
-    parser.add_argument("--render", action="store_true")
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--render", action="store_true", help="Render gameplay to a pygame window.")
     parser.add_argument("--device", help="Torch device override for loading the checkpoint.")
     parser.add_argument("--reward-scale", type=float, default=1.0)
     parser.add_argument("--rotation-penalty", type=float, default=0.0)
@@ -56,6 +57,26 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         action="append",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--temperature", type=float, default=1.0, help="Action sampling temperature.")
+    parser.add_argument("--epsilon", type=float, default=0.0, help="Epsilon-greedy exploration rate.")
+    parser.add_argument(
+        "--deterministic",
+        dest="deterministic",
+        action="store_true",
+        default=True,
+        help="Use greedy actions (default).",
+    )
+    parser.add_argument(
+        "--stochastic",
+        dest="deterministic",
+        action="store_false",
+        help="Sample actions instead of running deterministically.",
+    )
+    parser.add_argument(
+        "--placement-actions",
+        action="store_true",
+        help="Evaluate a placement-action policy (must match training).",
+    )
     return parser.parse_args(argv)
 
 
@@ -76,6 +97,7 @@ def _wrap_env(
     env_kind: str,
     agent_reward_weights: Optional[list[str]],
     environment_reward_weights: Optional[list[str]],
+    use_placement_actions: bool,
 ):
     try:
         agent_cfg = build_agent_reward_config(agent_reward_weights)
@@ -91,6 +113,8 @@ def _wrap_env(
     env = FloatBoardWrapper(env)
     if reward_scale != 1.0:
         env = RewardScaleWrapper(env, scale=reward_scale)
+    if use_placement_actions:
+        env = PlacementActionWrapper(env, allow_hold=(env_kind != "nes"))
     return env
 
 
@@ -113,6 +137,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             env_kind = "modern"
         elif "nes" in lowered:
             env_kind = "nes"
+
     env = gym.make(env_id, render_mode="human" if args.render else None, **env_kwargs)
     env = _wrap_env(
         env,
@@ -120,6 +145,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         env_kind=env_kind,
         agent_reward_weights=args.agent_reward_weights,
         environment_reward_weights=args.environment_reward_weights,
+        use_placement_actions=args.placement_actions,
     )
 
     processor = ObservationProcessor(env.observation_space)
@@ -135,7 +161,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         total_reward = 0.0
         last_score = 0.0
         while not (terminated or truncated):
-            action, _, _ = agent.act(flat, temperature=1e-6, epsilon=0.0, deterministic=True)
+            action, _, _ = agent.act(
+                flat,
+                temperature=args.temperature,
+                epsilon=args.epsilon,
+                deterministic=args.deterministic,
+            )
             obs, reward, terminated, truncated, info = env.step(action)
             flat = processor.flatten(obs)
             total_reward += reward
@@ -143,10 +174,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             if args.render:
                 env.render()
         returns.append(total_reward)
-        print(f"Episode {episode+1}: reward={total_reward:.1f}, score={last_score:.1f}")
+        print(f"Episode {episode + 1}: reward={total_reward:.1f}, score={last_score:.1f}")
 
     env.close()
-    avg_return = sum(returns) / max(len(returns), 1)
+    avg_return = float(np.mean(returns)) if returns else 0.0
     print(f"Average return over {len(returns)} episodes: {avg_return:.1f}")
     return 0
 
