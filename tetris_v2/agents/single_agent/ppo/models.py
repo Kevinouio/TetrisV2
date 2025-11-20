@@ -20,36 +20,15 @@ class ActorCritic(nn.Module):
         input_dim: int,
         action_dim: int,
         hidden_sizes: Sequence[int],
-        *,
-        board_dim: int = 0,
-        board_shape: Optional[Tuple[int, int]] = None,
     ):
         super().__init__()
-        self.board_dim = int(board_dim)
-        self.board_shape = board_shape
-        vector_dim = input_dim - self.board_dim
-        if self.board_dim and self.board_shape is not None:
-            channels = 32
-            self.board_extractor = nn.Sequential(
-                nn.Conv2d(1, channels, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(channels, channels * 2, kernel_size=3, padding=1),
-                nn.ReLU(),
-                nn.Flatten(),
-            )
-            conv_out = (channels * 2) * self.board_shape[0] * self.board_shape[1]
-        else:
-            self.board_extractor = None
-            conv_out = 0
-
-        mlp_input = conv_out + max(vector_dim, 0)
         layers: list[nn.Module] = []
-        dims = [mlp_input] + list(hidden_sizes)
+        dims = [input_dim] + list(hidden_sizes)
         for idx in range(len(hidden_sizes)):
             layers.append(nn.Linear(dims[idx], dims[idx + 1]))
             layers.append(nn.ReLU())
         self.feature_extractor = nn.Sequential(*layers) if layers else nn.Identity()
-        last_dim = dims[-1] if hidden_sizes else mlp_input
+        last_dim = dims[-1] if hidden_sizes else input_dim
         self.policy_head = nn.Linear(last_dim, action_dim)
         self.value_head = nn.Linear(last_dim, 1)
 
@@ -59,17 +38,7 @@ class ActorCritic(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, x: Tensor) -> Tuple[Tensor, Tensor]:  # type: ignore[override]
-        if self.board_extractor is not None and self.board_dim > 0:
-            board = x[:, : self.board_dim].view(-1, 1, *self.board_shape)  # type: ignore[arg-type]
-            rest = x[:, self.board_dim :]
-            board_features = self.board_extractor(board)
-            if rest.shape[1] > 0:
-                feat_input = torch.cat([board_features, rest], dim=1)
-            else:
-                feat_input = board_features
-        else:
-            feat_input = x
-        features = self.feature_extractor(feat_input)
+        features = self.feature_extractor(x)
         logits = self.policy_head(features)
         values = self.value_head(features).squeeze(-1)
         return logits, values
@@ -88,8 +57,6 @@ class PPOConfig:
     value_coef: float = 0.5
     max_grad_norm: float = 0.5
     device: Optional[str] = None
-    board_dim: int = 0
-    board_shape: Optional[Tuple[int, int]] = None
 
 
 class RolloutBuffer:
@@ -194,8 +161,6 @@ class PPOAgent:
             config.obs_dim,
             config.action_dim,
             config.hidden_sizes,
-            board_dim=config.board_dim,
-            board_shape=config.board_shape,
         ).to(self.device)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=config.learning_rate)
 
@@ -333,8 +298,6 @@ class PPOAgent:
                 "entropy_coef": self.config.entropy_coef,
                 "value_coef": self.config.value_coef,
                 "max_grad_norm": self.config.max_grad_norm,
-                "board_dim": self.config.board_dim,
-                "board_shape": self.config.board_shape,
             },
             "state_dict": self.policy.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -346,6 +309,11 @@ class PPOAgent:
     def load(cls, path: str, *, device: Optional[str] = None) -> Tuple["PPOAgent", Dict[str, float]]:
         payload = torch.load(path, map_location=device or "cpu", weights_only=False)
         cfg = payload["config"]
+        if cfg.get("board_dim") or cfg.get("board_shape"):
+            raise ValueError(
+                "Checkpoint was trained with the deprecated CNN board encoder; "
+                "please retrain with the current MLP architecture."
+            )
         config = PPOConfig(
             obs_dim=cfg["obs_dim"],
             action_dim=cfg["action_dim"],
@@ -358,8 +326,6 @@ class PPOAgent:
             value_coef=cfg["value_coef"],
             max_grad_norm=cfg["max_grad_norm"],
             device=device,
-            board_dim=cfg.get("board_dim", 0),
-            board_shape=tuple(cfg["board_shape"]) if cfg.get("board_shape") else None,
         )
         agent = cls(config)
         agent.policy.load_state_dict(payload["state_dict"])

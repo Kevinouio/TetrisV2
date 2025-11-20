@@ -432,8 +432,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             value_coef=args.value_coef,
             max_grad_norm=args.max_grad_norm,
             device=args.device,
-            board_dim=processor.board_dim,
-            board_shape=processor.board_shape,
         )
         agent = PPOAgent(config)
         start_step = 0
