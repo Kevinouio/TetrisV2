@@ -274,7 +274,6 @@ class ModernRuleset:
             distance = utils.hard_drop_distance(self._board, self._current)
             self._current = self._current.moved(d_row=distance)
             info["hard_drop_distance"] = distance
-            score_delta += distance * 2
             touching_ground = True
             locked = True
             self._gravity_progress = 0.0
@@ -318,9 +317,6 @@ class ModernRuleset:
             
             if moved_down:
                 self._ground_frames = 0
-            if action == SOFT_DROP and rows_dropped:
-                # Reward only actual downward motion, not soft-drop taps on the ground.
-                score_delta += rows_dropped
 
         if not touching_ground and self._is_touching_ground():
             touching_ground = True

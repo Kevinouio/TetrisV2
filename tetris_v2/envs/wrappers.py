@@ -112,7 +112,7 @@ class EnvironmentRewardConfig:
     perfect_clear_reward: float = 2.0
     tspin_reward: float = 0.5
     pending_garbage_penalty: float = 0.01
-    hard_drop_reward: float = 0.02
+    hard_drop_reward: float = 0.0
     drop_bonus_scale: float = 0.005
     level_reward: float = 0.0
 
