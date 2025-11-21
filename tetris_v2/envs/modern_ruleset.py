@@ -151,7 +151,8 @@ class ModernRuleset:
             return StepResult(self._observe(), True, 0, 0, 0, {"top_out": True})
 
         if self.max_steps and self._steps >= self.max_steps:
-            return StepResult(self._observe(), True, 0, 0, 0, {"top_out": False})
+            # Treat max_steps as a timeout/truncation rather than a failure.
+            return StepResult(self._observe(), False, 0, 0, 0, {"max_steps_reached": True})
 
         self._steps += 1
         info: Dict[str, int | float | bool | str] = {}
@@ -267,6 +268,7 @@ class ModernRuleset:
         touching_ground = False
         gravity_per_frame = self._gravity_per_frame()
         moved_down = False
+        rows_dropped = 0
         
         if action == HARD_DROP:
             distance = utils.hard_drop_distance(self._board, self._current)
@@ -278,7 +280,6 @@ class ModernRuleset:
             self._gravity_progress = 0.0
             self._manipulation_count = 0
         else:
-            increment = self.soft_drop_factor if action == SOFT_DROP else 1.0
             # Apply gravity (G per frame)
             # If soft dropping, we multiply the G force
             # Note: Standard soft drop is usually 20G or similar fixed speed, 
@@ -293,17 +294,9 @@ class ModernRuleset:
             # Calculate rows to drop this frame
             rows_to_drop = 0.0
             if action == SOFT_DROP:
-                 # Soft drop usually guarantees at least some speed. 
-                 # Let's say soft drop adds 0.5G (1 row every 2 frames) minimum, or factor * gravity.
-                 # A simple way: Soft drop = 20x gravity or 1G, whichever is faster?
-                 # Let's stick to factor for now to preserve config.
-                 rows_to_drop = gravity_per_frame * self.soft_drop_factor
-                 # Ensure soft drop is at least somewhat fast (e.g. 1/60 rows per frame is too slow if factor is 6)
-                 # If gravity is 0.01, factor 6 -> 0.06. Still slow.
-                 # Let's enforce a minimum soft drop speed of 0.5 rows/frame?
-                 rows_to_drop = max(rows_to_drop, 0.5)
-                 score_delta += 1 # 1 point per soft drop step (approx)
-                 self._last_action = "soft_drop"
+                rows_to_drop = gravity_per_frame * self.soft_drop_factor
+                rows_to_drop = max(rows_to_drop, 0.5)
+                self._last_action = "soft_drop"
             else:
                 rows_to_drop = gravity_per_frame
             
@@ -317,6 +310,7 @@ class ModernRuleset:
                     break
                 self._current = candidate
                 moved_down = True
+                rows_dropped += 1
                 lock_reset = True
                 self._gravity_progress -= 1.0
                 # Reset manipulation count on step down
@@ -324,6 +318,9 @@ class ModernRuleset:
             
             if moved_down:
                 self._ground_frames = 0
+            if action == SOFT_DROP and rows_dropped:
+                # Reward only actual downward motion, not soft-drop taps on the ground.
+                score_delta += rows_dropped
 
         if not touching_ground and self._is_touching_ground():
             touching_ground = True

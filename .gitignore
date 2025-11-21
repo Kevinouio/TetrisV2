@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*.txt
 
 # Virtual environments
 .venv/

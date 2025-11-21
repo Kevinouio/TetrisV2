@@ -10,7 +10,18 @@ from gymnasium import spaces
 
 from tetris_v2.rendering import PygameBoardRenderer
 from . import utils
-from .modern_ruleset import ModernRuleset
+from .modern_ruleset import (
+    ModernRuleset,
+    MOVE_NONE,
+    MOVE_LEFT,
+    MOVE_RIGHT,
+    ROTATE_CW,
+    ROTATE_CCW,
+    SOFT_DROP,
+    HARD_DROP,
+    HOLD,
+    ROTATE_180,
+)
 
 Action = int
 
@@ -34,13 +45,12 @@ class ModernTetrisEnv(gym.Env):
         das_frames: int = 10,
         arr_frames: int = 2,
         allowed_pieces: Optional[Sequence[str | int]] = None,
+        include_hold: bool = True,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
         self.reward_mode = reward_mode
         self.preview_pieces = max(1, int(preview_pieces))
-        if time_limit_seconds is None and reward_mode == "score":
-            time_limit_seconds = 180.0
         self._frame_limit = (
             None if time_limit_seconds is None else int(time_limit_seconds * self.metadata["render_fps"])
         )
@@ -55,6 +65,19 @@ class ModernTetrisEnv(gym.Env):
             arr_frames=arr_frames,
             allowed_pieces=allowed_pieces,
         )
+        # Mapping from discrete index -> low-level ruleset action.
+        self._action_map = [
+            MOVE_NONE,
+            MOVE_LEFT,
+            MOVE_RIGHT,
+            ROTATE_CW,
+            ROTATE_CCW,
+            SOFT_DROP,
+            HARD_DROP,
+            ROTATE_180,
+        ]
+        if include_hold:
+            self._action_map.append(HOLD)
         self.observation_space = spaces.Dict(
             {
                 "board": spaces.Box(low=0, high=8, shape=(20, 10), dtype=np.int8),
@@ -69,7 +92,7 @@ class ModernTetrisEnv(gym.Env):
                 "pending_garbage": spaces.Box(low=0, high=200, shape=(), dtype=np.int16),
             }
         )
-        self.action_space = spaces.Discrete(9)
+        self.action_space = spaces.Discrete(len(self._action_map))
         self._renderer: Optional[PygameBoardRenderer] = None
         self._skip_frame_advance = False
 
@@ -82,7 +105,11 @@ class ModernTetrisEnv(gym.Env):
         return obs, {}
 
     def step(self, action: Action):
-        result = self._rules.step(action)
+        try:
+            mapped = self._action_map[int(action)]
+        except (IndexError, TypeError, ValueError):
+            raise AssertionError(f"Invalid action index {action}") from None
+        result = self._rules.step(mapped)
         reward = self._compute_reward(result)
         info = dict(result.info)
         if getattr(self, "_skip_frame_advance", False):
@@ -90,6 +117,9 @@ class ModernTetrisEnv(gym.Env):
         else:
             self._frames += 1
         truncated = False
+        if info.get("max_steps_reached"):
+            truncated = True
+            info["time_limit_reached"] = True
         if self._frame_limit is not None and self._frames >= self._frame_limit:
             truncated = True
             info["time_limit_reached"] = True
