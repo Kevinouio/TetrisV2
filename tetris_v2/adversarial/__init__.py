@@ -1,1 +1,0 @@
-"""Adversarial scaffolding (skeleton)."""

@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tetris-v2"
-version = "0.0.1"
-description = "Tetris RL environments and agents (NES → modern → adversarial)"
+name = "tetris-version-one"
+version = "0.1.0"
+description = "Stable baseline: Tetris environments + PPO agent"
 authors = [{name="Your Name"}]
 requires-python = ">=3.9"
 dependencies = [
@@ -16,4 +16,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = [""]
-include = ["tetris_v2*"]
+include = ["TetrisVersionOne*"]
