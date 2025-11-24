@@ -29,6 +29,11 @@ Notes:
 - Default heuristics live in `cold_clear_cpp/include/cold_clear_cpp/eval.hpp` (C++) and `cold-clear-2/src/default.json` (Rust). Adjust these to trade off survival vs. T‑spins.
 - Combo tracking bug is fixed; soft-drop distance is included in the eval reward.
 
+### Demo (Cold Clear playing to survive)
+Default survival-oriented eval (human-set weights; not tuned for score chasing):
+
+![Cold Clear survival loop](Recordings/ColdClear.gif)
+
 ### Logging for imitation
 To collect demonstrations from Cold Clear, tap into `cc_play` to emit per-move state/action JSONL (board, hold, queue, bag, chosen `Placement`). A future `scripts/` helper can batch games over seeds to produce a dataset.
 
