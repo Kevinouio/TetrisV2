@@ -31,8 +31,11 @@ Notes:
 
 ### Demo (Cold Clear playing to survive)
 Default survival-oriented eval (human-set weights; not tuned for score chasing):
+<a href="Recordings/ColdClear.gif">
 
-![Cold Clear survival loop](Recordings/ColdClear.gif)
+
+  <img src="Recordings/ColdClear.gif" width="360" alt="Cold Clear survival loop">
+</a>
 
 ### Logging for imitation
 To collect demonstrations from Cold Clear, tap into `cc_play` to emit per-move state/action JSONL (board, hold, queue, bag, chosen `Placement`). A future `scripts/` helper can batch games over seeds to produce a dataset.
