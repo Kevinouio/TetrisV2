@@ -45,7 +45,6 @@ checkpoints/
 
 # Media generated during recording
 *.mp4
-*.gif
 *.pdf
 
 # Misc
