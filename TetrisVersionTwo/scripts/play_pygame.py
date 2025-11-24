@@ -53,6 +53,18 @@ def draw_board(surface, board_rows, cell_size):
             pygame.draw.rect(surface, (40, 40, 40), rect, width=1)
 
 
+def draw_ghost(surface, ghost_rows, cell_size):
+    if not ghost_rows:
+        return
+    ghost_color = (200, 200, 200)
+    for y, row in enumerate(ghost_rows):
+        for x, c in enumerate(row):
+            if c == ".":
+                continue
+            rect = pygame.Rect(x * cell_size, y * cell_size, cell_size, cell_size)
+            pygame.draw.rect(surface, ghost_color, rect, width=1)
+
+
 def draw_side_text(surface, font, hold, queue, offset_x, cell_size):
     y = 10
     hold_text = font.render(f"Hold: {hold}", True, (255, 255, 255))
@@ -95,7 +107,9 @@ def main():
             break
 
         screen.fill((10, 10, 10))
+        ghost = frame.get("ghost", [])
         draw_board(screen, frame["board"], cell)
+        draw_ghost(screen, ghost, cell)
         draw_side_text(screen, font, frame["hold"], frame["queue"], board_width + 12, cell)
 
         pygame.display.flip()

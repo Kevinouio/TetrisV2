@@ -11,27 +11,29 @@
 namespace cold_clear_cpp {
 
 struct Weights {
-    float cell_coveredness{-0.2f};
+    // Survival-first tuning: larger penalties for mess/height, modest line-clear rewards,
+    // and toned-down spin/B2B incentives.
+    float cell_coveredness{-0.7f};
     std::uint32_t max_cell_covered_height{6};
-    float holes{-1.5f};
-    float row_transitions{-0.2f};
-    float height{-0.4f};
-    float height_upper_half{-1.5f};
-    float height_upper_quarter{-5.0f};
-    float tetris_well_depth{0.3f};
-    std::array<float, 4> tslot{{0.1f, 1.5f, 2.0f, 4.0f}};
+    float holes{-3.5f};
+    float row_transitions{-0.6f};
+    float height{-1.0f};
+    float height_upper_half{-3.0f};
+    float height_upper_quarter{-7.0f};
+    float tetris_well_depth{0.15f};
+    std::array<float, 4> tslot{{0.0f, 0.2f, 0.4f, 0.6f}};
 
-    float has_back_to_back{0.5f};
-    float wasted_t{-1.5f};
-    float softdrop{-0.2f};
+    float has_back_to_back{0.2f};
+    float wasted_t{-0.8f};
+    float softdrop{-0.1f};
 
-    std::array<float, 5> normal_clears{{0.0f, -2.0f, -1.5f, -1.0f, 3.5f}};
+    std::array<float, 5> normal_clears{{0.2f, 0.6f, 0.9f, 1.2f, 1.8f}};
     std::array<float, 3> mini_spin_clears{{0.0f, -1.5f, -1.0f}};
-    std::array<float, 4> spin_clears{{0.0f, 1.0f, 4.0f, 6.0f}};
-    float back_to_back_clear{1.0f};
-    float combo_attack{1.5f};
-    float perfect_clear{15.0f};
-    bool perfect_clear_override{true};
+    std::array<float, 4> spin_clears{{0.0f, 0.2f, 0.8f, 1.5f}};
+    float back_to_back_clear{0.2f};
+    float combo_attack{0.3f};
+    float perfect_clear{8.0f};
+    bool perfect_clear_override{false};
 };
 
 struct Eval {

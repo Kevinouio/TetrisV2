@@ -44,21 +44,20 @@ int main(int argc, char** argv) {
     auto opts = parse(argc, argv);
 
     tetris_v2::TetrisEnv env;
-    auto appended = env.ensure_queue(8);
+    env.ensure_queue(8);
 
     cold_clear_cpp::BotOptions options;
     options.speculate = true;
     options.config = std::make_shared<cold_clear_cpp::BotConfig>();
 
     tetris_v2::CCAgent agent(options, env);
-    agent.on_new_pieces(appended);  // synchronize any newly appended queue entries
 
     for (int step = 0; step < opts.steps && !env.game_over(); ++step) {
         // Keep the bot's queue in sync with the environment.
         auto added = env.ensure_queue(8);
         agent.on_new_pieces(added);
 
-        auto mv = agent.choose_move(256);
+        auto mv = agent.choose_move(1024);
         if (!mv) {
             std::cout << "No available moves; game over.\n";
             break;

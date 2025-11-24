@@ -77,6 +77,7 @@ PlacementInfo GameState::advance(Piece next, const Placement& placement) {
         bool hard = (cleared == 4) || (placement.spin != Spin::None);
         b2b = hard && back_to_back;
         back_to_back = hard;
+        combo = static_cast<std::uint8_t>(std::min<std::uint32_t>(combo + 1, 255));
     } else {
         combo = 0;
     }

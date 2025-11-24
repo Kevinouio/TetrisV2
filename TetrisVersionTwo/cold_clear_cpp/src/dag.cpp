@@ -3,12 +3,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <random>
+#include <mutex>
+#include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "cold_clear_cpp/profiling.hpp"
 namespace cold_clear_cpp {
 
 namespace {
@@ -26,6 +31,105 @@ struct BackpropUpdate {
     std::size_t child{};
 };
 
+template <typename T>
+struct Slice {
+    T* data{nullptr};
+    std::size_t length{0};
+
+    T* begin() { return data; }
+    const T* begin() const { return data; }
+    T* end() { return data + length; }
+    const T* end() const { return data + length; }
+    bool empty() const { return length == 0; }
+    std::size_t size() const { return length; }
+    T& operator[](std::size_t idx) { return data[idx]; }
+    const T& operator[](std::size_t idx) const { return data[idx]; }
+    T& front() { return data[0]; }
+    const T& front() const { return data[0]; }
+};
+
+class BumpArena {
+public:
+    BumpArena() = default;
+    BumpArena(const BumpArena&) = delete;
+    BumpArena& operator=(const BumpArena&) = delete;
+
+    template <typename T>
+    Slice<T> alloc_slice(std::size_t count) {
+        if (count == 0) {
+            return {};
+        }
+        T* ptr = static_cast<T*>(::operator new[](sizeof(T) * count));
+        for (std::size_t i = 0; i < count; ++i) {
+            new (ptr + i) T();
+        }
+        register_allocation<T>(ptr, count);
+        return Slice<T>{ptr, count};
+    }
+
+    template <typename T>
+    Slice<T> alloc_slice_copy(const std::vector<T>& src) {
+        if (src.empty()) {
+            return {};
+        }
+        T* ptr = static_cast<T*>(::operator new[](sizeof(T) * src.size()));
+        for (std::size_t i = 0; i < src.size(); ++i) {
+            new (ptr + i) T(src[i]);
+        }
+        register_allocation<T>(ptr, src.size());
+        return Slice<T>{ptr, src.size()};
+    }
+
+    template <typename T>
+    Slice<T> alloc_slice_copy(const Slice<T>& src) {
+        if (src.size() == 0) {
+            return {};
+        }
+        T* ptr = static_cast<T*>(::operator new[](sizeof(T) * src.size()));
+        for (std::size_t i = 0; i < src.size(); ++i) {
+            new (ptr + i) T(src[i]);
+        }
+        register_allocation<T>(ptr, src.size());
+        return Slice<T>{ptr, src.size()};
+    }
+
+    template <typename T>
+    Slice<T> alloc_slice_extend(const Slice<T>& existing, const T& extra) {
+        auto total = existing.size() + 1;
+        T* ptr = static_cast<T*>(::operator new[](sizeof(T) * total));
+        for (std::size_t i = 0; i < existing.size(); ++i) {
+            new (ptr + i) T(existing[i]);
+        }
+        new (ptr + existing.size()) T(extra);
+        register_allocation<T>(ptr, total);
+        return Slice<T>{ptr, total};
+    }
+
+    ~BumpArena() { clear(); }
+
+private:
+    template <typename T>
+    void register_allocation(T* ptr, std::size_t count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cleanup_.emplace_back([ptr, count]() {
+            for (std::size_t i = 0; i < count; ++i) {
+                ptr[i].~T();
+            }
+            ::operator delete[](ptr);
+        });
+    }
+
+    void clear() {
+        for (auto& fn : cleanup_) {
+            fn();
+        }
+        cleanup_.clear();
+    }
+
+    std::mutex mutex_;
+    std::vector<std::function<void()>> cleanup_;
+};
+
 struct SelectResult {
     enum class Kind { Failed, Done, Advance };
     Kind kind{Kind::Failed};
@@ -39,14 +143,16 @@ struct LayerCommon;
 struct SpeculatedLayer;
 
 struct KnownNode {
-    std::vector<std::tuple<std::size_t, Placement, Piece>> parents;
+    Slice<std::tuple<std::size_t, Placement, Piece>> parents;
     Eval eval{};
-    std::vector<Child> children;
+    Slice<Child> children;
     std::atomic_bool expanding{false};
 
     KnownNode() = default;
     KnownNode(const KnownNode& other)
-        : parents(other.parents), eval(other.eval), children(other.children),
+        : parents(other.parents),
+          eval(other.eval),
+          children(other.children),
           expanding(other.expanding.load(std::memory_order_relaxed)) {}
     KnownNode& operator=(const KnownNode& other) {
         parents = other.parents;
@@ -58,9 +164,9 @@ struct KnownNode {
 };
 
 struct SpeculatedNode {
-    std::vector<std::tuple<std::size_t, Placement, Piece>> parents;
+    Slice<std::tuple<std::size_t, Placement, Piece>> parents;
     Eval eval{};
-    std::array<std::vector<Child>, 7> children;
+    std::array<Slice<Child>, 7> children;
     std::atomic_bool expanding{false};
     PieceSet bag{all_pieces()};
 
@@ -81,30 +187,44 @@ struct SpeculatedNode {
     }
 };
 
-bool update_child(std::vector<Child>& list, const Placement& placement, const Eval& child_eval) {
-    auto it = std::find_if(list.begin(), list.end(), [&](const Child& c) { return c.mv == placement; });
-    if (it == list.end()) {
+template <typename ChildList>
+bool update_child(ChildList& list, const Placement& placement, const Eval& child_eval) {
+    std::optional<std::size_t> found;
+    for (std::size_t i = 0; i < list.size(); ++i) {
+        if (list[i].mv == placement) {
+            found = i;
+            break;
+        }
+    }
+    if (!found) {
         return false;
     }
 
-    it->cached_eval = child_eval + it->reward;
-    auto index = static_cast<std::size_t>(std::distance(list.begin(), it));
+    auto index = *found;
+    list[index].cached_eval = child_eval + list[index].reward;
 
-    while (index > 0 && list[index - 1].cached_eval < list[index].cached_eval) {
-        std::swap(list[index - 1], list[index]);
-        --index;
-    }
-    while (index + 1 < list.size() && list[index + 1].cached_eval > list[index].cached_eval) {
-        std::swap(list[index + 1], list[index]);
-        ++index;
+    if (index > 0 && list[index - 1].cached_eval < list[index].cached_eval) {
+        auto hole = list[index];
+        while (index > 0 && list[index - 1].cached_eval < hole.cached_eval) {
+            list[index] = list[index - 1];
+            --index;
+        }
+        list[index] = hole;
+    } else if (index + 1 < list.size() && list[index + 1].cached_eval > list[index].cached_eval) {
+        auto hole = list[index];
+        while (index + 1 < list.size() && list[index + 1].cached_eval > hole.cached_eval) {
+            list[index] = list[index + 1];
+            ++index;
+        }
+        list[index] = hole;
     }
 
     return index == 0;
 }
 
 struct KnownLayer {
-    KnownLayer() = default;
-    explicit KnownLayer(Piece p) : piece(p) {}
+    KnownLayer() : arena(std::make_shared<BumpArena>()) {}
+    explicit KnownLayer(Piece p) : piece(p), arena(std::make_shared<BumpArena>()) {}
 
     void initialize_root(const GameState& root);
     std::vector<Placement> suggest(const GameState& state) const;
@@ -118,10 +238,12 @@ struct KnownLayer {
     void absorb_from_speculated(const SpeculatedLayer& layer, Piece p);
 
     mutable StateMap<KnownNode> states;
+    std::shared_ptr<BumpArena> arena;
     Piece piece{Piece::I};
 };
 
 struct SpeculatedLayer {
+    SpeculatedLayer() : arena(std::make_shared<BumpArena>()) {}
     void initialize_root(const GameState& root);
     std::vector<Placement> suggest(const GameState& state) const;
     SelectResult select(const GameState& state, double exploration) const;
@@ -133,6 +255,7 @@ struct SpeculatedLayer {
         const std::vector<BackpropUpdate>& updates, LayerCommon* next_layer);
 
     mutable StateMap<SpeculatedNode> states;
+    std::shared_ptr<BumpArena> arena;
 };
 
 struct LayerCommon {
@@ -169,6 +292,7 @@ LayerCommon* LayerCommon::ensure_next() {
 }
 
 void LayerCommon::initialize_root(const GameState& root) {
+    PROFILE_FUNCTION();
     if (type == LayerType::Known) {
         known.initialize_root(root);
     } else {
@@ -181,6 +305,7 @@ std::optional<Piece> LayerCommon::piece_if_known() const {
 }
 
 bool LayerCommon::despeculate(Piece target_piece) {
+    PROFILE_FUNCTION();
     if (type == LayerType::Known) {
         return false;
     }
@@ -191,6 +316,7 @@ bool LayerCommon::despeculate(Piece target_piece) {
 }
 
 std::vector<Placement> LayerCommon::suggest(const GameState& state) const {
+    PROFILE_FUNCTION();
     if (type == LayerType::Known) {
         return known.suggest(state);
     }
@@ -198,6 +324,7 @@ std::vector<Placement> LayerCommon::suggest(const GameState& state) const {
 }
 
 SelectResult LayerCommon::select(const GameState& state, bool speculate, double exploration) const {
+    PROFILE_FUNCTION();
     if (type == LayerType::Known) {
         return known.select(state, exploration);
     }
@@ -209,6 +336,7 @@ SelectResult LayerCommon::select(const GameState& state, bool speculate, double 
 
 std::vector<BackpropUpdate> LayerCommon::expand(
     LayerCommon* next_layer, const GameState& parent_state, const ChildrenByPiece& children) {
+    PROFILE_FUNCTION();
     if (type == LayerType::Known) {
         return known.expand(next_layer, parent_state, children);
     }
@@ -217,6 +345,7 @@ std::vector<BackpropUpdate> LayerCommon::expand(
 
 std::vector<BackpropUpdate> LayerCommon::backprop(
     const std::vector<BackpropUpdate>& updates, LayerCommon* next_layer) {
+    PROFILE_FUNCTION();
     if (type == LayerType::Known) {
         return known.backprop(updates, next_layer);
     }
@@ -224,6 +353,7 @@ std::vector<BackpropUpdate> LayerCommon::backprop(
 }
 
 Eval LayerCommon::get_eval(std::size_t raw) const {
+    PROFILE_FUNCTION();
     if (type == LayerType::Known) {
         return known.get_eval(raw);
     }
@@ -232,6 +362,7 @@ Eval LayerCommon::get_eval(std::size_t raw) const {
 
 std::vector<Eval> LayerCommon::create_nodes(
     const std::vector<ChildData>& children, std::size_t parent_index, Piece speculation_piece) {
+    PROFILE_FUNCTION();
     std::vector<Eval> evals;
     evals.reserve(children.size());
     if (type == LayerType::Known) {
@@ -247,26 +378,34 @@ std::vector<Eval> LayerCommon::create_nodes(
 }
 
 void KnownLayer::initialize_root(const GameState& root) {
-    states.get_or_insert_with(root, [] { return KnownNode{}; });
+    PROFILE_FUNCTION();
+    (void)states.get_or_insert_with(root, [] { return KnownNode{}; });
 }
 
 std::vector<Placement> KnownLayer::suggest(const GameState& state) const {
+    PROFILE_FUNCTION();
     std::vector<Placement> result;
-    auto* node = states.get(state);
-    if (!node || node->children.empty()) {
+    auto node_guard = states.get(state);
+    if (!node_guard) {
         return result;
     }
-    result.push_back(node->children.front().mv);
+    const auto& node = **node_guard;
+    if (node.children.empty()) {
+        return result;
+    }
+    result.push_back(node.children.front().mv);
     return result;
 }
 
 SelectResult KnownLayer::select(const GameState& state, double exploration) const {
-    auto* node = states.get(state);
-    if (!node) {
+    PROFILE_FUNCTION();
+    auto node_guard = states.get(state);
+    if (!node_guard) {
         return {SelectResult::Kind::Failed};
     }
-    if (node->children.empty()) {
-        bool already = node->expanding.exchange(true, std::memory_order_relaxed);
+    auto& node = **node_guard;
+    if (node.children.empty()) {
+        bool already = node.expanding.exchange(true, std::memory_order_relaxed);
         return {already ? SelectResult::Kind::Failed : SelectResult::Kind::Done};
     }
 
@@ -275,36 +414,52 @@ SelectResult KnownLayer::select(const GameState& state, double exploration) cons
     std::uniform_real_distribution<double> dist(0.0, 1.0);
     double s = dist(rng);
     auto idx =
-        static_cast<std::size_t>(std::fmod(-std::log(s) / exploration, static_cast<double>(node->children.size())));
-    return {SelectResult::Kind::Advance, piece, node->children[idx].mv};
+        static_cast<std::size_t>(std::fmod(-std::log(s) / exploration, static_cast<double>(node.children.size())));
+    return {SelectResult::Kind::Advance, piece, node.children[idx].mv};
 }
 
 Eval KnownLayer::get_eval(std::size_t raw) const {
-    auto* node = states.get_raw(raw);
-    return node ? node->eval : Eval{};
+    PROFILE_FUNCTION();
+    auto node_guard = states.get_raw(raw);
+    return node_guard ? (**node_guard).eval : Eval{};
 }
 
 Eval KnownLayer::create_node(const ChildData& child, std::size_t parent, Piece speculation_piece) {
-    auto& node = states.get_or_insert_with(child.resulting_state, [&] {
+    PROFILE_FUNCTION();
+    auto guard = states.get_or_insert_with(child.resulting_state, [&] {
         KnownNode n;
         n.eval = child.eval;
         return n;
     });
-    node.parents.emplace_back(parent, child.mv, speculation_piece);
+    auto& node = *guard;
+    auto entry = std::make_tuple(parent, child.mv, speculation_piece);
+    if (node.parents.size() == 0) {
+        std::vector<std::tuple<std::size_t, Placement, Piece>> parents_vec;
+        parents_vec.push_back(entry);
+        node.parents = arena->alloc_slice_copy(parents_vec);
+    } else {
+        node.parents = arena->alloc_slice_extend(node.parents, entry);
+    }
     return node.eval;
 }
 
 std::vector<BackpropUpdate> KnownLayer::expand(
     LayerCommon* next_layer, const GameState& parent_state, const ChildrenByPiece& children) {
+    PROFILE_FUNCTION();
     std::vector<BackpropUpdate> next;
     const auto parent_index = states.index(parent_state);
-    auto* parent = states.get_raw(parent_index);
-    if (!parent) {
-        parent = &states.get_or_insert_with(parent_state, [] { return KnownNode{}; });
+    auto parent_guard = states.get_raw_mut(parent_index);
+    if (!parent_guard) {
+        parent_guard = states.get_raw_or_insert_with(parent_index, parent_state, [] { return KnownNode{}; });
     }
+    auto& parent = **parent_guard;
 
     const auto& list = children[piece_index(piece)];
-    auto evals = next_layer->create_nodes(list, parent_index, piece);
+    std::vector<Eval> evals;
+    {
+        PROFILE_SCOPE("create nodes");
+        evals = next_layer->create_nodes(list, parent_index, piece);
+    }
 
     std::vector<Child> childs;
     childs.reserve(list.size());
@@ -322,35 +477,38 @@ std::vector<BackpropUpdate> KnownLayer::expand(
 
     std::vector<std::optional<Eval>> opts;
     opts.push_back(childs.empty() ? std::optional<Eval>{} : std::optional<Eval>{childs.front().cached_eval});
-    parent->eval = Eval::average(opts);
-    parent->children = std::move(childs);
+    parent.eval = Eval::average(opts);
+    parent.children = arena->alloc_slice_copy(childs);
 
-    for (const auto& [grand, mv, speculation_piece] : parent->parents) {
+    for (const auto& [grand, mv, speculation_piece] : parent.parents) {
         next.push_back(BackpropUpdate{grand, mv, speculation_piece, parent_index});
     }
-    parent->expanding.store(false, std::memory_order_relaxed);
+    parent.expanding.store(false, std::memory_order_relaxed);
     return next;
 }
 
 std::vector<BackpropUpdate> KnownLayer::backprop(
     const std::vector<BackpropUpdate>& updates, LayerCommon* next_layer) {
+    PROFILE_FUNCTION();
     std::vector<BackpropUpdate> new_updates;
     for (const auto& update : updates) {
         if (update.speculation_piece != piece) {
             continue;
         }
-        auto* parent = states.get_raw(update.parent);
-        if (!parent) {
+        auto parent_guard = states.get_raw_mut(update.parent);
+        if (!parent_guard) {
             continue;
         }
+        auto& parent = **parent_guard;
         auto child_eval = next_layer->get_eval(update.child);
-        bool is_best = update_child(parent->children, update.mv, child_eval);
+        bool is_best = update_child(parent.children, update.mv, child_eval);
         if (is_best) {
-            auto new_eval = parent->children.front().cached_eval;
-            if (parent->eval != new_eval) {
-                parent->eval = new_eval;
-                for (const auto& [grand, mv, speculation_piece] : parent->parents) {
-                    new_updates.push_back(BackpropUpdate{grand, mv, speculation_piece, update.parent});
+            auto new_eval = parent.children.front().cached_eval;
+            if (parent.eval != new_eval) {
+                parent.eval = new_eval;
+                for (const auto& [grand, mv, speculation_piece] : parent.parents) {
+                    new_updates.push_back(
+                        BackpropUpdate{grand, mv, speculation_piece, update.parent});
                 }
             }
         }
@@ -363,17 +521,18 @@ void KnownLayer::absorb_from_speculated(const SpeculatedLayer& layer, Piece p) {
     StateMap<KnownNode> new_states;
     layer.states.for_each([&](const GameState& state, const SpeculatedNode& node) {
         KnownNode known_node;
-        known_node.parents = node.parents;
+        known_node.parents = arena->alloc_slice_copy(node.parents);
         known_node.eval = node.eval;
-        known_node.children = node.children[piece_index(p)];
+        known_node.children = arena->alloc_slice_copy(node.children[piece_index(p)]);
         known_node.expanding.store(node.expanding.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        new_states.get_or_insert_with(state, [&] { return known_node; });
+        (void)new_states.get_or_insert_with(state, [&] { return known_node; });
     });
     states = std::move(new_states);
 }
 
 void SpeculatedLayer::initialize_root(const GameState& root) {
-    states.get_or_insert_with(root, [&] {
+    PROFILE_FUNCTION();
+    (void)states.get_or_insert_with(root, [&] {
         SpeculatedNode node;
         node.bag = root.bag;
         return node;
@@ -381,16 +540,18 @@ void SpeculatedLayer::initialize_root(const GameState& root) {
 }
 
 std::vector<Placement> SpeculatedLayer::suggest(const GameState& state) const {
+    PROFILE_FUNCTION();
     std::vector<Placement> result;
-    auto* node = states.get(state);
-    if (!node) {
+    auto node_guard = states.get(state);
+    if (!node_guard) {
         return result;
     }
+    const auto& node = **node_guard;
     for (auto p : kAllPieces) {
         if (!state.bag.test(piece_index(p))) {
             continue;
         }
-        const auto& list = node->children[piece_index(p)];
+        const auto& list = node.children[piece_index(p)];
         if (!list.empty()) {
             result.push_back(list.front().mv);
         }
@@ -399,20 +560,22 @@ std::vector<Placement> SpeculatedLayer::suggest(const GameState& state) const {
 }
 
 SelectResult SpeculatedLayer::select(const GameState& state, double exploration) const {
-    auto* node = states.get(state);
-    if (!node) {
+    PROFILE_FUNCTION();
+    auto node_guard = states.get(state);
+    if (!node_guard) {
         return {SelectResult::Kind::Failed};
     }
+    auto& node = **node_guard;
 
     bool has_children = false;
     for (auto p : kAllPieces) {
-        if (!node->children[piece_index(p)].empty()) {
+        if (!node.children[piece_index(p)].empty()) {
             has_children = true;
             break;
         }
     }
     if (!has_children) {
-        bool already = node->expanding.exchange(true, std::memory_order_relaxed);
+        bool already = node.expanding.exchange(true, std::memory_order_relaxed);
         return {already ? SelectResult::Kind::Failed : SelectResult::Kind::Done};
     }
 
@@ -432,7 +595,7 @@ SelectResult SpeculatedLayer::select(const GameState& state, double exploration)
         }
         ++seen;
     }
-    auto& list = node->children[piece_index(chosen)];
+    auto& list = node.children[piece_index(chosen)];
     if (list.empty()) {
         return {SelectResult::Kind::Failed};
     }
@@ -445,39 +608,54 @@ SelectResult SpeculatedLayer::select(const GameState& state, double exploration)
 }
 
 Eval SpeculatedLayer::get_eval(std::size_t raw) const {
-    auto* node = states.get_raw(raw);
-    return node ? node->eval : Eval{};
+    PROFILE_FUNCTION();
+    auto node_guard = states.get_raw(raw);
+    return node_guard ? (**node_guard).eval : Eval{};
 }
 
 Eval SpeculatedLayer::create_node(const ChildData& child, std::size_t parent, Piece speculation_piece) {
-    auto& node = states.get_or_insert_with(child.resulting_state, [&] {
+    PROFILE_FUNCTION();
+    auto guard = states.get_or_insert_with(child.resulting_state, [&] {
         SpeculatedNode n;
         n.eval = child.eval;
         n.bag = child.resulting_state.bag;
         return n;
     });
-    node.parents.emplace_back(parent, child.mv, speculation_piece);
+    auto& node = *guard;
+    auto entry = std::make_tuple(parent, child.mv, speculation_piece);
+    if (node.parents.size() == 0) {
+        std::vector<std::tuple<std::size_t, Placement, Piece>> parents_vec;
+        parents_vec.push_back(entry);
+        node.parents = arena->alloc_slice_copy(parents_vec);
+    } else {
+        node.parents = arena->alloc_slice_extend(node.parents, entry);
+    }
     return node.eval;
 }
 
 std::vector<BackpropUpdate> SpeculatedLayer::expand(
     LayerCommon* next_layer, const GameState& parent_state, const ChildrenByPiece& children) {
+    PROFILE_FUNCTION();
     std::vector<BackpropUpdate> next;
     const auto parent_index = states.index(parent_state);
-    auto* parent = states.get_raw(parent_index);
-    if (!parent) {
-        parent = &states.get_or_insert_with(parent_state, [&] {
+    auto parent_guard = states.get_raw_mut(parent_index);
+    if (!parent_guard) {
+        parent_guard = states.get_raw_or_insert_with(parent_index, parent_state, [&] {
             SpeculatedNode node;
             node.bag = parent_state.bag;
             return node;
         });
     }
+    auto& parent = **parent_guard;
 
     for (auto p : kAllPieces) {
         const auto& list = children[piece_index(p)];
-        auto evals = next_layer->create_nodes(list, parent_index, p);
-        auto& target_list = parent->children[piece_index(p)];
-        target_list.clear();
+        std::vector<Eval> evals;
+        {
+            PROFILE_SCOPE("create nodes");
+            evals = next_layer->create_nodes(list, parent_index, p);
+        }
+        std::vector<Child> target_list;
         target_list.reserve(list.size());
         for (std::size_t i = 0; i < list.size(); ++i) {
             target_list.push_back(Child{
@@ -489,53 +667,57 @@ std::vector<BackpropUpdate> SpeculatedLayer::expand(
         std::sort(
             target_list.begin(), target_list.end(),
             [](const Child& a, const Child& b) { return a.cached_eval > b.cached_eval; });
+        parent.children[piece_index(p)] = arena->alloc_slice_copy(target_list);
     }
 
     std::vector<std::optional<Eval>> best;
     for (auto p : kAllPieces) {
-        if (!parent->bag.test(piece_index(p))) {
+        if (!parent.bag.test(piece_index(p))) {
             continue;
         }
-        const auto& child_list = parent->children[piece_index(p)];
+        const auto& child_list = parent.children[piece_index(p)];
         best.push_back(
             child_list.empty() ? std::optional<Eval>{} : std::optional<Eval>{child_list.front().cached_eval});
     }
-    parent->eval = Eval::average(best);
+    parent.eval = Eval::average(best);
 
-    for (const auto& [grand, mv, speculation_piece] : parent->parents) {
+    for (const auto& [grand, mv, speculation_piece] : parent.parents) {
         next.push_back(BackpropUpdate{grand, mv, speculation_piece, parent_index});
     }
-    parent->expanding.store(false, std::memory_order_relaxed);
+    parent.expanding.store(false, std::memory_order_relaxed);
     return next;
 }
 
 std::vector<BackpropUpdate> SpeculatedLayer::backprop(
     const std::vector<BackpropUpdate>& updates, LayerCommon* next_layer) {
+    PROFILE_FUNCTION();
     std::vector<BackpropUpdate> new_updates;
     for (const auto& update : updates) {
-        auto* parent = states.get_raw(update.parent);
-        if (!parent) {
+        auto parent_guard = states.get_raw_mut(update.parent);
+        if (!parent_guard) {
             continue;
         }
+        auto& parent = **parent_guard;
         auto child_eval = next_layer->get_eval(update.child);
-        auto& list = parent->children[piece_index(update.speculation_piece)];
+        auto& list = parent.children[piece_index(update.speculation_piece)];
         bool is_best = update_child(list, update.mv, child_eval);
         if (is_best) {
             std::vector<std::optional<Eval>> best;
             for (auto p : kAllPieces) {
-                if (!parent->bag.test(piece_index(p))) {
+                if (!parent.bag.test(piece_index(p))) {
                     continue;
                 }
-                const auto& child_list = parent->children[piece_index(p)];
+                const auto& child_list = parent.children[piece_index(p)];
                 best.push_back(
                     child_list.empty() ? std::optional<Eval>{}
                                        : std::optional<Eval>{child_list.front().cached_eval});
             }
             auto new_eval = Eval::average(best);
-            if (parent->eval != new_eval) {
-                parent->eval = new_eval;
-                for (const auto& [grand, mv, speculation_piece] : parent->parents) {
-                    new_updates.push_back(BackpropUpdate{grand, mv, speculation_piece, update.parent});
+            if (parent.eval != new_eval) {
+                parent.eval = new_eval;
+                for (const auto& [grand, mv, speculation_piece] : parent.parents) {
+                    new_updates.push_back(
+                        BackpropUpdate{grand, mv, speculation_piece, update.parent});
                 }
             }
         }
@@ -550,6 +732,7 @@ struct Dag::Impl {
     std::unique_ptr<LayerCommon> top_layer;
 
     Impl(const GameState& root_state, const std::vector<Piece>& queue) : root(root_state) {
+        PROFILE_FUNCTION();
         top_layer = std::make_unique<LayerCommon>();
         top_layer->initialize_root(root);
         auto* layer = top_layer.get();
@@ -560,6 +743,7 @@ struct Dag::Impl {
     }
 
     std::optional<Selection> select(bool speculate, double exploration) const {
+        PROFILE_FUNCTION();
         std::vector<LayerCommon*> layers;
         layers.push_back(top_layer.get());
         GameState game_state = root;
@@ -587,6 +771,7 @@ struct Dag::Impl {
     }
 
     void expand(std::vector<LayerCommon*> layers, const GameState& state, const ChildrenByPiece& children) {
+        PROFILE_FUNCTION();
         auto* start_layer = layers.back();
         layers.pop_back();
         auto* child_layer = start_layer->ensure_next();
@@ -601,9 +786,14 @@ struct Dag::Impl {
     }
 
     void advance(const Placement& mv) {
+        PROFILE_FUNCTION();
         auto current = std::move(top_layer);
-        auto piece = current->piece_if_known().value_or(Piece::I);
-        root.advance(piece, mv);
+        auto next_piece = current->piece_if_known();
+        if (!next_piece) {
+            throw std::runtime_error("advance called without a known next piece");
+        }
+
+        root.advance(*next_piece, mv);
         auto next = std::move(current->next);
         if (!next) {
             next = std::make_unique<LayerCommon>();
@@ -613,6 +803,7 @@ struct Dag::Impl {
     }
 
     void add_piece(Piece piece) {
+        PROFILE_FUNCTION();
         auto* layer = top_layer.get();
         while (true) {
             if (layer->despeculate(piece)) {
@@ -622,7 +813,10 @@ struct Dag::Impl {
         }
     }
 
-    std::vector<Placement> suggest() const { return top_layer->suggest(root); }
+    std::vector<Placement> suggest() const {
+        PROFILE_FUNCTION();
+        return top_layer->suggest(root);
+    }
 };
 
 Dag::Dag(const GameState& root, const std::vector<Piece>& queue) : impl_(std::make_unique<Impl>(root, queue)) {}

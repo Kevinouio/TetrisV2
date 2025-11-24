@@ -2,12 +2,15 @@
 
 #include <array>
 
+#include "cold_clear_cpp/profiling.hpp"
+
 namespace cold_clear_cpp {
 
 Bot::Bot(const BotOptions& options, GameState root, const std::vector<Piece>& queue)
     : options_(options), current_(root), queue_(queue.begin(), queue.end()), dag_(root, queue) {}
 
 void Bot::advance(const Placement& mv) {
+    PROFILE_FUNCTION();
     if (!queue_.empty()) {
         current_.advance(queue_.front(), mv);
         queue_.pop_front();
@@ -16,13 +19,18 @@ void Bot::advance(const Placement& mv) {
 }
 
 void Bot::new_piece(Piece piece) {
+    PROFILE_FUNCTION();
     queue_.push_back(piece);
     dag_.add_piece(piece);
 }
 
-std::vector<Placement> Bot::suggest() const { return dag_.suggest(); }
+std::vector<Placement> Bot::suggest() const {
+    PROFILE_FUNCTION();
+    return dag_.suggest();
+}
 
 Statistics Bot::do_work() const {
+    PROFILE_FUNCTION();
     Statistics stats{};
     stats.selections += 1;
 
@@ -41,13 +49,17 @@ Statistics Bot::do_work() const {
     }
 
     std::array<std::vector<std::pair<Placement, std::uint32_t>>, 7> moves;
-    for (auto p : kAllPieces) {
-        if (next_possibilities.test(piece_index(p)) || p == state.reserve) {
-            moves[piece_index(p)] = find_moves(state.board, p);
+    {
+        PROFILE_SCOPE("movegen");
+        for (auto p : kAllPieces) {
+            if (next_possibilities.test(piece_index(p)) || p == state.reserve) {
+                moves[piece_index(p)] = find_moves(state.board, p);
+            }
         }
     }
 
     ChildrenByPiece children{};
+    PROFILE_SCOPE("eval");
     for (auto next : kAllPieces) {
         if (!next_possibilities.test(piece_index(next))) {
             continue;
