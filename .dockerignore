@@ -1,0 +1,10 @@
+build/
+**/build/
+.venv/
+**/__pycache__/
+*.pyc
+.git/
+Recordings/
+archive/
+TetrisVersionOne/
+cold-clear-2/

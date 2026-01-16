@@ -2,6 +2,7 @@
 
 #include <array>
 #include <optional>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
 #include <utility>
