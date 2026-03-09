@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <optional>
@@ -25,6 +26,7 @@ struct EnvConfig {
 
 struct EnvState {
     Board board{};
+    std::array<std::array<std::int8_t, Board::kWidth>, Board::kRows> piece_ids{};
     ActivePiece active{};
     std::optional<Piece> hold{};
     bool hold_available{true};
@@ -42,6 +44,7 @@ struct EnvState {
 struct PlacementOption {
     ActivePiece placement{};
     Board board_after_lock{};
+    std::array<bool, Board::kRows> cleared_rows{};
     int lines_cleared{0};
 };
 
@@ -72,6 +75,8 @@ public:
     StepResult step(Action action);
     std::vector<PlacementOption> enumerate_active_piece_placements() const;
     std::optional<PlacementOption> placement_option_at(std::size_t index) const;
+    std::vector<std::uint8_t> visible_board_piece_ids(bool include_active) const;
+    std::vector<std::uint8_t> visible_placement_piece_ids(std::size_t index) const;
     StepResult apply_placement(const ActivePiece& placement);
     StepResult apply_placement_index(std::size_t index);
     RotationTrace rotation_trace(Action rotate_action) const;

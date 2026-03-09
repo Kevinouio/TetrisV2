@@ -22,6 +22,24 @@ float combo_bonus(int combo) {
 
 using KickOffsets = std::array<Cell, 5>;
 
+void compact_piece_ids(
+    std::array<std::array<std::int8_t, Board::kWidth>, Board::kRows>& ids,
+    const std::array<bool, Board::kRows>& cleared_rows) {
+    std::array<std::array<std::int8_t, Board::kWidth>, Board::kRows> compacted{};
+    for (auto& row : compacted) {
+        row.fill(-1);
+    }
+
+    int dst = 0;
+    for (int src = 0; src < Board::kRows; ++src) {
+        if (cleared_rows[static_cast<std::size_t>(src)]) {
+            continue;
+        }
+        compacted[static_cast<std::size_t>(dst++)] = ids[static_cast<std::size_t>(src)];
+    }
+    ids = compacted;
+}
+
 KickOffsets rotation_offsets(Piece piece, Rotation rotation) {
     switch (piece) {
         case Piece::O:
@@ -95,6 +113,9 @@ void ModernTetrisEnv::reset(std::optional<std::uint32_t> seed) {
 
     state_ = EnvState{};
     state_.board.clear();
+    for (auto& row : state_.piece_ids) {
+        row.fill(-1);
+    }
     ensure_queue(static_cast<std::size_t>(config_.queue_size) + 1u);
     spawn_next_piece(true);
 }
@@ -263,8 +284,17 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
                 for (const auto& cell : cells) {
                     board_after.set_cell(current.x + cell.x, current.y + cell.y, true);
                 }
-                int cleared = board_after.clear_filled_lines();
-                options.push_back(PlacementOption{current, board_after, cleared});
+                std::array<bool, Board::kRows> cleared_rows{};
+                int cleared = 0;
+                for (int y = 0; y < Board::kRows; ++y) {
+                    bool full = (board_after.row_mask(y) & Board::kFullRowMask) == Board::kFullRowMask;
+                    cleared_rows[static_cast<std::size_t>(y)] = full;
+                    if (full) {
+                        ++cleared;
+                    }
+                }
+                board_after.clear_filled_lines();
+                options.push_back(PlacementOption{current, board_after, cleared_rows, cleared});
             }
         }
 
@@ -324,6 +354,78 @@ std::optional<PlacementOption> ModernTetrisEnv::placement_option_at(std::size_t 
         return std::nullopt;
     }
     return options[index];
+}
+
+std::vector<std::uint8_t> ModernTetrisEnv::visible_board_piece_ids(bool include_active) const {
+    constexpr std::uint8_t kEmpty = 255;
+    std::vector<std::uint8_t> out(
+        static_cast<std::size_t>(Board::kVisibleRows * Board::kWidth), kEmpty);
+
+    for (int row = 0; row < Board::kVisibleRows; ++row) {
+        int y = (Board::kVisibleRows - 1) - row;
+        for (int x = 0; x < Board::kWidth; ++x) {
+            auto id = state_.piece_ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
+            if (id >= 0 && id <= 6) {
+                out[static_cast<std::size_t>(row * Board::kWidth + x)] =
+                    static_cast<std::uint8_t>(id);
+            }
+        }
+    }
+
+    if (include_active && state_.active.piece != Piece::None) {
+        auto cells = piece_cells(state_.active.piece, state_.active.rotation);
+        auto active_id = static_cast<std::uint8_t>(piece_index(state_.active.piece));
+        for (const auto& c : cells) {
+            int x = state_.active.x + c.x;
+            int y = state_.active.y + c.y;
+            if (x < 0 || x >= Board::kWidth || y < 0 || y >= Board::kVisibleRows) {
+                continue;
+            }
+            int row = (Board::kVisibleRows - 1) - y;
+            out[static_cast<std::size_t>(row * Board::kWidth + x)] = active_id;
+        }
+    }
+
+    return out;
+}
+
+std::vector<std::uint8_t> ModernTetrisEnv::visible_placement_piece_ids(std::size_t index) const {
+    constexpr std::uint8_t kEmpty = 255;
+    auto option = placement_option_at(index);
+    if (!option.has_value()) {
+        return std::vector<std::uint8_t>(
+            static_cast<std::size_t>(Board::kVisibleRows * Board::kWidth), kEmpty);
+    }
+
+    auto ids = state_.piece_ids;
+    auto pid = static_cast<std::int8_t>(piece_index(option->placement.piece));
+    auto cells = piece_cells(option->placement.piece, option->placement.rotation);
+    for (const auto& c : cells) {
+        int x = option->placement.x + c.x;
+        int y = option->placement.y + c.y;
+        if (x < 0 || x >= Board::kWidth || y < 0 || y >= Board::kRows) {
+            continue;
+        }
+        ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] = pid;
+    }
+
+    if (option->lines_cleared > 0) {
+        compact_piece_ids(ids, option->cleared_rows);
+    }
+
+    std::vector<std::uint8_t> out(
+        static_cast<std::size_t>(Board::kVisibleRows * Board::kWidth), kEmpty);
+    for (int row = 0; row < Board::kVisibleRows; ++row) {
+        int y = (Board::kVisibleRows - 1) - row;
+        for (int x = 0; x < Board::kWidth; ++x) {
+            auto id = ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
+            if (id >= 0 && id <= 6) {
+                out[static_cast<std::size_t>(row * Board::kWidth + x)] =
+                    static_cast<std::uint8_t>(id);
+            }
+        }
+    }
+    return out;
 }
 
 StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
@@ -612,11 +714,29 @@ bool ModernTetrisEnv::apply_hold() {
 
 void ModernTetrisEnv::lock_active_piece(StepResult& result) {
     auto cells = piece_cells(state_.active.piece, state_.active.rotation);
+    auto pid = static_cast<std::int8_t>(piece_index(state_.active.piece));
     for (const auto& cell : cells) {
-        state_.board.set_cell(state_.active.x + cell.x, state_.active.y + cell.y, true);
+        int x = state_.active.x + cell.x;
+        int y = state_.active.y + cell.y;
+        state_.board.set_cell(x, y, true);
+        if (x >= 0 && x < Board::kWidth && y >= 0 && y < Board::kRows) {
+            state_.piece_ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] = pid;
+        }
     }
 
-    int lines = state_.board.clear_filled_lines();
+    std::array<bool, Board::kRows> cleared_rows{};
+    int lines = 0;
+    for (int y = 0; y < Board::kRows; ++y) {
+        bool full = (state_.board.row_mask(y) & Board::kFullRowMask) == Board::kFullRowMask;
+        cleared_rows[static_cast<std::size_t>(y)] = full;
+        if (full) {
+            ++lines;
+        }
+    }
+    state_.board.clear_filled_lines();
+    if (lines > 0) {
+        compact_piece_ids(state_.piece_ids, cleared_rows);
+    }
     result.piece_locked = true;
     result.lines_cleared = lines;
     result.reward += line_clear_reward(lines);

@@ -10,6 +10,7 @@ import pygame
 
 BOARD_ROWS = 20
 BOARD_COLS = 10
+EMPTY_CELL_ID = 255
 
 ACTION_CW = 5
 ACTION_CCW = 6
@@ -96,6 +97,13 @@ class EnvCtypes:
     def _bind(self):
         void_p = ctypes.c_void_p
         c_int_p = ctypes.POINTER(ctypes.c_int)
+        self._has_piece_id_api = all(
+            hasattr(self.lib, name)
+            for name in (
+                "tetris_env_board_piece_ids_write",
+                "tetris_env_placement_board_piece_ids_write",
+            )
+        )
 
         self.lib.tetris_env_create.argtypes = [ctypes.c_uint32]
         self.lib.tetris_env_create.restype = void_p
@@ -122,6 +130,15 @@ class EnvCtypes:
             ctypes.c_size_t,
         ]
         self.lib.tetris_env_board_write.restype = ctypes.c_size_t
+
+        if self._has_piece_id_api:
+            self.lib.tetris_env_board_piece_ids_write.argtypes = [
+                void_p,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_size_t,
+            ]
+            self.lib.tetris_env_board_piece_ids_write.restype = ctypes.c_size_t
 
         self.lib.tetris_env_active_piece.argtypes = [void_p, c_int_p, c_int_p, c_int_p, c_int_p]
         self.lib.tetris_env_active_piece.restype = ctypes.c_int
@@ -151,6 +168,15 @@ class EnvCtypes:
             ctypes.c_size_t,
         ]
         self.lib.tetris_env_placement_board_write.restype = ctypes.c_size_t
+
+        if self._has_piece_id_api:
+            self.lib.tetris_env_placement_board_piece_ids_write.argtypes = [
+                void_p,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_size_t,
+            ]
+            self.lib.tetris_env_placement_board_piece_ids_write.restype = ctypes.c_size_t
 
         self.lib.tetris_env_apply_placement_index.argtypes = [
             void_p,
@@ -208,6 +234,25 @@ class EnvCtypes:
             return [[0 for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
         flat = [int(v) for v in buf]
         return [flat[r * BOARD_COLS : (r + 1) * BOARD_COLS] for r in range(BOARD_ROWS)]
+
+    def board_piece_ids(self, include_active: bool = True):
+        if self._has_piece_id_api:
+            buf = (ctypes.c_uint8 * (BOARD_ROWS * BOARD_COLS))()
+            written = self.lib.tetris_env_board_piece_ids_write(
+                self.handle,
+                1 if include_active else 0,
+                buf,
+                len(buf),
+            )
+            if written == len(buf):
+                flat = [int(v) for v in buf]
+                return [flat[r * BOARD_COLS : (r + 1) * BOARD_COLS] for r in range(BOARD_ROWS)]
+
+        occ = self.board()
+        return [
+            [7 if occ[r][c] else EMPTY_CELL_ID for c in range(BOARD_COLS)]
+            for r in range(BOARD_ROWS)
+        ]
 
     def active(self):
         piece = ctypes.c_int(-1)
@@ -305,6 +350,20 @@ class EnvCtypes:
             return [[0 for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
         flat = [int(v) for v in buf]
         return [flat[r * BOARD_COLS : (r + 1) * BOARD_COLS] for r in range(BOARD_ROWS)]
+
+    def placement_piece_ids(self, index: int):
+        if self._has_piece_id_api:
+            buf = (ctypes.c_uint8 * (BOARD_ROWS * BOARD_COLS))()
+            written = self.lib.tetris_env_placement_board_piece_ids_write(self.handle, int(index), buf, len(buf))
+            if written == len(buf):
+                flat = [int(v) for v in buf]
+                return [flat[r * BOARD_COLS : (r + 1) * BOARD_COLS] for r in range(BOARD_ROWS)]
+
+        occ = self.placement_board(index)
+        return [
+            [7 if occ[r][c] else EMPTY_CELL_ID for c in range(BOARD_COLS)]
+            for r in range(BOARD_ROWS)
+        ]
 
     def apply_placement(self, index: int):
         reward = ctypes.c_float(0.0)
@@ -406,33 +465,22 @@ def piece_cells(piece: int, rotation: int):
     return [rot(c) for c in base]
 
 
-def draw_board(surface, x0, y0, cell, board, active):
+def draw_board(surface, x0, y0, cell, board_piece_ids):
     for r in range(BOARD_ROWS):
         for c in range(BOARD_COLS):
             rect = pygame.Rect(x0 + c * cell, y0 + r * cell, cell, cell)
-            if board[r][c]:
-                pygame.draw.rect(surface, BOARD_FILL, rect)
+            piece_id = board_piece_ids[r][c]
+            if piece_id != EMPTY_CELL_ID:
+                pygame.draw.rect(surface, PIECE_COLORS.get(piece_id, BOARD_FILL), rect)
             pygame.draw.rect(surface, GRID_LINE, rect, width=1)
 
-    if active is not None and 0 <= active["piece"] <= 6:
-        color = PIECE_COLORS.get(active["piece"], (220, 220, 220))
-        for dx, dy in piece_cells(active["piece"], active["rotation"]):
-            x = active["x"] + dx
-            y = active["y"] + dy
-            if x < 0 or x >= BOARD_COLS or y < 0 or y >= BOARD_ROWS:
-                continue
-            row = (BOARD_ROWS - 1) - y
-            rect = pygame.Rect(x0 + x * cell, y0 + row * cell, cell, cell)
-            pygame.draw.rect(surface, color, rect)
-            pygame.draw.rect(surface, (30, 30, 30), rect, width=1)
-
-
-def draw_small_board(surface, x0, y0, cell, board):
+def draw_small_board(surface, x0, y0, cell, board_piece_ids):
     for r in range(BOARD_ROWS):
         for c in range(BOARD_COLS):
             rect = pygame.Rect(x0 + c * cell, y0 + r * cell, cell, cell)
-            if board[r][c]:
-                pygame.draw.rect(surface, (120, 140, 170), rect)
+            piece_id = board_piece_ids[r][c]
+            if piece_id != EMPTY_CELL_ID:
+                pygame.draw.rect(surface, PIECE_COLORS.get(piece_id, BOARD_FILL), rect)
             pygame.draw.rect(surface, (55, 60, 72), rect, width=1)
 
 
@@ -466,11 +514,31 @@ def main():
 
     env = EnvCtypes(lib_path, args.seed)
     selected_index = 0
+    list_scroll = 0
     inspector_actions = [ACTION_CW, ACTION_CCW, ACTION_180]
     inspector_idx = 0
     status = f"Loaded {lib_path.name}"
     seed = int(args.seed)
 
+    list_y = board_y + 160
+    list_h = 280
+    list_header_h = 30
+    list_footer_h = 30
+    row_h = 18
+    list_content_h = max(1, list_h - list_header_h - list_footer_h)
+    max_rows = max(1, list_content_h // row_h)
+    scrollbar_w = 10
+    list_rect = pygame.Rect(right_x, list_y, right_w, list_h)
+    list_rows_rect = pygame.Rect(right_x + 6, list_y + list_header_h, right_w - 24, row_h * max_rows)
+    list_scrollbar_rect = pygame.Rect(
+        list_rows_rect.right + 6,
+        list_rows_rect.top,
+        scrollbar_w,
+        list_rows_rect.height,
+    )
+    apply_button_rect = pygame.Rect(right_x + right_w - 126, list_y + list_h - 26, 116, 20)
+
+    placements = env.placements()
     running = True
     try:
         while running:
@@ -482,8 +550,12 @@ def main():
                         running = False
                     elif event.key == pygame.K_UP:
                         selected_index = max(0, selected_index - 1)
+                        if selected_index < list_scroll:
+                            list_scroll = selected_index
                     elif event.key == pygame.K_DOWN:
                         selected_index += 1
+                        if selected_index >= list_scroll + max_rows:
+                            list_scroll = selected_index - max_rows + 1
                     elif event.key == pygame.K_RETURN:
                         result = env.apply_placement(selected_index)
                         if result["success"]:
@@ -500,15 +572,48 @@ def main():
                     elif event.key == pygame.K_r:
                         env.reset(seed)
                         selected_index = 0
+                        list_scroll = 0
                         status = f"Reset seed={seed}"
                     elif event.key == pygame.K_n:
                         seed = random.randint(1, 2**31 - 1)
                         env.reset(seed)
                         selected_index = 0
+                        list_scroll = 0
                         status = f"Reset new seed={seed}"
+                elif event.type == pygame.MOUSEWHEEL:
+                    if list_rect.collidepoint(pygame.mouse.get_pos()):
+                        max_start = max(0, len(placements) - max_rows)
+                        list_scroll = max(0, min(max_start, list_scroll - int(event.y)))
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if apply_button_rect.collidepoint(event.pos) and placements:
+                        result = env.apply_placement(selected_index)
+                        if result["success"]:
+                            status = f"Applied placement {selected_index}: reward={result['reward']:.1f} lines={result['lines']}"
+                        else:
+                            status = "Placement apply failed."
+                    elif list_scrollbar_rect.collidepoint(event.pos) and placements and len(placements) > max_rows:
+                        max_start = len(placements) - max_rows
+                        rel = event.pos[1] - list_scrollbar_rect.top
+                        ratio = max(0.0, min(1.0, rel / float(max(1, list_scrollbar_rect.height - 1))))
+                        list_scroll = int(round(ratio * max_start))
+                    elif list_rows_rect.collidepoint(event.pos):
+                        row = (event.pos[1] - list_rows_rect.top) // row_h
+                        clicked_index = list_scroll + int(row)
+                        if 0 <= row < max_rows and 0 <= clicked_index < len(placements):
+                            if clicked_index == selected_index:
+                                result = env.apply_placement(selected_index)
+                                if result["success"]:
+                                    status = (
+                                        f"Applied placement {selected_index}: reward={result['reward']:.1f} "
+                                        f"lines={result['lines']}"
+                                    )
+                                else:
+                                    status = "Placement apply failed."
+                            else:
+                                selected_index = clicked_index
+                                status = f"Selected placement {selected_index}"
 
-            board = env.board()
-            active = env.active()
+            board_piece_ids = env.board_piece_ids(include_active=True)
             hold = env.hold_info()
             queue = env.queue()
             meta = env.meta()
@@ -516,10 +621,13 @@ def main():
 
             if placements:
                 selected_index = max(0, min(selected_index, len(placements) - 1))
-                preview_board = env.placement_board(selected_index)
+                max_start = max(0, len(placements) - max_rows)
+                list_scroll = max(0, min(max_start, list_scroll))
+                preview_piece_ids = env.placement_piece_ids(selected_index)
             else:
                 selected_index = 0
-                preview_board = [[0 for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
+                list_scroll = 0
+                preview_piece_ids = [[EMPTY_CELL_ID for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
 
             inspect_action = inspector_actions[inspector_idx]
             trace = env.rotation_trace(inspect_action)
@@ -527,7 +635,7 @@ def main():
             screen.fill(BG_COLOR)
 
             pygame.draw.rect(screen, PANEL_COLOR, (board_x - 4, board_y - 4, board_w + 8, board_h + 8), border_radius=6)
-            draw_board(screen, board_x, board_y, cell, board, active)
+            draw_board(screen, board_x, board_y, cell, board_piece_ids)
 
             # Top-right info panel
             info_y = board_y
@@ -546,27 +654,46 @@ def main():
                 screen.blit(surface, (right_x + 10, info_y + 10 + i * 19))
 
             # Placement list panel
-            list_y = info_y + 160
-            list_h = 280
             pygame.draw.rect(screen, PANEL_COLOR, (right_x, list_y, right_w, list_h), border_radius=8)
             title = font.render(f"Placements ({len(placements)})", True, LOCK_TEXT)
             screen.blit(title, (right_x + 10, list_y + 8))
 
-            row_h = 18
-            max_rows = max(1, (list_h - 38) // row_h)
-            start = 0
-            if selected_index >= max_rows:
-                start = selected_index - max_rows + 1
+            start = list_scroll
             end = min(len(placements), start + max_rows)
             for i in range(start, end):
                 p = placements[i]
-                y = list_y + 30 + (i - start) * row_h
+                y = list_rows_rect.top + (i - start) * row_h
                 text = f"[{p['index']:03d}] x={p['x']:>2} y={p['y']:>2} rot={ROTATION_NAMES.get(p['rotation'], '?')} lines={p['lines']}"
                 color = LOCK_TEXT
                 if i == selected_index:
-                    pygame.draw.rect(screen, SELECT_COLOR, (right_x + 6, y - 1, right_w - 12, row_h - 1), border_radius=4)
+                    pygame.draw.rect(screen, SELECT_COLOR, (list_rows_rect.left, y - 1, list_rows_rect.width, row_h - 1), border_radius=4)
                     color = (255, 255, 255)
-                screen.blit(small_font.render(text, True, color), (right_x + 12, y))
+                screen.blit(small_font.render(text, True, color), (list_rows_rect.left + 6, y))
+            if placements:
+                shown = f"Showing {start + 1}-{end} / {len(placements)}"
+                screen.blit(small_font.render(shown, True, LOCK_TEXT), (right_x + right_w - 180, list_y + 9))
+
+            # Scrollbar and apply button
+            pygame.draw.rect(screen, (42, 48, 60), list_scrollbar_rect, border_radius=4)
+            if placements and len(placements) > max_rows:
+                max_start = len(placements) - max_rows
+                thumb_h = max(24, int(list_scrollbar_rect.height * (max_rows / float(len(placements)))))
+                travel = max(0, list_scrollbar_rect.height - thumb_h)
+                thumb_top = list_scrollbar_rect.top + int(travel * (list_scroll / float(max_start)))
+                thumb_rect = pygame.Rect(list_scrollbar_rect.left, thumb_top, list_scrollbar_rect.width, thumb_h)
+            else:
+                thumb_rect = pygame.Rect(
+                    list_scrollbar_rect.left,
+                    list_scrollbar_rect.top,
+                    list_scrollbar_rect.width,
+                    list_scrollbar_rect.height,
+                )
+            pygame.draw.rect(screen, (120, 136, 170), thumb_rect, border_radius=4)
+
+            button_color = (66, 96, 170) if placements else (58, 64, 76)
+            pygame.draw.rect(screen, button_color, apply_button_rect, border_radius=5)
+            button_text = small_font.render("Apply (Enter)", True, (255, 255, 255))
+            screen.blit(button_text, (apply_button_rect.x + 12, apply_button_rect.y + 2))
 
             # Preview panel
             preview_y = list_y + list_h + 10
@@ -574,7 +701,7 @@ def main():
             preview_h = BOARD_ROWS * preview_cell + 36
             pygame.draw.rect(screen, PANEL_COLOR, (right_x, preview_y, right_w, preview_h), border_radius=8)
             screen.blit(font.render("Selected Placement Board", True, LOCK_TEXT), (right_x + 10, preview_y + 8))
-            draw_small_board(screen, right_x + 10, preview_y + 30, preview_cell, preview_board)
+            draw_small_board(screen, right_x + 10, preview_y + 30, preview_cell, preview_piece_ids)
 
             # Kick inspector panel
             kick_y = preview_y + preview_h + 10
@@ -597,7 +724,7 @@ def main():
                 )
                 screen.blit(small_font.render(txt, True, color), (right_x + 10, y))
 
-            controls = "Controls: Up/Down select | Enter apply | H hold | [ ] inspector | R reset seed | N new seed | Q quit"
+            controls = "Controls: Wheel/scrollbar browse | Click row select | Apply button/Enter lock | H | [ ] | R/N | Q"
             screen.blit(small_font.render(controls, True, LOCK_TEXT), (board_x, screen_h - 22))
             screen.blit(small_font.render(status, True, (180, 210, 255)), (board_x, board_y + board_h + 8))
 

@@ -58,6 +58,14 @@ std::vector<std::uint8_t> board_from_c_api(tetris_env_handle* handle, bool inclu
     return out;
 }
 
+std::vector<std::uint8_t> board_piece_ids_from_c_api(tetris_env_handle* handle, bool include_active) {
+    std::vector<std::uint8_t> out(200, 255);
+    auto written = tetris_env_board_piece_ids_write(
+        handle, include_active ? 1 : 0, out.data(), out.size());
+    assert(written == out.size());
+    return out;
+}
+
 void test_smoke_and_state_exports() {
     auto* handle = tetris_env_create(1337);
     assert(handle != nullptr);
@@ -104,6 +112,8 @@ void test_smoke_and_state_exports() {
 
     auto board = board_from_c_api(handle, true);
     assert(board.size() == 200);
+    auto ids = board_piece_ids_from_c_api(handle, true);
+    assert(ids.size() == 200);
 
     tetris_env_destroy(handle);
 }
@@ -120,6 +130,9 @@ void test_placement_parity_and_apply() {
     auto cpp_board = board_from_cpp_state(env_cpp.state(), true);
     auto c_board = board_from_c_api(handle, true);
     assert(cpp_board == c_board);
+    auto cpp_ids = env_cpp.visible_board_piece_ids(true);
+    auto c_ids = board_piece_ids_from_c_api(handle, true);
+    assert(cpp_ids == c_ids);
 
     auto cpp_options = env_cpp.enumerate_active_piece_placements();
     auto c_count = tetris_env_placement_count(handle);
@@ -141,6 +154,13 @@ void test_placement_parity_and_apply() {
         assert(written == c_after.size());
         auto cpp_after = board_from_cpp_board(cpp_options[i].board_after_lock);
         assert(c_after == cpp_after);
+
+        std::vector<std::uint8_t> c_after_ids(200, 255);
+        auto written_ids =
+            tetris_env_placement_board_piece_ids_write(handle, i, c_after_ids.data(), c_after_ids.size());
+        assert(written_ids == c_after_ids.size());
+        auto cpp_after_ids = env_cpp.visible_placement_piece_ids(i);
+        assert(c_after_ids == cpp_after_ids);
     }
 
     if (!cpp_options.empty()) {
@@ -159,6 +179,9 @@ void test_placement_parity_and_apply() {
         auto board_cpp_after = board_from_cpp_state(env_cpp.state(), true);
         auto board_c_after = board_from_c_api(handle, true);
         assert(board_cpp_after == board_c_after);
+        auto board_cpp_after_ids = env_cpp.visible_board_piece_ids(true);
+        auto board_c_after_ids = board_piece_ids_from_c_api(handle, true);
+        assert(board_cpp_after_ids == board_c_after_ids);
     }
 
     tetris_env_destroy(handle);
@@ -299,6 +322,7 @@ void test_bounds_and_null_safety() {
     assert(tetris_env_queue_get(handle, 9999, &dummy) == 0);
     assert(tetris_env_placement_get(handle, 9999, &dummy, &dummy, &dummy, &dummy) == 0);
     assert(tetris_env_placement_board_write(handle, 9999, board.data(), board.size()) == 0);
+    assert(tetris_env_placement_board_piece_ids_write(handle, 9999, board.data(), board.size()) == 0);
     assert(tetris_env_apply_placement_index(handle, 9999, &reward, &dummy, &dummy) == 0);
     assert(tetris_env_rotation_trace_count(handle, static_cast<int>(Action::Left)) == 0);
     assert(

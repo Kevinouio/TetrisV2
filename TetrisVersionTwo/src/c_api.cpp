@@ -160,6 +160,17 @@ size_t tetris_env_board_write(
     return write_visible_board(handle->env.state().board, active, out, out_len);
 }
 
+size_t tetris_env_board_piece_ids_write(
+    const tetris_env_handle* handle, int include_active, uint8_t* out, size_t out_len) {
+    if (!handle || !out) {
+        return 0;
+    }
+    auto ids = handle->env.visible_board_piece_ids(include_active != 0);
+    auto n = std::min(out_len, ids.size());
+    std::copy(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(n), out);
+    return n;
+}
+
 int tetris_env_active_piece(
     const tetris_env_handle* handle, int* piece, int* rotation, int* x, int* y) {
     if (!handle) {
@@ -261,6 +272,17 @@ size_t tetris_env_placement_board_write(
         return 0;
     }
     return write_visible_board(option->board_after_lock, std::nullopt, out, out_len);
+}
+
+size_t tetris_env_placement_board_piece_ids_write(
+    const tetris_env_handle* handle, size_t index, uint8_t* out, size_t out_len) {
+    if (!handle || !out) {
+        return 0;
+    }
+    auto ids = handle->env.visible_placement_piece_ids(index);
+    auto n = std::min(out_len, ids.size());
+    std::copy(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(n), out);
+    return n;
 }
 
 int tetris_env_apply_placement_index(

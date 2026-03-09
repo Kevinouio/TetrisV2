@@ -24,6 +24,10 @@ size_t tetris_env_observation_write(
 // include_active != 0 overlays the active piece cells as occupied.
 size_t tetris_env_board_write(
     const tetris_env_handle* handle, int include_active, uint8_t* out, size_t out_len);
+// Writes visible board piece ids (20x10 = 200 bytes), row-major top-to-bottom.
+// piece ids: 0..6, empty=255. include_active overlays active piece ids.
+size_t tetris_env_board_piece_ids_write(
+    const tetris_env_handle* handle, int include_active, uint8_t* out, size_t out_len);
 
 int tetris_env_active_piece(
     const tetris_env_handle* handle, int* piece, int* rotation, int* x, int* y);
@@ -47,6 +51,8 @@ size_t tetris_env_placement_count(const tetris_env_handle* handle);
 int tetris_env_placement_get(
     const tetris_env_handle* handle, size_t index, int* x, int* y, int* rotation, int* lines_cleared);
 size_t tetris_env_placement_board_write(
+    const tetris_env_handle* handle, size_t index, uint8_t* out, size_t out_len);
+size_t tetris_env_placement_board_piece_ids_write(
     const tetris_env_handle* handle, size_t index, uint8_t* out, size_t out_len);
 int tetris_env_apply_placement_index(
     tetris_env_handle* handle, size_t index, float* reward_out, int* lines_cleared_out, int* game_over_out);
