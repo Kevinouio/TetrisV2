@@ -149,6 +149,24 @@ void test_placement_parity_and_apply() {
         assert(rotation == static_cast<int>(cpp_options[i].placement.rotation));
         assert(lines == cpp_options[i].lines_cleared);
 
+        int spin_candidate = 0;
+        int difficult_candidate = 0;
+        int used_kick = 0;
+        assert(
+            tetris_env_placement_get_ex(
+                handle,
+                i,
+                &x,
+                &y,
+                &rotation,
+                &lines,
+                &spin_candidate,
+                &difficult_candidate,
+                &used_kick) == 1);
+        assert(spin_candidate == (cpp_options[i].spin_clear_candidate ? 1 : 0));
+        assert(difficult_candidate == (cpp_options[i].difficult_clear_candidate ? 1 : 0));
+        assert(used_kick == (cpp_options[i].last_rotate_used_kick_path ? 1 : 0));
+
         std::vector<std::uint8_t> c_after(200, 0);
         auto written = tetris_env_placement_board_write(handle, i, c_after.data(), c_after.size());
         assert(written == c_after.size());
@@ -175,6 +193,14 @@ void test_placement_parity_and_apply() {
         assert(std::fabs(cpp_step.reward - c_reward) < 1e-5f);
         assert(cpp_step.lines_cleared == c_lines);
         assert((cpp_step.game_over ? 1 : 0) == c_game_over);
+
+        int c_spin_clear = 0;
+        int c_difficult_clear = 0;
+        int c_b2b_bonus = 0;
+        assert(tetris_env_last_clear_meta(handle, &c_spin_clear, &c_difficult_clear, &c_b2b_bonus) == 1);
+        assert(c_spin_clear == (cpp_step.spin_clear ? 1 : 0));
+        assert(c_difficult_clear == (cpp_step.difficult_clear ? 1 : 0));
+        assert(c_b2b_bonus == (cpp_step.b2b_bonus_applied ? 1 : 0));
 
         auto board_cpp_after = board_from_cpp_state(env_cpp.state(), true);
         auto board_c_after = board_from_c_api(handle, true);
@@ -311,6 +337,8 @@ void test_bounds_and_null_safety() {
     assert(tetris_env_rotation_trace_count(nullptr, static_cast<int>(Action::RotateCW)) == 0);
     assert(tetris_env_board_write(nullptr, 1, nullptr, 0) == 0);
     assert(tetris_env_active_piece(nullptr, nullptr, nullptr, nullptr, nullptr) == 0);
+    assert(tetris_env_placement_get_ex(nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) == 0);
+    assert(tetris_env_last_clear_meta(nullptr, nullptr, nullptr, nullptr) == 0);
 
     auto* handle = tetris_env_create(5);
     assert(handle != nullptr);
@@ -321,6 +349,17 @@ void test_bounds_and_null_safety() {
 
     assert(tetris_env_queue_get(handle, 9999, &dummy) == 0);
     assert(tetris_env_placement_get(handle, 9999, &dummy, &dummy, &dummy, &dummy) == 0);
+    assert(
+        tetris_env_placement_get_ex(
+            handle,
+            9999,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy,
+            &dummy) == 0);
     assert(tetris_env_placement_board_write(handle, 9999, board.data(), board.size()) == 0);
     assert(tetris_env_placement_board_piece_ids_write(handle, 9999, board.data(), board.size()) == 0);
     assert(tetris_env_apply_placement_index(handle, 9999, &reward, &dummy, &dummy) == 0);

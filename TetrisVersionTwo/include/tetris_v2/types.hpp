@@ -59,6 +59,9 @@ struct StepResult {
     bool hold_used{false};
     bool action_succeeded{false};
     int lines_cleared{0};
+    bool spin_clear{false};
+    bool difficult_clear{false};
+    bool b2b_bonus_applied{false};
     int combo{-1};
     bool back_to_back{false};
     float reward{0.0f};

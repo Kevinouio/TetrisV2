@@ -37,5 +37,8 @@ target_link_libraries(tetris_smoke PRIVATE tetris_v2)
 add_executable(tetris_kick_search_tests tests/kick_search_tests.cpp)
 target_link_libraries(tetris_kick_search_tests PRIVATE tetris_v2)
 
+add_executable(tetris_b2b_spin_tests tests/b2b_spin_tests.cpp)
+target_link_libraries(tetris_b2b_spin_tests PRIVATE tetris_v2)
+
 add_executable(tetris_c_api_tests tests/c_api_tests.cpp)
 target_link_libraries(tetris_c_api_tests PRIVATE tetris_v2 tetris_v2_c_api_static)

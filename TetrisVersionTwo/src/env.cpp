@@ -5,7 +5,7 @@
 #include <optional>
 #include <queue>
 #include <sstream>
-#include <unordered_set>
+#include <unordered_map>
 
 #include "tetris_v2/piece_defs.hpp"
 
@@ -13,11 +13,40 @@ namespace tetris_v2 {
 
 namespace {
 
-float combo_bonus(int combo) {
-    if (combo <= 0) {
-        return 0.0f;
+struct PathMetadata {
+    bool spin_eligible{false};
+    bool last_rotate_used_kick{false};
+};
+
+bool metadata_is_better(const PathMetadata& candidate, const PathMetadata& baseline) {
+    if (candidate.spin_eligible != baseline.spin_eligible) {
+        return candidate.spin_eligible && !baseline.spin_eligible;
     }
-    return static_cast<float>(combo * 50);
+    if (candidate.spin_eligible &&
+        candidate.last_rotate_used_kick != baseline.last_rotate_used_kick) {
+        return candidate.last_rotate_used_kick && !baseline.last_rotate_used_kick;
+    }
+    return false;
+}
+
+bool placement_metadata_is_better(const PlacementOption& candidate, const PlacementOption& baseline) {
+    if (candidate.spin_clear_candidate != baseline.spin_clear_candidate) {
+        return candidate.spin_clear_candidate && !baseline.spin_clear_candidate;
+    }
+    if (candidate.spin_clear_candidate &&
+        candidate.last_rotate_used_kick_path != baseline.last_rotate_used_kick_path) {
+        return candidate.last_rotate_used_kick_path && !baseline.last_rotate_used_kick_path;
+    }
+    return false;
+}
+
+bool kick_passed_with_nonzero_offset(const std::vector<KickTest>& tests) {
+    for (const auto& test : tests) {
+        if (test.passed) {
+            return test.kick_index != 0;
+        }
+    }
+    return false;
 }
 
 using KickOffsets = std::array<Cell, 5>;
@@ -137,25 +166,47 @@ StepResult ModernTetrisEnv::step(Action action) {
     switch (action) {
         case Action::Left:
             action_succeeded = try_move(-1, 0);
+            if (action_succeeded) {
+                state_.spin_eligible = false;
+                state_.last_rotate_used_kick = false;
+            }
             moved_while_grounded = action_succeeded && touching_ground();
             break;
         case Action::Right:
             action_succeeded = try_move(1, 0);
+            if (action_succeeded) {
+                state_.spin_eligible = false;
+                state_.last_rotate_used_kick = false;
+            }
             moved_while_grounded = action_succeeded && touching_ground();
             break;
-        case Action::RotateCW:
-            action_succeeded = try_rotate(rotate_cw(state_.active.rotation));
+        case Action::RotateCW: {
+            bool used_kick = false;
+            action_succeeded = try_rotate(rotate_cw(state_.active.rotation), &used_kick);
+            if (action_succeeded) {
+                state_.spin_eligible = true;
+                state_.last_rotate_used_kick = used_kick;
+            }
             moved_while_grounded = action_succeeded && touching_ground();
             break;
-        case Action::RotateCCW:
-            action_succeeded = try_rotate(rotate_ccw(state_.active.rotation));
+        }
+        case Action::RotateCCW: {
+            bool used_kick = false;
+            action_succeeded = try_rotate(rotate_ccw(state_.active.rotation), &used_kick);
+            if (action_succeeded) {
+                state_.spin_eligible = true;
+                state_.last_rotate_used_kick = used_kick;
+            }
             moved_while_grounded = action_succeeded && touching_ground();
             break;
+        }
         case Action::Rotate180:
             if (config_.allow_rotate_180) {
-                auto rotated = kicked_rotate_180(state_.active);
+                auto rotated = kicked_rotate_180_with_kick(state_.active);
                 if (rotated.has_value()) {
-                    state_.active = *rotated;
+                    state_.active = rotated->first;
+                    state_.spin_eligible = true;
+                    state_.last_rotate_used_kick = rotated->second;
                     action_succeeded = true;
                 }
                 moved_while_grounded = action_succeeded && touching_ground();
@@ -164,6 +215,8 @@ StepResult ModernTetrisEnv::step(Action action) {
         case Action::SoftDrop:
             if (try_move(0, -1)) {
                 action_succeeded = true;
+                state_.spin_eligible = false;
+                state_.last_rotate_used_kick = false;
                 result.reward += 1.0f;
             }
             break;
@@ -265,72 +318,118 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
         return collides(below);
     };
 
-    std::queue<ActivePiece> frontier;
-    std::unordered_set<PoseKey, PoseKeyHash> visited;
-    std::unordered_set<PoseKey, PoseKeyHash> locked_seen;
+    struct SearchNode {
+        ActivePiece piece{};
+        PathMetadata metadata{};
+    };
 
-    frontier.push(state_.active);
-    visited.insert(to_key(state_.active));
+    std::queue<SearchNode> frontier;
+    std::unordered_map<PoseKey, PathMetadata, PoseKeyHash> visited_best;
+    std::unordered_map<PoseKey, std::size_t, PoseKeyHash> locked_best;
+
+    PathMetadata start_metadata{state_.spin_eligible, state_.last_rotate_used_kick};
+    frontier.push(SearchNode{state_.active, start_metadata});
+    visited_best.emplace(to_key(state_.active), start_metadata);
+
+    auto try_enqueue = [&](const ActivePiece& candidate, const PathMetadata& metadata) {
+        if (collides(candidate)) {
+            return;
+        }
+        auto key = to_key(candidate);
+        auto it = visited_best.find(key);
+        if (it == visited_best.end()) {
+            visited_best.emplace(key, metadata);
+            frontier.push(SearchNode{candidate, metadata});
+            return;
+        }
+        if (metadata_is_better(metadata, it->second)) {
+            it->second = metadata;
+            frontier.push(SearchNode{candidate, metadata});
+        }
+    };
 
     while (!frontier.empty()) {
-        ActivePiece current = frontier.front();
+        SearchNode current = frontier.front();
         frontier.pop();
 
-        if (grounded(current)) {
-            auto key = to_key(current);
-            if (locked_seen.insert(key).second) {
-                Board board_after = state_.board;
-                auto cells = piece_cells(current.piece, current.rotation);
-                for (const auto& cell : cells) {
-                    board_after.set_cell(current.x + cell.x, current.y + cell.y, true);
+        auto key = to_key(current.piece);
+        auto best_it = visited_best.find(key);
+        if (best_it == visited_best.end()) {
+            continue;
+        }
+        if (best_it->second.spin_eligible != current.metadata.spin_eligible ||
+            best_it->second.last_rotate_used_kick != current.metadata.last_rotate_used_kick) {
+            continue;
+        }
+
+        if (grounded(current.piece)) {
+            Board board_after = state_.board;
+            auto cells = piece_cells(current.piece.piece, current.piece.rotation);
+            for (const auto& cell : cells) {
+                board_after.set_cell(current.piece.x + cell.x, current.piece.y + cell.y, true);
+            }
+            std::array<bool, Board::kRows> cleared_rows{};
+            int cleared = 0;
+            for (int y = 0; y < Board::kRows; ++y) {
+                bool full = (board_after.row_mask(y) & Board::kFullRowMask) == Board::kFullRowMask;
+                cleared_rows[static_cast<std::size_t>(y)] = full;
+                if (full) {
+                    ++cleared;
                 }
-                std::array<bool, Board::kRows> cleared_rows{};
-                int cleared = 0;
-                for (int y = 0; y < Board::kRows; ++y) {
-                    bool full = (board_after.row_mask(y) & Board::kFullRowMask) == Board::kFullRowMask;
-                    cleared_rows[static_cast<std::size_t>(y)] = full;
-                    if (full) {
-                        ++cleared;
-                    }
+            }
+            board_after.clear_filled_lines();
+            bool spin_candidate =
+                (cleared > 0) && (current.piece.piece != Piece::O) && current.metadata.spin_eligible;
+            bool difficult_candidate = (cleared == 4) || spin_candidate;
+            PlacementOption candidate_option{
+                current.piece,
+                board_after,
+                cleared_rows,
+                cleared,
+                current.metadata.spin_eligible,
+                current.metadata.last_rotate_used_kick,
+                spin_candidate,
+                difficult_candidate,
+            };
+            auto existing = locked_best.find(key);
+            if (existing == locked_best.end()) {
+                locked_best.emplace(key, options.size());
+                options.push_back(std::move(candidate_option));
+            } else {
+                auto& baseline = options[existing->second];
+                if (placement_metadata_is_better(candidate_option, baseline)) {
+                    baseline = std::move(candidate_option);
                 }
-                board_after.clear_filled_lines();
-                options.push_back(PlacementOption{current, board_after, cleared_rows, cleared});
             }
         }
 
-        auto try_enqueue = [&](const ActivePiece& candidate) {
-            if (collides(candidate)) {
-                return;
-            }
-            auto [_, inserted] = visited.insert(to_key(candidate));
-            if (inserted) {
-                frontier.push(candidate);
-            }
-        };
-
-        ActivePiece left = current;
+        ActivePiece left = current.piece;
         left.x -= 1;
-        try_enqueue(left);
+        try_enqueue(left, PathMetadata{false, false});
 
-        ActivePiece right = current;
+        ActivePiece right = current.piece;
         right.x += 1;
-        try_enqueue(right);
+        try_enqueue(right, PathMetadata{false, false});
 
-        ActivePiece down = current;
+        ActivePiece down = current.piece;
         down.y -= 1;
-        try_enqueue(down);
+        try_enqueue(down, PathMetadata{false, false});
 
-        if (auto cw = kicked_rotation(current, rotate_cw(current.rotation))) {
-            try_enqueue(*cw);
+        auto [cw, cw_tests] =
+            kicked_rotation_with_tests(current.piece, rotate_cw(current.piece.rotation), 0, 0);
+        if (cw.has_value()) {
+            try_enqueue(*cw, PathMetadata{true, kick_passed_with_nonzero_offset(cw_tests)});
         }
 
-        if (auto ccw = kicked_rotation(current, rotate_ccw(current.rotation))) {
-            try_enqueue(*ccw);
+        auto [ccw, ccw_tests] =
+            kicked_rotation_with_tests(current.piece, rotate_ccw(current.piece.rotation), 0, 0);
+        if (ccw.has_value()) {
+            try_enqueue(*ccw, PathMetadata{true, kick_passed_with_nonzero_offset(ccw_tests)});
         }
 
         if (config_.allow_rotate_180) {
-            if (auto r180 = kicked_rotate_180(current)) {
-                try_enqueue(*r180);
+            if (auto r180 = kicked_rotate_180_with_kick(current.piece)) {
+                try_enqueue(r180->first, PathMetadata{true, r180->second});
             }
         }
     }
@@ -451,7 +550,9 @@ StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
         return result;
     }
 
-    state_.active = placement;
+    state_.active = it->placement;
+    state_.spin_eligible = it->spin_eligible_path;
+    state_.last_rotate_used_kick = it->last_rotate_used_kick_path;
     lock_active_piece(result);
     result.action_succeeded = true;
     result.combo = state_.combo;
@@ -462,9 +563,17 @@ StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
 }
 
 StepResult ModernTetrisEnv::apply_placement_index(std::size_t index) {
+    StepResult result{};
+    if (state_.game_over) {
+        result.game_over = true;
+        result.top_out = state_.top_out;
+        result.combo = state_.combo;
+        result.back_to_back = state_.back_to_back;
+        return result;
+    }
+
     auto option = placement_option_at(index);
     if (!option.has_value()) {
-        StepResult result{};
         result.action_succeeded = false;
         result.combo = state_.combo;
         result.back_to_back = state_.back_to_back;
@@ -472,7 +581,17 @@ StepResult ModernTetrisEnv::apply_placement_index(std::size_t index) {
         result.top_out = state_.top_out;
         return result;
     }
-    return apply_placement(option->placement);
+
+    state_.active = option->placement;
+    state_.spin_eligible = option->spin_eligible_path;
+    state_.last_rotate_used_kick = option->last_rotate_used_kick_path;
+    lock_active_piece(result);
+    result.action_succeeded = true;
+    result.combo = state_.combo;
+    result.back_to_back = state_.back_to_back;
+    result.game_over = state_.game_over;
+    result.top_out = state_.top_out;
+    return result;
 }
 
 RotationTrace ModernTetrisEnv::rotation_trace(Action rotate_action) const {
@@ -586,6 +705,8 @@ void ModernTetrisEnv::spawn_next_piece(bool reset_hold_availability) {
     state_.lock_timer = 0;
     state_.lock_resets_used = 0;
     state_.gravity_accumulator = 0.0f;
+    state_.spin_eligible = false;
+    state_.last_rotate_used_kick = false;
     if (reset_hold_availability) {
         state_.hold_available = true;
     }
@@ -619,10 +740,16 @@ bool ModernTetrisEnv::try_move(int dx, int dy) {
     return true;
 }
 
-bool ModernTetrisEnv::try_rotate(Rotation target_rotation) {
-    auto rotated = kicked_rotation(state_.active, target_rotation);
+bool ModernTetrisEnv::try_rotate(Rotation target_rotation, bool* used_kick) {
+    auto [rotated, tests] = kicked_rotation_with_tests(state_.active, target_rotation, 0, 0);
     if (!rotated.has_value()) {
+        if (used_kick) {
+            *used_kick = false;
+        }
         return false;
+    }
+    if (used_kick) {
+        *used_kick = kick_passed_with_nonzero_offset(tests);
     }
     state_.active = *rotated;
     return true;
@@ -666,16 +793,39 @@ std::optional<ActivePiece> ModernTetrisEnv::kicked_rotation(
     return kicked_rotation_with_tests(from, target_rotation, 0, 0).first;
 }
 
-std::optional<ActivePiece> ModernTetrisEnv::kicked_rotate_180(const ActivePiece& from) const {
-    if (auto first = kicked_rotation(from, rotate_cw(from.rotation))) {
-        if (auto second = kicked_rotation(*first, rotate_cw(first->rotation))) {
-            return second;
+std::optional<std::pair<ActivePiece, bool>> ModernTetrisEnv::kicked_rotate_180_with_kick(
+    const ActivePiece& from) const {
+    auto [cw_first, tests_cw_first] =
+        kicked_rotation_with_tests(from, rotate_cw(from.rotation), 0, 0);
+    if (cw_first.has_value()) {
+        bool used_kick = kick_passed_with_nonzero_offset(tests_cw_first);
+        auto [cw_second, tests_cw_second] =
+            kicked_rotation_with_tests(*cw_first, rotate_cw(cw_first->rotation), 1, 0);
+        if (cw_second.has_value()) {
+            used_kick = used_kick || kick_passed_with_nonzero_offset(tests_cw_second);
+            return std::make_pair(*cw_second, used_kick);
         }
     }
-    if (auto first = kicked_rotation(from, rotate_ccw(from.rotation))) {
-        if (auto second = kicked_rotation(*first, rotate_ccw(first->rotation))) {
-            return second;
+
+    auto [ccw_first, tests_ccw_first] =
+        kicked_rotation_with_tests(from, rotate_ccw(from.rotation), 2, 0);
+    if (ccw_first.has_value()) {
+        bool used_kick = kick_passed_with_nonzero_offset(tests_ccw_first);
+        auto [ccw_second, tests_ccw_second] =
+            kicked_rotation_with_tests(*ccw_first, rotate_ccw(ccw_first->rotation), 3, 0);
+        if (ccw_second.has_value()) {
+            used_kick = used_kick || kick_passed_with_nonzero_offset(tests_ccw_second);
+            return std::make_pair(*ccw_second, used_kick);
         }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<ActivePiece> ModernTetrisEnv::kicked_rotate_180(const ActivePiece& from) const {
+    auto rotated = kicked_rotate_180_with_kick(from);
+    if (rotated.has_value()) {
+        return rotated->first;
     }
     return std::nullopt;
 }
@@ -699,6 +849,8 @@ bool ModernTetrisEnv::apply_hold() {
         state_.lock_timer = 0;
         state_.lock_resets_used = 0;
         state_.gravity_accumulator = 0.0f;
+        state_.spin_eligible = false;
+        state_.last_rotate_used_kick = false;
         if (collides(state_.active)) {
             state_.game_over = true;
             state_.top_out = true;
@@ -739,15 +891,18 @@ void ModernTetrisEnv::lock_active_piece(StepResult& result) {
     }
     result.piece_locked = true;
     result.lines_cleared = lines;
-    result.reward += line_clear_reward(lines);
+    result.spin_clear = (lines > 0) && (state_.active.piece != Piece::O) && state_.spin_eligible;
+    result.difficult_clear = (lines == 4) || result.spin_clear;
+    result.b2b_bonus_applied = false;
 
     if (lines > 0) {
+        result.reward += line_clear_reward(lines, result.spin_clear);
         state_.combo += 1;
-        bool hard_clear = (lines == 4);
-        if (hard_clear && state_.back_to_back) {
-            result.reward += 100.0f;
+        if (result.difficult_clear && state_.back_to_back) {
+            result.reward += config_.scoring.b2b_bonus;
+            result.b2b_bonus_applied = true;
         }
-        if (hard_clear) {
+        if (result.difficult_clear) {
             state_.back_to_back = true;
         } else {
             state_.back_to_back = false;
@@ -757,18 +912,26 @@ void ModernTetrisEnv::lock_active_piece(StepResult& result) {
         state_.combo = -1;
     }
 
+    state_.last_clear_spin = result.spin_clear;
+    state_.last_clear_difficult = result.difficult_clear;
+    state_.last_clear_b2b_bonus = result.b2b_bonus_applied;
     state_.total_lines_cleared += lines;
     spawn_next_piece(true);
 }
 
-float ModernTetrisEnv::line_clear_reward(int lines) const {
-    switch (lines) {
-        case 1: return 100.0f;
-        case 2: return 300.0f;
-        case 3: return 500.0f;
-        case 4: return 800.0f;
-        default: return 0.0f;
+float ModernTetrisEnv::line_clear_reward(int lines, bool spin_clear) const {
+    if (lines < 0 || lines > 4) {
+        return 0.0f;
     }
+    const auto& table = spin_clear ? config_.scoring.spin_clear_reward : config_.scoring.normal_clear_reward;
+    return table[static_cast<std::size_t>(lines)];
+}
+
+float ModernTetrisEnv::combo_bonus(int combo) const {
+    if (combo <= 0) {
+        return 0.0f;
+    }
+    return static_cast<float>(combo) * config_.scoring.combo_unit_bonus;
 }
 
 }  // namespace tetris_v2

@@ -50,12 +50,28 @@ int tetris_env_meta(
 size_t tetris_env_placement_count(const tetris_env_handle* handle);
 int tetris_env_placement_get(
     const tetris_env_handle* handle, size_t index, int* x, int* y, int* rotation, int* lines_cleared);
+int tetris_env_placement_get_ex(
+    const tetris_env_handle* handle,
+    size_t index,
+    int* x,
+    int* y,
+    int* rotation,
+    int* lines_cleared,
+    int* spin_candidate,
+    int* difficult_candidate,
+    int* last_rotate_used_kick);
 size_t tetris_env_placement_board_write(
     const tetris_env_handle* handle, size_t index, uint8_t* out, size_t out_len);
 size_t tetris_env_placement_board_piece_ids_write(
     const tetris_env_handle* handle, size_t index, uint8_t* out, size_t out_len);
 int tetris_env_apply_placement_index(
     tetris_env_handle* handle, size_t index, float* reward_out, int* lines_cleared_out, int* game_over_out);
+
+int tetris_env_last_clear_meta(
+    const tetris_env_handle* handle,
+    int* spin_clear,
+    int* difficult_clear,
+    int* b2b_bonus_applied);
 
 size_t tetris_env_rotation_trace_count(const tetris_env_handle* handle, int rotate_action);
 int tetris_env_rotation_trace_get(

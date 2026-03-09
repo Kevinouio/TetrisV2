@@ -262,6 +262,33 @@ int tetris_env_placement_get(
     return 1;
 }
 
+int tetris_env_placement_get_ex(
+    const tetris_env_handle* handle,
+    size_t index,
+    int* x,
+    int* y,
+    int* rotation,
+    int* lines_cleared,
+    int* spin_candidate,
+    int* difficult_candidate,
+    int* last_rotate_used_kick) {
+    if (!handle) {
+        return 0;
+    }
+    auto option = handle->env.placement_option_at(index);
+    if (!option.has_value()) {
+        return 0;
+    }
+    maybe_set_int(x, option->placement.x);
+    maybe_set_int(y, option->placement.y);
+    maybe_set_int(rotation, static_cast<int>(option->placement.rotation));
+    maybe_set_int(lines_cleared, option->lines_cleared);
+    maybe_set_int(spin_candidate, option->spin_clear_candidate ? 1 : 0);
+    maybe_set_int(difficult_candidate, option->difficult_clear_candidate ? 1 : 0);
+    maybe_set_int(last_rotate_used_kick, option->last_rotate_used_kick_path ? 1 : 0);
+    return 1;
+}
+
 size_t tetris_env_placement_board_write(
     const tetris_env_handle* handle, size_t index, uint8_t* out, size_t out_len) {
     if (!handle || !out) {
@@ -299,6 +326,21 @@ int tetris_env_apply_placement_index(
     }
     maybe_set_int(lines_cleared_out, result.lines_cleared);
     maybe_set_int(game_over_out, result.game_over ? 1 : 0);
+    return 1;
+}
+
+int tetris_env_last_clear_meta(
+    const tetris_env_handle* handle,
+    int* spin_clear,
+    int* difficult_clear,
+    int* b2b_bonus_applied) {
+    if (!handle) {
+        return 0;
+    }
+    const auto& state = handle->env.state();
+    maybe_set_int(spin_clear, state.last_clear_spin ? 1 : 0);
+    maybe_set_int(difficult_clear, state.last_clear_difficult ? 1 : 0);
+    maybe_set_int(b2b_bonus_applied, state.last_clear_b2b_bonus ? 1 : 0);
     return 1;
 }
 

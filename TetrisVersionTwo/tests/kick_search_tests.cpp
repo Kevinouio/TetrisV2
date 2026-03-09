@@ -1,5 +1,7 @@
 #include <array>
 #include <cassert>
+#include <iostream>
+#include <string>
 #include <vector>
 
 #include "tetris_v2/env.hpp"
@@ -8,6 +10,45 @@
 namespace {
 
 using namespace tetris_v2;
+
+const char* action_name(Action action) {
+    switch (action) {
+        case Action::RotateCW: return "CW";
+        case Action::RotateCCW: return "CCW";
+        default: return "?";
+    }
+}
+
+void print_board_with_piece(const Board& board, const ActivePiece& piece, const std::string& label) {
+    std::array<std::string, Board::kVisibleRows> rows{};
+    for (int row = 0; row < Board::kVisibleRows; ++row) {
+        int y = (Board::kVisibleRows - 1) - row;
+        std::string line;
+        line.reserve(Board::kWidth);
+        auto mask = board.row_mask(y);
+        for (int x = 0; x < Board::kWidth; ++x) {
+            line.push_back((mask & (1u << x)) ? '#' : '.');
+        }
+        rows[static_cast<std::size_t>(row)] = std::move(line);
+    }
+
+    auto cells = piece_cells(piece.piece, piece.rotation);
+    for (const auto& c : cells) {
+        int x = piece.x + c.x;
+        int y = piece.y + c.y;
+        if (x < 0 || x >= Board::kWidth || y < 0 || y >= Board::kVisibleRows) {
+            continue;
+        }
+        int row = (Board::kVisibleRows - 1) - y;
+        rows[static_cast<std::size_t>(row)][static_cast<std::size_t>(x)] =
+            piece_to_char(piece.piece);
+    }
+
+    std::cout << label << '\n';
+    for (const auto& row : rows) {
+        std::cout << row << '\n';
+    }
+}
 
 bool collides_local(const Board& board, const ActivePiece& piece) {
     auto cells = piece_cells(piece.piece, piece.rotation);
@@ -76,7 +117,22 @@ bool kicked_rotation_found_for_piece(Piece piece, Action action) {
             return false;
         }
         // Kick occurred iff rotation succeeded despite raw collision and pose changed beyond raw.
-        return (after.x != raw.x) || (after.y != raw.y);
+        bool kicked = (after.x != raw.x) || (after.y != raw.y);
+        if (kicked) {
+            std::cout << "\n[kick_search] Found kick-required state "
+                      << "piece=" << piece_name(piece)
+                      << " action=" << action_name(action)
+                      << " from=(" << active.x << "," << active.y << ","
+                      << static_cast<int>(active.rotation) << ")"
+                      << " raw=(" << raw.x << "," << raw.y << ","
+                      << static_cast<int>(raw.rotation) << ")"
+                      << " after=(" << after.x << "," << after.y << ","
+                      << static_cast<int>(after.rotation) << ")\n";
+            print_board_with_piece(board, active, "Board + active before rotate:");
+            print_board_with_piece(board, raw, "Board + raw rotated pose (blocked):");
+            print_board_with_piece(board, after, "Board + final kicked pose:");
+        }
+        return kicked;
     };
 
     for (auto rotation : rotations) {
