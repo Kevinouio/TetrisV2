@@ -306,6 +306,10 @@ size_t tetris_env_placement_board_piece_ids_write(
     if (!handle || !out) {
         return 0;
     }
+    auto option = handle->env.placement_option_at(index);
+    if (!option.has_value()) {
+        return 0;
+    }
     auto ids = handle->env.visible_placement_piece_ids(index);
     auto n = std::min(out_len, ids.size());
     std::copy(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(n), out);

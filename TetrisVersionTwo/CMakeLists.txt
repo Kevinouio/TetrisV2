@@ -4,6 +4,8 @@ project(TetrisVersionTwo LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+find_package(Python3 COMPONENTS Interpreter)
+
 add_library(
     tetris_v2
     src/board.cpp
@@ -39,6 +41,28 @@ target_link_libraries(tetris_kick_search_tests PRIVATE tetris_v2)
 
 add_executable(tetris_b2b_spin_tests tests/b2b_spin_tests.cpp)
 target_link_libraries(tetris_b2b_spin_tests PRIVATE tetris_v2)
+
+set(TWIST_CASES_JSON ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/twist_cases_srs.json)
+set(TWIST_CASES_GENERATOR ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/generate_twist_cases.py)
+set(TWIST_CASES_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/tests/generated/twist_cases_generated.hpp)
+
+if(Python3_Interpreter_FOUND)
+    add_custom_command(
+        OUTPUT ${TWIST_CASES_HEADER}
+        COMMAND ${Python3_EXECUTABLE} ${TWIST_CASES_GENERATOR} ${TWIST_CASES_JSON} ${TWIST_CASES_HEADER}
+        DEPENDS ${TWIST_CASES_JSON} ${TWIST_CASES_GENERATOR}
+        COMMENT "Generating twist dataset header"
+        VERBATIM
+    )
+    add_custom_target(tetris_twist_dataset_gen DEPENDS ${TWIST_CASES_HEADER})
+else()
+    message(WARNING "Python3 not found; using checked-in twist dataset header without regeneration.")
+    add_custom_target(tetris_twist_dataset_gen)
+endif()
+
+add_executable(tetris_twist_dataset_tests tests/twist_dataset_tests.cpp)
+add_dependencies(tetris_twist_dataset_tests tetris_twist_dataset_gen)
+target_link_libraries(tetris_twist_dataset_tests PRIVATE tetris_v2)
 
 add_executable(tetris_c_api_tests tests/c_api_tests.cpp)
 target_link_libraries(tetris_c_api_tests PRIVATE tetris_v2 tetris_v2_c_api_static)

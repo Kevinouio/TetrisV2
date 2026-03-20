@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <deque>
 #include <iostream>
 #include <optional>
@@ -17,6 +18,11 @@ struct KickSpinScenario {
     EnvState state{};
     ActivePiece placement{};
 };
+
+bool twist_verbose() {
+    const char* raw = std::getenv("TETRIS_TWIST_VERBOSE");
+    return raw != nullptr && raw[0] != '\0' && raw[0] != '0';
+}
 
 void print_board_with_piece(const Board& board, const ActivePiece& piece, const char* label) {
     std::cout << label << '\n';
@@ -144,17 +150,19 @@ std::optional<KickSpinScenario> find_kick_spin_clear_scenario(
                                    opt.last_rotate_used_kick_path;
                         });
                         if (it != options.end()) {
-                            std::cout << "\n[b2b_spin] Kick+spin candidate found piece="
-                                      << piece_name(piece)
-                                      << " pattern=" << pattern
-                                      << " gap=" << gap
-                                      << " blocker=(" << dx << "," << dy << ")"
-                                      << " lines=" << it->lines_cleared
-                                      << " spin=" << it->spin_clear_candidate
-                                      << " difficult=" << it->difficult_clear_candidate
-                                      << " kick=" << it->last_rotate_used_kick_path
-                                      << '\n';
-                            print_board_with_piece(state.board, state.active, "Board at discovery:");
+                            if (twist_verbose()) {
+                                std::cout << "\n[b2b_spin] Kick+spin candidate found piece="
+                                          << piece_name(piece)
+                                          << " pattern=" << pattern
+                                          << " gap=" << gap
+                                          << " blocker=(" << dx << "," << dy << ")"
+                                          << " lines=" << it->lines_cleared
+                                          << " spin=" << it->spin_clear_candidate
+                                          << " difficult=" << it->difficult_clear_candidate
+                                          << " kick=" << it->last_rotate_used_kick_path
+                                          << '\n';
+                                print_board_with_piece(state.board, state.active, "Board at discovery:");
+                            }
                             return KickSpinScenario{state, it->placement};
                         }
                     }
@@ -206,11 +214,13 @@ void test_tetris_then_single_breaks_b2b() {
     cfg.lock_delay_steps = 999999;
 
     ModernTetrisEnv env(cfg);
-    auto state = make_clean_state(env, Piece::I, {Piece::I, Piece::T, Piece::T});
+    auto state = make_clean_state(env, Piece::I, {Piece::O, Piece::T, Piece::T});
     for (int y = 0; y <= 3; ++y) {
         fill_row_with_gap(state.board, y, 4);
     }
-    fill_row_with_gap(state.board, 4, 4);
+    for (int x = 0; x < Board::kWidth; ++x) {
+        state.board.set_cell(x, 4, x != 4 && x != 5);
+    }
     env.restore(state);
 
     auto options1 = env.enumerate_active_piece_placements();
@@ -222,11 +232,21 @@ void test_tetris_then_single_breaks_b2b() {
     assert(env.state().back_to_back);
 
     auto options2 = env.enumerate_active_piece_placements();
-    auto* single = find_placement_with_lines(options2, 1);
-    assert(single != nullptr);
-    auto step2 = env.apply_placement(single->placement);
+    auto single_it = std::find_if(options2.begin(), options2.end(), [](const PlacementOption& opt) {
+        return opt.lines_cleared == 1 && !opt.difficult_clear_candidate;
+    });
+    if (single_it == options2.end()) {
+        std::cerr << "[b2b_spin] No non-difficult single available after first tetris.\n";
+        print_board_with_piece(env.state().board, env.state().active, "Board before expected non-difficult single:");
+        assert(false && "No non-difficult single placement found");
+    }
+    auto step2 = env.apply_placement(single_it->placement);
     assert(step2.action_succeeded);
     assert(step2.lines_cleared == 1);
+    if (step2.difficult_clear) {
+        std::cerr << "[b2b_spin] Selected single cleared as difficult unexpectedly.\n";
+        print_board_with_piece(env.state().board, env.state().active, "Board after unexpected difficult single:");
+    }
     assert(!step2.difficult_clear);
     assert(!env.state().back_to_back);
 }

@@ -1,5 +1,5 @@
 #include <array>
-#include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -10,6 +10,10 @@
 namespace {
 
 using namespace tetris_v2;
+
+constexpr const char* kColorGreen = "\x1b[32m";
+constexpr const char* kColorRed = "\x1b[31m";
+constexpr const char* kColorReset = "\x1b[0m";
 
 const char* action_name(Action action) {
     switch (action) {
@@ -164,17 +168,37 @@ bool kicked_rotation_found_for_piece(Piece piece, Action action) {
     return false;
 }
 
-void test_kicks_found_for_all_pieces(Action action) {
+bool test_kicks_found_for_all_pieces(Action action) {
+    int failures = 0;
     for (auto piece : kPlayablePieces) {
         bool found = kicked_rotation_found_for_piece(piece, action);
-        assert(found && "No kick-required state found for piece");
+        if (found) {
+            std::cout << kColorGreen
+                      << "[kick_search] FOUND"
+                      << kColorReset
+                      << " piece=" << piece_name(piece)
+                      << " action=" << action_name(action) << '\n';
+        } else {
+            ++failures;
+            std::cout << kColorRed
+                      << "[kick_search] NOT FOUND"
+                      << kColorReset
+                      << " piece=" << piece_name(piece)
+                      << " action=" << action_name(action) << '\n';
+        }
     }
+    if (failures > 0) {
+        std::cerr << "[kick_search] Missing kick-required states for action="
+                  << action_name(action) << " failures=" << failures << '\n';
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
 
 int main() {
-    test_kicks_found_for_all_pieces(Action::RotateCW);
-    test_kicks_found_for_all_pieces(Action::RotateCCW);
-    return 0;
+    bool ok_cw = test_kicks_found_for_all_pieces(Action::RotateCW);
+    bool ok_ccw = test_kicks_found_for_all_pieces(Action::RotateCCW);
+    return (ok_cw && ok_ccw) ? 0 : 1;
 }
