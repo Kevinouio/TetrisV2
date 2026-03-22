@@ -7,6 +7,12 @@ from typing import Optional
 
 import pygame
 
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from TetrisVersionTwo.rl.runtime import EnvCtypes as SharedEnvCtypes
+from TetrisVersionTwo.rl.runtime import find_library as shared_find_library
+
 
 BOARD_ROWS = 20
 BOARD_COLS = 10
@@ -50,7 +56,7 @@ SELECT_COLOR = (80, 130, 240)
 BOARD_FILL = (70, 80, 100)
 
 
-def parse_args():
+def parse_args(argv: Optional[list[str]] = None):
     parser = argparse.ArgumentParser(description="Pygame Placement + Kick Explorer via ctypes.")
     parser.add_argument("--lib", type=Path, default=None, help="Path to tetris_v2_c_api shared library.")
     parser.add_argument("--cell", type=int, default=28, help="Main board cell size.")
@@ -71,10 +77,10 @@ def parse_args():
         dest="auto_reset",
         help="Disable AI auto reset on topout.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def find_library(explicit_path: Optional[Path]) -> Path:
+def _legacy_find_library(explicit_path: Optional[Path]) -> Path:
     if explicit_path is not None:
         if explicit_path.exists():
             return explicit_path
@@ -99,7 +105,7 @@ def find_library(explicit_path: Optional[Path]) -> Path:
     raise FileNotFoundError("Could not locate tetris_v2_c_api shared library. Build it first.")
 
 
-class EnvCtypes:
+class _LegacyEnvCtypes:
     def __init__(self, lib_path: Path, seed: int):
         self.lib = ctypes.CDLL(str(lib_path))
         self._bind()
@@ -694,8 +700,13 @@ def action_name(action: int):
     return {ACTION_CW: "CW", ACTION_CCW: "CCW", ACTION_180: "180"}.get(action, "?")
 
 
-def main():
-    args = parse_args()
+# Runtime binding source of truth for all Python tools.
+EnvCtypes = SharedEnvCtypes
+find_library = shared_find_library
+
+
+def main(argv: Optional[list[str]] = None):
+    args = parse_args(argv)
     try:
         lib_path = find_library(args.lib)
     except FileNotFoundError as exc:
@@ -1025,7 +1036,8 @@ def main():
     finally:
         env.close()
         pygame.quit()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
