@@ -1,0 +1,36 @@
+[
+  {
+    "id": "T_TEMPLATE_01",
+    "family": "T",
+    "source_url": "https://harddrop.com/wiki/List_of_twists",
+    "source_note": "Template case using compact board encoding",
+    "board_rows_by_y": {
+      "0": "#.########",
+      "1": ".........."
+    },
+    "active": {
+      "piece": "T",
+      "rotation": 1,
+      "x": 0,
+      "y": 14
+    },
+    "state": {
+      "back_to_back": false,
+      "combo": -1,
+      "spin_eligible": false,
+      "last_rotate_used_kick": false
+    },
+    "actions": [
+      "CW",
+      "HD"
+    ],
+    "expect": {
+      "lines_cleared": 1,
+      "spin_clear": true,
+      "difficult_clear": true,
+      "b2b_out": true,
+      "b2b_bonus_applied": false,
+      "must_observe_kick": true
+    }
+  }
+]
