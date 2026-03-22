@@ -72,7 +72,7 @@ EnvState make_clean_state(
     ModernTetrisEnv& env,
     Piece active_piece,
     const std::deque<Piece>& queue = std::deque<Piece>{}) {
-    EnvState state = env.snapshot();
+    EnvState state = env.snapshot().state;
     state.board.clear();
     for (auto& row : state.piece_ids) {
         row.fill(-1);
@@ -94,7 +94,9 @@ EnvState make_clean_state(
     state.gravity_accumulator = 0.0f;
     state.spin_eligible = false;
     state.last_rotate_used_kick = false;
+    state.last_rotate_kick_index = -1;
     state.last_clear_spin = false;
+    state.last_clear_spin_type = SpinType::None;
     state.last_clear_difficult = false;
     state.last_clear_b2b_bonus = false;
     return state;
@@ -292,7 +294,7 @@ void test_tetris_zero_then_tetris_preserves_b2b() {
     assert(env.state().back_to_back);
 }
 
-void test_kick_spin_clear_for_all_non_o_pieces() {
+void test_t_piece_kick_spin_clear() {
     EnvConfig cfg;
     cfg.seed = 4;
     cfg.gravity_per_step = 0.0f;
@@ -300,34 +302,29 @@ void test_kick_spin_clear_for_all_non_o_pieces() {
 
     ModernTetrisEnv env(cfg);
 
-    const std::array<Piece, 6> pieces{
-        Piece::I, Piece::T, Piece::L, Piece::J, Piece::S, Piece::Z};
+    auto scenario = find_kick_spin_clear_scenario(env, Piece::T);
+    assert(scenario.has_value() && "No kick+spin clear scenario found for T");
 
-    for (auto piece : pieces) {
-        auto scenario = find_kick_spin_clear_scenario(env, piece);
-        assert(scenario.has_value() && "No kick+spin clear scenario found for piece");
+    auto state_no_b2b = scenario->state;
+    state_no_b2b.back_to_back = false;
+    env.restore(state_no_b2b);
+    auto clear_no_b2b = env.apply_placement(scenario->placement);
+    assert(clear_no_b2b.action_succeeded);
+    assert(clear_no_b2b.lines_cleared > 0);
+    assert(clear_no_b2b.spin_clear);
+    assert(clear_no_b2b.difficult_clear);
+    assert(!clear_no_b2b.b2b_bonus_applied);
+    assert(env.state().back_to_back);
 
-        auto state_no_b2b = scenario->state;
-        state_no_b2b.back_to_back = false;
-        env.restore(state_no_b2b);
-        auto clear_no_b2b = env.apply_placement(scenario->placement);
-        assert(clear_no_b2b.action_succeeded);
-        assert(clear_no_b2b.lines_cleared > 0);
-        assert(clear_no_b2b.spin_clear);
-        assert(clear_no_b2b.difficult_clear);
-        assert(!clear_no_b2b.b2b_bonus_applied);
-        assert(env.state().back_to_back);
-
-        auto state_with_b2b = scenario->state;
-        state_with_b2b.back_to_back = true;
-        env.restore(state_with_b2b);
-        auto clear_with_b2b = env.apply_placement(scenario->placement);
-        assert(clear_with_b2b.action_succeeded);
-        assert(clear_with_b2b.lines_cleared > 0);
-        assert(clear_with_b2b.spin_clear);
-        assert(clear_with_b2b.difficult_clear);
-        assert(clear_with_b2b.b2b_bonus_applied);
-    }
+    auto state_with_b2b = scenario->state;
+    state_with_b2b.back_to_back = true;
+    env.restore(state_with_b2b);
+    auto clear_with_b2b = env.apply_placement(scenario->placement);
+    assert(clear_with_b2b.action_succeeded);
+    assert(clear_with_b2b.lines_cleared > 0);
+    assert(clear_with_b2b.spin_clear);
+    assert(clear_with_b2b.difficult_clear);
+    assert(clear_with_b2b.b2b_bonus_applied);
 }
 
 }  // namespace
@@ -336,6 +333,6 @@ int main() {
     test_tetris_to_tetris_gets_b2b_bonus();
     test_tetris_then_single_breaks_b2b();
     test_tetris_zero_then_tetris_preserves_b2b();
-    test_kick_spin_clear_for_all_non_o_pieces();
+    test_t_piece_kick_spin_clear();
     return 0;
 }

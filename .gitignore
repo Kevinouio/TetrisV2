@@ -30,7 +30,8 @@ CMakeFiles/
 *.dll
 *.exe
 compile_commands.json
-
+cold-clear/
+cold-clear-2/
 # Experiment outputs
 runs/
 videos/

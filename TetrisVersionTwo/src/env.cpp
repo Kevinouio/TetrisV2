@@ -16,15 +16,25 @@ namespace {
 struct PathMetadata {
     bool spin_eligible{false};
     bool last_rotate_used_kick{false};
+    int last_rotate_kick_index{-1};
 };
 
 bool metadata_is_better(const PathMetadata& candidate, const PathMetadata& baseline) {
     if (candidate.spin_eligible != baseline.spin_eligible) {
         return candidate.spin_eligible && !baseline.spin_eligible;
     }
-    if (candidate.spin_eligible &&
-        candidate.last_rotate_used_kick != baseline.last_rotate_used_kick) {
-        return candidate.last_rotate_used_kick && !baseline.last_rotate_used_kick;
+    if (candidate.spin_eligible) {
+        const bool candidate_full_kick = candidate.last_rotate_kick_index == 4;
+        const bool baseline_full_kick = baseline.last_rotate_kick_index == 4;
+        if (candidate_full_kick != baseline_full_kick) {
+            return candidate_full_kick;
+        }
+        if (candidate.last_rotate_used_kick != baseline.last_rotate_used_kick) {
+            return candidate.last_rotate_used_kick && !baseline.last_rotate_used_kick;
+        }
+        if (candidate.last_rotate_kick_index != baseline.last_rotate_kick_index) {
+            return candidate.last_rotate_kick_index > baseline.last_rotate_kick_index;
+        }
     }
     return false;
 }
@@ -37,6 +47,14 @@ bool placement_metadata_is_better(const PlacementOption& candidate, const Placem
         candidate.last_rotate_used_kick_path != baseline.last_rotate_used_kick_path) {
         return candidate.last_rotate_used_kick_path && !baseline.last_rotate_used_kick_path;
     }
+    const bool candidate_full_kick = candidate.last_rotate_kick_index_path == 4;
+    const bool baseline_full_kick = baseline.last_rotate_kick_index_path == 4;
+    if (candidate_full_kick != baseline_full_kick) {
+        return candidate_full_kick;
+    }
+    if (candidate.last_rotate_kick_index_path != baseline.last_rotate_kick_index_path) {
+        return candidate.last_rotate_kick_index_path > baseline.last_rotate_kick_index_path;
+    }
     return false;
 }
 
@@ -47,6 +65,15 @@ bool kick_passed_with_nonzero_offset(const std::vector<KickTest>& tests) {
         }
     }
     return false;
+}
+
+int passing_kick_index(const std::vector<KickTest>& tests) {
+    for (const auto& test : tests) {
+        if (test.passed) {
+            return test.kick_index;
+        }
+    }
+    return -1;
 }
 
 using KickOffsets = std::array<Cell, 5>;
@@ -169,6 +196,7 @@ StepResult ModernTetrisEnv::step(Action action) {
             if (action_succeeded) {
                 state_.spin_eligible = false;
                 state_.last_rotate_used_kick = false;
+                state_.last_rotate_kick_index = -1;
             }
             moved_while_grounded = action_succeeded && touching_ground();
             break;
@@ -177,25 +205,30 @@ StepResult ModernTetrisEnv::step(Action action) {
             if (action_succeeded) {
                 state_.spin_eligible = false;
                 state_.last_rotate_used_kick = false;
+                state_.last_rotate_kick_index = -1;
             }
             moved_while_grounded = action_succeeded && touching_ground();
             break;
         case Action::RotateCW: {
             bool used_kick = false;
-            action_succeeded = try_rotate(rotate_cw(state_.active.rotation), &used_kick);
+            int kick_index = -1;
+            action_succeeded = try_rotate(rotate_cw(state_.active.rotation), &used_kick, &kick_index);
             if (action_succeeded) {
                 state_.spin_eligible = true;
                 state_.last_rotate_used_kick = used_kick;
+                state_.last_rotate_kick_index = kick_index;
             }
             moved_while_grounded = action_succeeded && touching_ground();
             break;
         }
         case Action::RotateCCW: {
             bool used_kick = false;
-            action_succeeded = try_rotate(rotate_ccw(state_.active.rotation), &used_kick);
+            int kick_index = -1;
+            action_succeeded = try_rotate(rotate_ccw(state_.active.rotation), &used_kick, &kick_index);
             if (action_succeeded) {
                 state_.spin_eligible = true;
                 state_.last_rotate_used_kick = used_kick;
+                state_.last_rotate_kick_index = kick_index;
             }
             moved_while_grounded = action_succeeded && touching_ground();
             break;
@@ -207,6 +240,7 @@ StepResult ModernTetrisEnv::step(Action action) {
                     state_.active = rotated->first;
                     state_.spin_eligible = true;
                     state_.last_rotate_used_kick = rotated->second;
+                    state_.last_rotate_kick_index = -1;
                     action_succeeded = true;
                 }
                 moved_while_grounded = action_succeeded && touching_ground();
@@ -217,6 +251,7 @@ StepResult ModernTetrisEnv::step(Action action) {
                 action_succeeded = true;
                 state_.spin_eligible = false;
                 state_.last_rotate_used_kick = false;
+                state_.last_rotate_kick_index = -1;
                 result.reward += 1.0f;
             }
             break;
@@ -327,7 +362,10 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
     std::unordered_map<PoseKey, PathMetadata, PoseKeyHash> visited_best;
     std::unordered_map<PoseKey, std::size_t, PoseKeyHash> locked_best;
 
-    PathMetadata start_metadata{state_.spin_eligible, state_.last_rotate_used_kick};
+    PathMetadata start_metadata{
+        state_.spin_eligible,
+        state_.last_rotate_used_kick,
+        state_.last_rotate_kick_index};
     frontier.push(SearchNode{state_.active, start_metadata});
     visited_best.emplace(to_key(state_.active), start_metadata);
 
@@ -358,7 +396,8 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
             continue;
         }
         if (best_it->second.spin_eligible != current.metadata.spin_eligible ||
-            best_it->second.last_rotate_used_kick != current.metadata.last_rotate_used_kick) {
+            best_it->second.last_rotate_used_kick != current.metadata.last_rotate_used_kick ||
+            best_it->second.last_rotate_kick_index != current.metadata.last_rotate_kick_index) {
             continue;
         }
 
@@ -379,7 +418,7 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
             }
             board_after.clear_filled_lines();
             bool spin_candidate =
-                (cleared > 0) && (current.piece.piece != Piece::O) && current.metadata.spin_eligible;
+                (cleared > 0) && (current.piece.piece == Piece::T) && current.metadata.spin_eligible;
             bool difficult_candidate = (cleared == 4) || spin_candidate;
             PlacementOption candidate_option{
                 current.piece,
@@ -388,6 +427,7 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
                 cleared,
                 current.metadata.spin_eligible,
                 current.metadata.last_rotate_used_kick,
+                current.metadata.last_rotate_kick_index,
                 spin_candidate,
                 difficult_candidate,
             };
@@ -405,31 +445,33 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
 
         ActivePiece left = current.piece;
         left.x -= 1;
-        try_enqueue(left, PathMetadata{false, false});
+        try_enqueue(left, PathMetadata{false, false, -1});
 
         ActivePiece right = current.piece;
         right.x += 1;
-        try_enqueue(right, PathMetadata{false, false});
+        try_enqueue(right, PathMetadata{false, false, -1});
 
         ActivePiece down = current.piece;
         down.y -= 1;
-        try_enqueue(down, PathMetadata{false, false});
+        try_enqueue(down, PathMetadata{false, false, -1});
 
         auto [cw, cw_tests] =
             kicked_rotation_with_tests(current.piece, rotate_cw(current.piece.rotation), 0, 0);
         if (cw.has_value()) {
-            try_enqueue(*cw, PathMetadata{true, kick_passed_with_nonzero_offset(cw_tests)});
+            const int kick_index = passing_kick_index(cw_tests);
+            try_enqueue(*cw, PathMetadata{true, kick_index > 0, kick_index});
         }
 
         auto [ccw, ccw_tests] =
             kicked_rotation_with_tests(current.piece, rotate_ccw(current.piece.rotation), 0, 0);
         if (ccw.has_value()) {
-            try_enqueue(*ccw, PathMetadata{true, kick_passed_with_nonzero_offset(ccw_tests)});
+            const int kick_index = passing_kick_index(ccw_tests);
+            try_enqueue(*ccw, PathMetadata{true, kick_index > 0, kick_index});
         }
 
         if (config_.allow_rotate_180) {
             if (auto r180 = kicked_rotate_180_with_kick(current.piece)) {
-                try_enqueue(r180->first, PathMetadata{true, r180->second});
+                try_enqueue(r180->first, PathMetadata{true, r180->second, -1});
             }
         }
     }
@@ -553,6 +595,7 @@ StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
     state_.active = it->placement;
     state_.spin_eligible = it->spin_eligible_path;
     state_.last_rotate_used_kick = it->last_rotate_used_kick_path;
+    state_.last_rotate_kick_index = it->last_rotate_kick_index_path;
     lock_active_piece(result);
     result.action_succeeded = true;
     result.combo = state_.combo;
@@ -585,6 +628,7 @@ StepResult ModernTetrisEnv::apply_placement_index(std::size_t index) {
     state_.active = option->placement;
     state_.spin_eligible = option->spin_eligible_path;
     state_.last_rotate_used_kick = option->last_rotate_used_kick_path;
+    state_.last_rotate_kick_index = option->last_rotate_kick_index_path;
     lock_active_piece(result);
     result.action_succeeded = true;
     result.combo = state_.combo;
@@ -656,7 +700,17 @@ RotationTrace ModernTetrisEnv::rotation_trace(Action rotate_action) const {
     return trace;
 }
 
-EnvState ModernTetrisEnv::snapshot() const { return state_; }
+EnvSnapshot ModernTetrisEnv::snapshot() const {
+    EnvSnapshot out{};
+    out.state = state_;
+    out.randomizer = randomizer_;
+    return out;
+}
+
+void ModernTetrisEnv::restore(const EnvSnapshot& snapshot) {
+    state_ = snapshot.state;
+    randomizer_ = snapshot.randomizer;
+}
 
 void ModernTetrisEnv::restore(const EnvState& state) { state_ = state; }
 
@@ -707,6 +761,7 @@ void ModernTetrisEnv::spawn_next_piece(bool reset_hold_availability) {
     state_.gravity_accumulator = 0.0f;
     state_.spin_eligible = false;
     state_.last_rotate_used_kick = false;
+    state_.last_rotate_kick_index = -1;
     if (reset_hold_availability) {
         state_.hold_available = true;
     }
@@ -740,16 +795,23 @@ bool ModernTetrisEnv::try_move(int dx, int dy) {
     return true;
 }
 
-bool ModernTetrisEnv::try_rotate(Rotation target_rotation, bool* used_kick) {
+bool ModernTetrisEnv::try_rotate(Rotation target_rotation, bool* used_kick, int* kick_index) {
     auto [rotated, tests] = kicked_rotation_with_tests(state_.active, target_rotation, 0, 0);
     if (!rotated.has_value()) {
         if (used_kick) {
             *used_kick = false;
         }
+        if (kick_index) {
+            *kick_index = -1;
+        }
         return false;
     }
+    int passed = passing_kick_index(tests);
     if (used_kick) {
-        *used_kick = kick_passed_with_nonzero_offset(tests);
+        *used_kick = passed > 0;
+    }
+    if (kick_index) {
+        *kick_index = passed;
     }
     state_.active = *rotated;
     return true;
@@ -851,6 +913,7 @@ bool ModernTetrisEnv::apply_hold() {
         state_.gravity_accumulator = 0.0f;
         state_.spin_eligible = false;
         state_.last_rotate_used_kick = false;
+        state_.last_rotate_kick_index = -1;
         if (collides(state_.active)) {
             state_.game_over = true;
             state_.top_out = true;
@@ -885,13 +948,46 @@ void ModernTetrisEnv::lock_active_piece(StepResult& result) {
             ++lines;
         }
     }
+
+    auto spin_type = SpinType::None;
+    if (lines > 0 && state_.active.piece == Piece::T && state_.spin_eligible) {
+        auto occupied_corner = [&](int dx, int dy) {
+            return state_.board.occupied(state_.active.x + dx, state_.active.y + dy);
+        };
+        const int corners =
+            static_cast<int>(occupied_corner(-1, -1)) +
+            static_cast<int>(occupied_corner(1, -1)) +
+            static_cast<int>(occupied_corner(-1, 1)) +
+            static_cast<int>(occupied_corner(1, 1));
+
+        if (corners >= 3) {
+            auto rotate = [&](int x, int y) -> Cell {
+                switch (state_.active.rotation) {
+                    case Rotation::North: return Cell{x, y};
+                    case Rotation::East: return Cell{y, -x};
+                    case Rotation::South: return Cell{-x, -y};
+                    case Rotation::West: return Cell{-y, x};
+                }
+                return Cell{x, y};
+            };
+            auto c1 = rotate(-1, 1);
+            auto c2 = rotate(1, 1);
+            const int mini_corners =
+                static_cast<int>(occupied_corner(c1.x, c1.y)) +
+                static_cast<int>(occupied_corner(c2.x, c2.y));
+            const bool full = (mini_corners == 2) || (state_.last_rotate_kick_index == 4);
+            spin_type = full ? SpinType::Full : SpinType::Mini;
+        }
+    }
+
     state_.board.clear_filled_lines();
     if (lines > 0) {
         compact_piece_ids(state_.piece_ids, cleared_rows);
     }
     result.piece_locked = true;
     result.lines_cleared = lines;
-    result.spin_clear = (lines > 0) && (state_.active.piece != Piece::O) && state_.spin_eligible;
+    result.spin_type = spin_type;
+    result.spin_clear = result.spin_type != SpinType::None;
     result.difficult_clear = (lines == 4) || result.spin_clear;
     result.b2b_bonus_applied = false;
 
@@ -913,6 +1009,7 @@ void ModernTetrisEnv::lock_active_piece(StepResult& result) {
     }
 
     state_.last_clear_spin = result.spin_clear;
+    state_.last_clear_spin_type = result.spin_type;
     state_.last_clear_difficult = result.difficult_clear;
     state_.last_clear_b2b_bonus = result.b2b_bonus_applied;
     state_.total_lines_cleared += lines;

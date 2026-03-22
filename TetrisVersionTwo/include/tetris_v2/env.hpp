@@ -49,9 +49,16 @@ struct EnvState {
     float gravity_accumulator{0.0f};
     bool spin_eligible{false};
     bool last_rotate_used_kick{false};
+    int last_rotate_kick_index{-1};
     bool last_clear_spin{false};
+    SpinType last_clear_spin_type{SpinType::None};
     bool last_clear_difficult{false};
     bool last_clear_b2b_bonus{false};
+};
+
+struct EnvSnapshot {
+    EnvState state{};
+    SevenBagRandomizer randomizer{};
 };
 
 struct PlacementOption {
@@ -61,6 +68,7 @@ struct PlacementOption {
     int lines_cleared{0};
     bool spin_eligible_path{false};
     bool last_rotate_used_kick_path{false};
+    int last_rotate_kick_index_path{-1};
     bool spin_clear_candidate{false};
     bool difficult_clear_candidate{false};
 };
@@ -98,7 +106,8 @@ public:
     StepResult apply_placement_index(std::size_t index);
     RotationTrace rotation_trace(Action rotate_action) const;
 
-    EnvState snapshot() const;
+    EnvSnapshot snapshot() const;
+    void restore(const EnvSnapshot& snapshot);
     void restore(const EnvState& state);
 
     const EnvState& state() const { return state_; }
@@ -112,7 +121,7 @@ private:
     void spawn_next_piece(bool reset_hold_availability);
     bool collides(const ActivePiece& piece) const;
     bool try_move(int dx, int dy);
-    bool try_rotate(Rotation target_rotation, bool* used_kick = nullptr);
+    bool try_rotate(Rotation target_rotation, bool* used_kick = nullptr, int* kick_index = nullptr);
     std::pair<std::optional<ActivePiece>, std::vector<KickTest>> kicked_rotation_with_tests(
         const ActivePiece& from, Rotation target_rotation, int phase, int start_test_index) const;
     std::optional<ActivePiece> kicked_rotation(const ActivePiece& from, Rotation target_rotation) const;

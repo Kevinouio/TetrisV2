@@ -15,6 +15,8 @@ public:
 
     void reseed(std::uint32_t seed);
     Piece next_piece();
+    const std::vector<Piece>& bag_order() const { return bag_; }
+    std::size_t bag_index() const { return index_; }
 
 private:
     void refill_bag();

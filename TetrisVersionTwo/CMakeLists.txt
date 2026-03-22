@@ -5,10 +5,18 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Python3 COMPONENTS Interpreter)
+include(CTest)
 
 add_library(
     tetris_v2
     src/board.cpp
+    src/cc2_data.cpp
+    src/cc2_dag.cpp
+    src/cc2_eval.cpp
+    src/cc2_movegen.cpp
+    src/cc2_sync.cpp
+    src/cc_env.cpp
+    src/cold_clear_bot.cpp
     src/piece_defs.cpp
     src/randomizer.cpp
     src/env.cpp
@@ -30,8 +38,8 @@ target_include_directories(tetris_v2_c_api_static PUBLIC ${CMAKE_CURRENT_SOURCE_
 target_link_libraries(tetris_v2_c_api_static PUBLIC tetris_v2)
 target_compile_features(tetris_v2_c_api_static PUBLIC cxx_std_17)
 
-add_executable(tetris_cli apps/cli_play.cpp)
-target_link_libraries(tetris_cli PRIVATE tetris_v2)
+add_executable(tetris_bot_cli apps/cli_bot_play.cpp)
+target_link_libraries(tetris_bot_cli PRIVATE tetris_v2)
 
 add_executable(tetris_smoke tests/smoke_env.cpp)
 target_link_libraries(tetris_smoke PRIVATE tetris_v2)
@@ -66,3 +74,11 @@ target_link_libraries(tetris_twist_dataset_tests PRIVATE tetris_v2)
 
 add_executable(tetris_c_api_tests tests/c_api_tests.cpp)
 target_link_libraries(tetris_c_api_tests PRIVATE tetris_v2 tetris_v2_c_api_static)
+
+if(BUILD_TESTING)
+    add_test(NAME tetris_smoke COMMAND tetris_smoke)
+    add_test(NAME tetris_kick_search_tests COMMAND tetris_kick_search_tests)
+    add_test(NAME tetris_b2b_spin_tests COMMAND tetris_b2b_spin_tests)
+    add_test(NAME tetris_twist_dataset_tests COMMAND tetris_twist_dataset_tests)
+    add_test(NAME tetris_c_api_tests COMMAND tetris_c_api_tests)
+endif()

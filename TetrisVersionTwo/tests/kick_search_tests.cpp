@@ -82,7 +82,8 @@ bool kicked_rotation_found_for_piece(Piece piece, Action action) {
     config.allow_rotate_180 = true;
 
     ModernTetrisEnv env(config);
-    EnvState state = env.snapshot();
+    EnvSnapshot base_snapshot = env.snapshot();
+    EnvState state = base_snapshot.state;
     state.game_over = false;
     state.top_out = false;
     state.hold.reset();
@@ -93,6 +94,9 @@ bool kicked_rotation_found_for_piece(Piece piece, Action action) {
     state.lock_timer = 0;
     state.lock_resets_used = 0;
     state.gravity_accumulator = 0.0f;
+    state.spin_eligible = false;
+    state.last_rotate_used_kick = false;
+    state.last_rotate_kick_index = -1;
 
     const auto rotations = std::array<Rotation, 4>{
         Rotation::North, Rotation::East, Rotation::South, Rotation::West};
@@ -106,9 +110,10 @@ bool kicked_rotation_found_for_piece(Piece piece, Action action) {
             return false;  // not a kick-required state
         }
 
-        EnvState s = state;
-        s.board = board;
-        s.active = active;
+        EnvSnapshot s = base_snapshot;
+        s.state = state;
+        s.state.board = board;
+        s.state.active = active;
         env.restore(s);
 
         auto result = env.step(action);

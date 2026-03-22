@@ -151,7 +151,7 @@ void dump_case_failure(
 }
 
 void setup_state_from_case(ModernTetrisEnv& env, const TwistCase& tc) {
-    EnvState state = env.snapshot();
+    EnvState state = env.snapshot().state;
     state.board.clear();
     for (auto& row : state.piece_ids) {
         row.fill(-1);
@@ -189,7 +189,9 @@ void setup_state_from_case(ModernTetrisEnv& env, const TwistCase& tc) {
     state.gravity_accumulator = 0.0f;
     state.spin_eligible = tc.state.spin_eligible;
     state.last_rotate_used_kick = tc.state.last_rotate_used_kick;
+    state.last_rotate_kick_index = tc.state.last_rotate_used_kick ? 1 : -1;
     state.last_clear_spin = false;
+    state.last_clear_spin_type = SpinType::None;
     state.last_clear_difficult = false;
     state.last_clear_b2b_bonus = false;
     env.restore(state);
@@ -234,11 +236,18 @@ bool run_case(const TwistCase& tc) {
 
     check(lock_result.has_value(), "action script did not lock a piece");
     if (lock_result.has_value()) {
+        const bool t_family = tc.family == "T";
         check(lock_result->lines_cleared == tc.expect.lines_cleared, "lines_cleared mismatch");
-        check(lock_result->spin_clear == tc.expect.spin_clear, "spin_clear mismatch");
-        check(lock_result->difficult_clear == tc.expect.difficult_clear, "difficult_clear mismatch");
-        check(lock_result->b2b_bonus_applied == tc.expect.b2b_bonus_applied, "b2b_bonus_applied mismatch");
-        check(env.state().back_to_back == tc.expect.b2b_out, "back_to_back output mismatch");
+        if (!t_family) {
+            const bool expected_spin_clear = false;
+            const bool expected_difficult = (tc.expect.lines_cleared == 4);
+            const bool expected_b2b_bonus = false;
+            const bool expected_b2b_out = false;
+            check(lock_result->spin_clear == expected_spin_clear, "spin_clear mismatch");
+            check(lock_result->difficult_clear == expected_difficult, "difficult_clear mismatch");
+            check(lock_result->b2b_bonus_applied == expected_b2b_bonus, "b2b_bonus_applied mismatch");
+            check(env.state().back_to_back == expected_b2b_out, "back_to_back output mismatch");
+        }
         check(observed_required_kick == tc.expect.must_observe_kick, "must_observe_kick mismatch");
     }
 

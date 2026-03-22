@@ -36,6 +36,12 @@ enum class Action : std::uint8_t {
     Hold = 8,
 };
 
+enum class SpinType : std::uint8_t {
+    None = 0,
+    Mini = 1,
+    Full = 2,
+};
+
 struct Cell {
     int x{0};
     int y{0};
@@ -60,6 +66,7 @@ struct StepResult {
     bool action_succeeded{false};
     int lines_cleared{0};
     bool spin_clear{false};
+    SpinType spin_type{SpinType::None};
     bool difficult_clear{false};
     bool b2b_bonus_applied{false};
     int combo{-1};

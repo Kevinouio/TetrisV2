@@ -57,6 +57,20 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=60, help="Render FPS.")
     parser.add_argument("--seed", type=int, default=1234, help="Initial reset seed.")
     parser.add_argument("--queue-visible", type=int, default=8, help="How many queued pieces to display.")
+    parser.add_argument("--ai", action="store_true", help="Start with AI autoplay enabled.")
+    parser.add_argument("--think-ms", type=int, default=20, help="AI think budget per move in milliseconds.")
+    parser.add_argument(
+        "--auto-reset",
+        action="store_true",
+        default=True,
+        help="Auto reset to next seed on topout in AI mode (default: on).",
+    )
+    parser.add_argument(
+        "--no-auto-reset",
+        action="store_false",
+        dest="auto_reset",
+        help="Disable AI auto reset on topout.",
+    )
     return parser.parse_args()
 
 
@@ -89,9 +103,15 @@ class EnvCtypes:
     def __init__(self, lib_path: Path, seed: int):
         self.lib = ctypes.CDLL(str(lib_path))
         self._bind()
-        self.handle = self.lib.tetris_env_create(ctypes.c_uint32(seed))
+        self.handle = self.lib.tetris_cc_env_create(ctypes.c_uint32(seed))
         if not self.handle:
             raise RuntimeError("Failed to create env handle")
+        self.bot_handle = None
+        if self._has_bot_api:
+            self.bot_handle = self.lib.tetris_cc_bot_create_default()
+            if not self.bot_handle:
+                raise RuntimeError("Failed to create bot handle")
+            self.bot_sync()
         self.seed = int(seed)
 
     def _bind(self):
@@ -100,97 +120,115 @@ class EnvCtypes:
         self._has_piece_id_api = all(
             hasattr(self.lib, name)
             for name in (
-                "tetris_env_board_piece_ids_write",
-                "tetris_env_placement_board_piece_ids_write",
+                "tetris_cc_env_board_piece_ids_write",
+                "tetris_cc_env_placement_board_piece_ids_write",
+            )
+        )
+        self._has_bot_api = all(
+            hasattr(self.lib, name)
+            for name in (
+                "tetris_cc_bot_create_default",
+                "tetris_cc_bot_destroy",
+                "tetris_cc_bot_sync_from_env",
+                "tetris_cc_bot_choose",
+                "tetris_cc_bot_apply_choice",
+                "tetris_cc_bot_choose_and_apply",
+            )
+        )
+        self._has_bot_api_ex = self._has_bot_api and all(
+            hasattr(self.lib, name)
+            for name in (
+                "tetris_cc_bot_choose_ex",
+                "tetris_cc_bot_choose_and_apply_ex",
             )
         )
 
-        self.lib.tetris_env_create.argtypes = [ctypes.c_uint32]
-        self.lib.tetris_env_create.restype = void_p
+        self.lib.tetris_cc_env_create.argtypes = [ctypes.c_uint32]
+        self.lib.tetris_cc_env_create.restype = void_p
 
-        self.lib.tetris_env_destroy.argtypes = [void_p]
-        self.lib.tetris_env_destroy.restype = None
+        self.lib.tetris_cc_env_destroy.argtypes = [void_p]
+        self.lib.tetris_cc_env_destroy.restype = None
 
-        self.lib.tetris_env_reset.argtypes = [void_p, ctypes.c_uint32]
-        self.lib.tetris_env_reset.restype = None
+        self.lib.tetris_cc_env_reset.argtypes = [void_p, ctypes.c_uint32]
+        self.lib.tetris_cc_env_reset.restype = None
 
-        self.lib.tetris_env_step.argtypes = [void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
-        self.lib.tetris_env_step.restype = ctypes.c_int
+        self.lib.tetris_cc_env_step.argtypes = [void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
+        self.lib.tetris_cc_env_step.restype = ctypes.c_int
 
-        self.lib.tetris_env_hold.argtypes = [void_p, ctypes.POINTER(ctypes.c_float)]
-        self.lib.tetris_env_hold.restype = ctypes.c_int
+        self.lib.tetris_cc_env_hold.argtypes = [void_p, ctypes.POINTER(ctypes.c_float)]
+        self.lib.tetris_cc_env_hold.restype = ctypes.c_int
 
-        self.lib.tetris_env_observation_size.argtypes = [void_p, ctypes.c_int]
-        self.lib.tetris_env_observation_size.restype = ctypes.c_size_t
+        self.lib.tetris_cc_env_observation_size.argtypes = [void_p, ctypes.c_int]
+        self.lib.tetris_cc_env_observation_size.restype = ctypes.c_size_t
 
-        self.lib.tetris_env_board_write.argtypes = [
+        self.lib.tetris_cc_env_board_write.argtypes = [
             void_p,
             ctypes.c_int,
             ctypes.POINTER(ctypes.c_uint8),
             ctypes.c_size_t,
         ]
-        self.lib.tetris_env_board_write.restype = ctypes.c_size_t
+        self.lib.tetris_cc_env_board_write.restype = ctypes.c_size_t
 
         if self._has_piece_id_api:
-            self.lib.tetris_env_board_piece_ids_write.argtypes = [
+            self.lib.tetris_cc_env_board_piece_ids_write.argtypes = [
                 void_p,
                 ctypes.c_int,
                 ctypes.POINTER(ctypes.c_uint8),
                 ctypes.c_size_t,
             ]
-            self.lib.tetris_env_board_piece_ids_write.restype = ctypes.c_size_t
+            self.lib.tetris_cc_env_board_piece_ids_write.restype = ctypes.c_size_t
 
-        self.lib.tetris_env_active_piece.argtypes = [void_p, c_int_p, c_int_p, c_int_p, c_int_p]
-        self.lib.tetris_env_active_piece.restype = ctypes.c_int
+        self.lib.tetris_cc_env_active_piece.argtypes = [void_p, c_int_p, c_int_p, c_int_p, c_int_p]
+        self.lib.tetris_cc_env_active_piece.restype = ctypes.c_int
 
-        self.lib.tetris_env_hold_piece.argtypes = [void_p, c_int_p, c_int_p, c_int_p]
-        self.lib.tetris_env_hold_piece.restype = ctypes.c_int
+        self.lib.tetris_cc_env_hold_piece.argtypes = [void_p, c_int_p, c_int_p, c_int_p]
+        self.lib.tetris_cc_env_hold_piece.restype = ctypes.c_int
 
-        self.lib.tetris_env_queue_count.argtypes = [void_p]
-        self.lib.tetris_env_queue_count.restype = ctypes.c_size_t
+        self.lib.tetris_cc_env_queue_count.argtypes = [void_p]
+        self.lib.tetris_cc_env_queue_count.restype = ctypes.c_size_t
 
-        self.lib.tetris_env_queue_get.argtypes = [void_p, ctypes.c_size_t, c_int_p]
-        self.lib.tetris_env_queue_get.restype = ctypes.c_int
+        self.lib.tetris_cc_env_queue_get.argtypes = [void_p, ctypes.c_size_t, c_int_p]
+        self.lib.tetris_cc_env_queue_get.restype = ctypes.c_int
 
-        self.lib.tetris_env_meta.argtypes = [void_p, c_int_p, c_int_p, c_int_p, c_int_p, c_int_p, c_int_p, c_int_p]
-        self.lib.tetris_env_meta.restype = ctypes.c_int
+        self.lib.tetris_cc_env_meta.argtypes = [void_p, c_int_p, c_int_p, c_int_p, c_int_p, c_int_p, c_int_p, c_int_p]
+        self.lib.tetris_cc_env_meta.restype = ctypes.c_int
 
-        self.lib.tetris_env_placement_count.argtypes = [void_p]
-        self.lib.tetris_env_placement_count.restype = ctypes.c_size_t
+        self.lib.tetris_cc_env_placement_count.argtypes = [void_p]
+        self.lib.tetris_cc_env_placement_count.restype = ctypes.c_size_t
 
-        self.lib.tetris_env_placement_get.argtypes = [void_p, ctypes.c_size_t, c_int_p, c_int_p, c_int_p, c_int_p]
-        self.lib.tetris_env_placement_get.restype = ctypes.c_int
+        self.lib.tetris_cc_env_placement_get.argtypes = [void_p, ctypes.c_size_t, c_int_p, c_int_p, c_int_p, c_int_p]
+        self.lib.tetris_cc_env_placement_get.restype = ctypes.c_int
 
-        self.lib.tetris_env_placement_board_write.argtypes = [
+        self.lib.tetris_cc_env_placement_board_write.argtypes = [
             void_p,
             ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_uint8),
             ctypes.c_size_t,
         ]
-        self.lib.tetris_env_placement_board_write.restype = ctypes.c_size_t
+        self.lib.tetris_cc_env_placement_board_write.restype = ctypes.c_size_t
 
         if self._has_piece_id_api:
-            self.lib.tetris_env_placement_board_piece_ids_write.argtypes = [
+            self.lib.tetris_cc_env_placement_board_piece_ids_write.argtypes = [
                 void_p,
                 ctypes.c_size_t,
                 ctypes.POINTER(ctypes.c_uint8),
                 ctypes.c_size_t,
             ]
-            self.lib.tetris_env_placement_board_piece_ids_write.restype = ctypes.c_size_t
+            self.lib.tetris_cc_env_placement_board_piece_ids_write.restype = ctypes.c_size_t
 
-        self.lib.tetris_env_apply_placement_index.argtypes = [
+        self.lib.tetris_cc_env_apply_placement_index.argtypes = [
             void_p,
             ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_float),
             c_int_p,
             c_int_p,
         ]
-        self.lib.tetris_env_apply_placement_index.restype = ctypes.c_int
+        self.lib.tetris_cc_env_apply_placement_index.restype = ctypes.c_int
 
-        self.lib.tetris_env_rotation_trace_count.argtypes = [void_p, ctypes.c_int]
-        self.lib.tetris_env_rotation_trace_count.restype = ctypes.c_size_t
+        self.lib.tetris_cc_env_rotation_trace_count.argtypes = [void_p, ctypes.c_int]
+        self.lib.tetris_cc_env_rotation_trace_count.restype = ctypes.c_size_t
 
-        self.lib.tetris_env_rotation_trace_get.argtypes = [
+        self.lib.tetris_cc_env_rotation_trace_get.argtypes = [
             void_p,
             ctypes.c_int,
             ctypes.c_size_t,
@@ -205,31 +243,196 @@ class EnvCtypes:
             c_int_p,
             c_int_p,
         ]
-        self.lib.tetris_env_rotation_trace_get.restype = ctypes.c_int
+        self.lib.tetris_cc_env_rotation_trace_get.restype = ctypes.c_int
 
-        self.lib.tetris_env_rotation_trace_meta.argtypes = [void_p, ctypes.c_int, c_int_p, c_int_p, c_int_p, c_int_p]
-        self.lib.tetris_env_rotation_trace_meta.restype = ctypes.c_int
+        self.lib.tetris_cc_env_rotation_trace_meta.argtypes = [void_p, ctypes.c_int, c_int_p, c_int_p, c_int_p, c_int_p]
+        self.lib.tetris_cc_env_rotation_trace_meta.restype = ctypes.c_int
+
+        if self._has_bot_api:
+            size_p = ctypes.POINTER(ctypes.c_size_t)
+            u64_p = ctypes.POINTER(ctypes.c_uint64)
+            d_p = ctypes.POINTER(ctypes.c_double)
+
+            self.lib.tetris_cc_bot_create_default.argtypes = []
+            self.lib.tetris_cc_bot_create_default.restype = void_p
+            self.lib.tetris_cc_bot_destroy.argtypes = [void_p]
+            self.lib.tetris_cc_bot_destroy.restype = None
+            self.lib.tetris_cc_bot_sync_from_env.argtypes = [void_p, void_p]
+            self.lib.tetris_cc_bot_sync_from_env.restype = ctypes.c_int
+            self.lib.tetris_cc_bot_choose.argtypes = [
+                void_p,
+                ctypes.c_int,
+                c_int_p,
+                size_p,
+                ctypes.POINTER(ctypes.c_float),
+                u64_p,
+                d_p,
+                d_p,
+                c_int_p,
+            ]
+            self.lib.tetris_cc_bot_choose.restype = ctypes.c_int
+            self.lib.tetris_cc_bot_apply_choice.argtypes = [
+                void_p,
+                void_p,
+                ctypes.POINTER(ctypes.c_float),
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                size_p,
+            ]
+            self.lib.tetris_cc_bot_apply_choice.restype = ctypes.c_int
+            self.lib.tetris_cc_bot_choose_and_apply.argtypes = [
+                void_p,
+                void_p,
+                ctypes.c_int,
+                ctypes.POINTER(ctypes.c_float),
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                size_p,
+                ctypes.POINTER(ctypes.c_float),
+                u64_p,
+                d_p,
+                d_p,
+                c_int_p,
+            ]
+            self.lib.tetris_cc_bot_choose_and_apply.restype = ctypes.c_int
+            if self._has_bot_api_ex:
+                self.lib.tetris_cc_bot_choose_ex.argtypes = [
+                    void_p,
+                    ctypes.c_int,
+                    c_int_p,
+                    size_p,
+                    ctypes.POINTER(ctypes.c_float),
+                    u64_p,
+                    d_p,
+                    d_p,
+                    c_int_p,
+                ]
+                self.lib.tetris_cc_bot_choose_ex.restype = ctypes.c_int
+                self.lib.tetris_cc_bot_choose_and_apply_ex.argtypes = [
+                    void_p,
+                    void_p,
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_float),
+                    c_int_p,
+                    c_int_p,
+                    c_int_p,
+                    size_p,
+                    ctypes.POINTER(ctypes.c_float),
+                    u64_p,
+                    d_p,
+                    d_p,
+                    c_int_p,
+                ]
+                self.lib.tetris_cc_bot_choose_and_apply_ex.restype = ctypes.c_int
 
     def close(self):
+        if self.bot_handle and self._has_bot_api:
+            self.lib.tetris_cc_bot_destroy(self.bot_handle)
+            self.bot_handle = None
         if self.handle:
-            self.lib.tetris_env_destroy(self.handle)
+            self.lib.tetris_cc_env_destroy(self.handle)
             self.handle = None
 
     def reset(self, seed: int):
         self.seed = int(seed)
-        self.lib.tetris_env_reset(self.handle, ctypes.c_uint32(seed))
+        self.lib.tetris_cc_env_reset(self.handle, ctypes.c_uint32(seed))
+        self.bot_sync()
 
     def hold(self):
         reward = ctypes.c_float(0.0)
-        success = self.lib.tetris_env_hold(self.handle, ctypes.byref(reward))
+        success = self.lib.tetris_cc_env_hold(self.handle, ctypes.byref(reward))
+        if success:
+            self.bot_sync()
         return {"success": bool(success), "reward": float(reward.value)}
 
+    def has_bot(self):
+        return bool(self._has_bot_api and self.bot_handle)
+
+    def bot_sync(self):
+        if not self.has_bot():
+            return False
+        ok = self.lib.tetris_cc_bot_sync_from_env(self.bot_handle, self.handle)
+        return bool(ok)
+
+    def bot_choose_and_apply(self, think_ms: int = 20):
+        if not self.has_bot():
+            return {
+                "success": False,
+                "reward": 0.0,
+                "lines": 0,
+                "game_over": False,
+                "used_hold": False,
+                "placement_index": -1,
+                "score": 0.0,
+                "nodes": 0,
+                "think_ms": 0.0,
+                "nps": 0.0,
+                "budget_miss": 0,
+            }
+        reward = ctypes.c_float(0.0)
+        lines = ctypes.c_int(0)
+        game_over = ctypes.c_int(0)
+        used_hold = ctypes.c_int(0)
+        placement_index = ctypes.c_size_t(0)
+        score = ctypes.c_float(0.0)
+        nodes = ctypes.c_uint64(0)
+        think = ctypes.c_double(0.0)
+        nps = ctypes.c_double(0.0)
+        budget_miss = ctypes.c_int(0)
+        if self._has_bot_api_ex:
+            ok = self.lib.tetris_cc_bot_choose_and_apply_ex(
+                self.bot_handle,
+                self.handle,
+                int(max(1, think_ms)),
+                ctypes.byref(reward),
+                ctypes.byref(lines),
+                ctypes.byref(game_over),
+                ctypes.byref(used_hold),
+                ctypes.byref(placement_index),
+                ctypes.byref(score),
+                ctypes.byref(nodes),
+                ctypes.byref(think),
+                ctypes.byref(nps),
+                ctypes.byref(budget_miss),
+            )
+        else:
+            ok = self.lib.tetris_cc_bot_choose_and_apply(
+                self.bot_handle,
+                self.handle,
+                int(max(1, think_ms)),
+                ctypes.byref(reward),
+                ctypes.byref(lines),
+                ctypes.byref(game_over),
+                ctypes.byref(used_hold),
+                ctypes.byref(placement_index),
+                ctypes.byref(score),
+                ctypes.byref(nodes),
+                ctypes.byref(think),
+                ctypes.byref(nps),
+                ctypes.byref(budget_miss),
+            )
+        return {
+            "success": bool(ok),
+            "reward": float(reward.value),
+            "lines": int(lines.value),
+            "game_over": bool(game_over.value),
+            "used_hold": bool(used_hold.value),
+            "placement_index": int(placement_index.value),
+            "score": float(score.value),
+            "nodes": int(nodes.value),
+            "think_ms": float(think.value),
+            "nps": float(nps.value),
+            "budget_miss": int(budget_miss.value),
+        }
+
     def observation_size(self):
-        return int(self.lib.tetris_env_observation_size(self.handle, 1))
+        return int(self.lib.tetris_cc_env_observation_size(self.handle, 1))
 
     def board(self):
         buf = (ctypes.c_uint8 * (BOARD_ROWS * BOARD_COLS))()
-        written = self.lib.tetris_env_board_write(self.handle, 0, buf, len(buf))
+        written = self.lib.tetris_cc_env_board_write(self.handle, 0, buf, len(buf))
         if written != len(buf):
             return [[0 for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
         flat = [int(v) for v in buf]
@@ -238,7 +441,7 @@ class EnvCtypes:
     def board_piece_ids(self, include_active: bool = True):
         if self._has_piece_id_api:
             buf = (ctypes.c_uint8 * (BOARD_ROWS * BOARD_COLS))()
-            written = self.lib.tetris_env_board_piece_ids_write(
+            written = self.lib.tetris_cc_env_board_piece_ids_write(
                 self.handle,
                 1 if include_active else 0,
                 buf,
@@ -259,7 +462,7 @@ class EnvCtypes:
         rotation = ctypes.c_int(-1)
         x = ctypes.c_int(0)
         y = ctypes.c_int(0)
-        ok = self.lib.tetris_env_active_piece(
+        ok = self.lib.tetris_cc_env_active_piece(
             self.handle,
             ctypes.byref(piece),
             ctypes.byref(rotation),
@@ -274,7 +477,7 @@ class EnvCtypes:
         has_hold = ctypes.c_int(0)
         hold_piece = ctypes.c_int(7)
         hold_available = ctypes.c_int(0)
-        ok = self.lib.tetris_env_hold_piece(
+        ok = self.lib.tetris_cc_env_hold_piece(
             self.handle,
             ctypes.byref(has_hold),
             ctypes.byref(hold_piece),
@@ -289,17 +492,17 @@ class EnvCtypes:
         }
 
     def queue(self):
-        count = int(self.lib.tetris_env_queue_count(self.handle))
+        count = int(self.lib.tetris_cc_env_queue_count(self.handle))
         out = []
         for i in range(count):
             piece = ctypes.c_int(-1)
-            if self.lib.tetris_env_queue_get(self.handle, i, ctypes.byref(piece)):
+            if self.lib.tetris_cc_env_queue_get(self.handle, i, ctypes.byref(piece)):
                 out.append(int(piece.value))
         return out
 
     def meta(self):
         vals = [ctypes.c_int(0) for _ in range(7)]
-        ok = self.lib.tetris_env_meta(
+        ok = self.lib.tetris_cc_env_meta(
             self.handle,
             ctypes.byref(vals[0]),
             ctypes.byref(vals[1]),
@@ -330,14 +533,14 @@ class EnvCtypes:
         }
 
     def placements(self):
-        count = int(self.lib.tetris_env_placement_count(self.handle))
+        count = int(self.lib.tetris_cc_env_placement_count(self.handle))
         out = []
         for i in range(count):
             x = ctypes.c_int(0)
             y = ctypes.c_int(0)
             rot = ctypes.c_int(0)
             lines = ctypes.c_int(0)
-            if self.lib.tetris_env_placement_get(
+            if self.lib.tetris_cc_env_placement_get(
                 self.handle, i, ctypes.byref(x), ctypes.byref(y), ctypes.byref(rot), ctypes.byref(lines)
             ):
                 out.append({"index": i, "x": int(x.value), "y": int(y.value), "rotation": int(rot.value), "lines": int(lines.value)})
@@ -345,7 +548,7 @@ class EnvCtypes:
 
     def placement_board(self, index: int):
         buf = (ctypes.c_uint8 * (BOARD_ROWS * BOARD_COLS))()
-        written = self.lib.tetris_env_placement_board_write(self.handle, int(index), buf, len(buf))
+        written = self.lib.tetris_cc_env_placement_board_write(self.handle, int(index), buf, len(buf))
         if written != len(buf):
             return [[0 for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
         flat = [int(v) for v in buf]
@@ -354,7 +557,7 @@ class EnvCtypes:
     def placement_piece_ids(self, index: int):
         if self._has_piece_id_api:
             buf = (ctypes.c_uint8 * (BOARD_ROWS * BOARD_COLS))()
-            written = self.lib.tetris_env_placement_board_piece_ids_write(self.handle, int(index), buf, len(buf))
+            written = self.lib.tetris_cc_env_placement_board_piece_ids_write(self.handle, int(index), buf, len(buf))
             if written == len(buf):
                 flat = [int(v) for v in buf]
                 return [flat[r * BOARD_COLS : (r + 1) * BOARD_COLS] for r in range(BOARD_ROWS)]
@@ -369,26 +572,29 @@ class EnvCtypes:
         reward = ctypes.c_float(0.0)
         lines = ctypes.c_int(0)
         game_over = ctypes.c_int(0)
-        ok = self.lib.tetris_env_apply_placement_index(
+        ok = self.lib.tetris_cc_env_apply_placement_index(
             self.handle,
             int(index),
             ctypes.byref(reward),
             ctypes.byref(lines),
             ctypes.byref(game_over),
         )
-        return {
+        out = {
             "success": bool(ok),
             "reward": float(reward.value),
             "lines": int(lines.value),
             "game_over": bool(game_over.value),
         }
+        if out["success"]:
+            self.bot_sync()
+        return out
 
     def rotation_trace(self, action: int):
-        count = int(self.lib.tetris_env_rotation_trace_count(self.handle, int(action)))
+        count = int(self.lib.tetris_cc_env_rotation_trace_count(self.handle, int(action)))
         tests = []
         for i in range(count):
             vals = [ctypes.c_int(0) for _ in range(10)]
-            ok = self.lib.tetris_env_rotation_trace_get(
+            ok = self.lib.tetris_cc_env_rotation_trace_get(
                 self.handle,
                 int(action),
                 i,
@@ -424,7 +630,7 @@ class EnvCtypes:
         fx = ctypes.c_int(-1)
         fy = ctypes.c_int(-1)
         fr = ctypes.c_int(-1)
-        self.lib.tetris_env_rotation_trace_meta(
+        self.lib.tetris_cc_env_rotation_trace_meta(
             self.handle,
             int(action),
             ctypes.byref(success),
@@ -507,7 +713,7 @@ def main():
     right_x = board_x + board_w + 20
     right_w = 520
     screen_w = right_x + right_w + 20
-    screen_h = max(board_y + board_h + 20, 840)
+    screen_h = max(board_y + board_h + 20, 980)
 
     screen = pygame.display.set_mode((screen_w, screen_h))
     clock = pygame.time.Clock()
@@ -515,12 +721,34 @@ def main():
     env = EnvCtypes(lib_path, args.seed)
     selected_index = 0
     list_scroll = 0
-    inspector_actions = [ACTION_CW, ACTION_CCW, ACTION_180]
+    inspector_actions = [ACTION_CW, ACTION_CCW]
     inspector_idx = 0
     status = f"Loaded {lib_path.name}"
     seed = int(args.seed)
+    ai_available = env.has_bot()
+    ai_enabled = bool(args.ai and ai_available)
+    ai_metrics = {
+        "pieces": 0,
+        "lines": 0,
+        "topouts": 0,
+        "last_think_ms": 0.0,
+        "avg_think_ms": 0.0,
+        "last_nodes": 0,
+        "last_nps": 0.0,
+        "last_score": 0.0,
+        "last_budget_miss": 0,
+        "budget_misses": 0,
+        "think_sum_ms": 0.0,
+        "think_samples": 0,
+        "start_ticks": pygame.time.get_ticks(),
+    }
+    if args.ai and not ai_available:
+        status = "AI requested, but bot API symbols were not found in shared library."
+    elif ai_enabled:
+        status = f"AI enabled at startup (think={max(1, int(args.think_ms))}ms)"
 
-    list_y = board_y + 160
+    info_h = 240
+    list_y = board_y + info_h + 10
     list_h = 280
     list_header_h = 30
     list_footer_h = 30
@@ -548,6 +776,17 @@ def main():
                 elif event.type == pygame.KEYDOWN:
                     if event.key in (pygame.K_q, pygame.K_ESCAPE):
                         running = False
+                    elif event.key == pygame.K_a:
+                        if ai_available:
+                            ai_enabled = not ai_enabled
+                            if ai_enabled:
+                                ai_metrics["start_ticks"] = pygame.time.get_ticks()
+                                env.bot_sync()
+                                status = f"AI enabled (think={max(1, int(args.think_ms))}ms)"
+                            else:
+                                status = "AI disabled."
+                        else:
+                            status = "AI unavailable: bot symbols not exported by shared library."
                     elif event.key == pygame.K_UP:
                         selected_index = max(0, selected_index - 1)
                         if selected_index < list_scroll:
@@ -556,13 +795,13 @@ def main():
                         selected_index += 1
                         if selected_index >= list_scroll + max_rows:
                             list_scroll = selected_index - max_rows + 1
-                    elif event.key == pygame.K_RETURN:
+                    elif event.key == pygame.K_RETURN and not ai_enabled:
                         result = env.apply_placement(selected_index)
                         if result["success"]:
                             status = f"Applied placement {selected_index}: reward={result['reward']:.1f} lines={result['lines']}"
                         else:
                             status = "Placement apply failed."
-                    elif event.key == pygame.K_h:
+                    elif event.key == pygame.K_h and not ai_enabled:
                         result = env.hold()
                         status = "Hold used." if result["success"] else "Hold unavailable."
                     elif event.key == pygame.K_LEFTBRACKET:
@@ -585,7 +824,7 @@ def main():
                         max_start = max(0, len(placements) - max_rows)
                         list_scroll = max(0, min(max_start, list_scroll - int(event.y)))
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if apply_button_rect.collidepoint(event.pos) and placements:
+                    if apply_button_rect.collidepoint(event.pos) and placements and not ai_enabled:
                         result = env.apply_placement(selected_index)
                         if result["success"]:
                             status = f"Applied placement {selected_index}: reward={result['reward']:.1f} lines={result['lines']}"
@@ -600,7 +839,7 @@ def main():
                         row = (event.pos[1] - list_rows_rect.top) // row_h
                         clicked_index = list_scroll + int(row)
                         if 0 <= row < max_rows and 0 <= clicked_index < len(placements):
-                            if clicked_index == selected_index:
+                            if clicked_index == selected_index and not ai_enabled:
                                 result = env.apply_placement(selected_index)
                                 if result["success"]:
                                     status = (
@@ -612,6 +851,50 @@ def main():
                             else:
                                 selected_index = clicked_index
                                 status = f"Selected placement {selected_index}"
+
+            pre_meta = env.meta()
+            if ai_enabled and ai_available:
+                if pre_meta["game_over"]:
+                    ai_metrics["topouts"] += 1
+                    if args.auto_reset:
+                        seed += 1
+                        env.reset(seed)
+                        status = f"AI auto-reset to seed={seed}"
+                    else:
+                        ai_enabled = False
+                        status = "AI paused on topout. Press R/N or toggle AI with A."
+                else:
+                    ai_result = env.bot_choose_and_apply(args.think_ms)
+                    if ai_result["success"]:
+                        ai_metrics["pieces"] += 1
+                        ai_metrics["lines"] += int(ai_result["lines"])
+                        ai_metrics["last_think_ms"] = float(ai_result["think_ms"])
+                        ai_metrics["think_sum_ms"] += float(ai_result["think_ms"])
+                        ai_metrics["think_samples"] += 1
+                        ai_metrics["avg_think_ms"] = (
+                            ai_metrics["think_sum_ms"] / max(1, ai_metrics["think_samples"])
+                        )
+                        ai_metrics["last_nodes"] = int(ai_result["nodes"])
+                        ai_metrics["last_nps"] = float(ai_result["nps"])
+                        ai_metrics["last_score"] = float(ai_result["score"])
+                        ai_metrics["last_budget_miss"] = int(ai_result["budget_miss"])
+                        ai_metrics["budget_misses"] += int(ai_result["budget_miss"])
+                        status = (
+                            f"AI move idx={ai_result['placement_index']} hold={ai_result['used_hold']} "
+                            f"score={ai_result['score']:.2f} lines+={ai_result['lines']}"
+                        )
+                        if ai_result["game_over"]:
+                            ai_metrics["topouts"] += 1
+                            if args.auto_reset:
+                                seed += 1
+                                env.reset(seed)
+                                status = f"AI topout -> auto-reset seed={seed}"
+                            else:
+                                ai_enabled = False
+                                status = "AI topout. Autoplay stopped (auto-reset disabled)."
+                    else:
+                        ai_enabled = False
+                        status = "AI choose/apply failed. Autoplay disabled."
 
             board_piece_ids = env.board_piece_ids(include_active=True)
             hold = env.hold_info()
@@ -639,7 +922,9 @@ def main():
 
             # Top-right info panel
             info_y = board_y
-            pygame.draw.rect(screen, PANEL_COLOR, (right_x, info_y, right_w, 150), border_radius=8)
+            pygame.draw.rect(screen, PANEL_COLOR, (right_x, info_y, right_w, info_h), border_radius=8)
+            ai_elapsed_s = max(1e-6, (pygame.time.get_ticks() - ai_metrics["start_ticks"]) / 1000.0)
+            ai_pps = ai_metrics["pieces"] / ai_elapsed_s
             lines = [
                 f"Seed: {seed}",
                 f"Obs size: {env.observation_size()}",
@@ -648,6 +933,11 @@ def main():
                 f"GameOver={meta['game_over']} TopOut={meta['top_out']}",
                 f"Combo={meta['combo']} B2B={meta['b2b']} Lines={meta['lines']}",
                 f"LockTimer={meta['lock_timer']} Resets={meta['lock_resets']}",
+                f"AI: {'ON' if ai_enabled else 'OFF'} avail={ai_available} think={max(1, int(args.think_ms))}ms",
+                f"AI pieces={ai_metrics['pieces']} lines={ai_metrics['lines']} topouts={ai_metrics['topouts']}",
+                f"AI PPS={ai_pps:.2f} think(last/avg)={ai_metrics['last_think_ms']:.1f}/{ai_metrics['avg_think_ms']:.1f} ms",
+                f"AI nodes={ai_metrics['last_nodes']} nps={ai_metrics['last_nps']:.0f} score={ai_metrics['last_score']:.2f}",
+                f"AI budget_miss last/total={ai_metrics['last_budget_miss']}/{ai_metrics['budget_misses']}",
             ]
             for i, txt in enumerate(lines):
                 surface = small_font.render(txt, True, LOCK_TEXT)
@@ -690,9 +980,11 @@ def main():
                 )
             pygame.draw.rect(screen, (120, 136, 170), thumb_rect, border_radius=4)
 
-            button_color = (66, 96, 170) if placements else (58, 64, 76)
+            button_enabled = bool(placements and not ai_enabled)
+            button_color = (66, 96, 170) if button_enabled else (58, 64, 76)
             pygame.draw.rect(screen, button_color, apply_button_rect, border_radius=5)
-            button_text = small_font.render("Apply (Enter)", True, (255, 255, 255))
+            button_label = "Apply (Enter)" if not ai_enabled else "AI running"
+            button_text = small_font.render(button_label, True, (255, 255, 255))
             screen.blit(button_text, (apply_button_rect.x + 12, apply_button_rect.y + 2))
 
             # Preview panel
@@ -724,7 +1016,7 @@ def main():
                 )
                 screen.blit(small_font.render(txt, True, color), (right_x + 10, y))
 
-            controls = "Controls: Wheel/scrollbar browse | Click row select | Apply button/Enter lock | H | [ ] | R/N | Q"
+            controls = "Controls: A toggle AI | Wheel browse | Click row | Enter apply | H | [ ] | R/N | Q"
             screen.blit(small_font.render(controls, True, LOCK_TEXT), (board_x, screen_h - 22))
             screen.blit(small_font.render(status, True, (180, 210, 255)), (board_x, board_y + board_h + 8))
 
