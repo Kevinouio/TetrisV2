@@ -20,6 +20,7 @@ coverage*
 
 # C/C++ builds
 build/
+build-wsl/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -43,6 +44,7 @@ checkpoints/
 *.csv
 *.npz
 *.npy
+/data/
 
 # Media generated during recording
 *.mp4

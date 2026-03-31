@@ -2,8 +2,9 @@ import argparse
 import ctypes
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import pygame
 
@@ -48,6 +49,13 @@ PASS_COLOR = (110, 230, 150)
 FAIL_COLOR = (240, 120, 120)
 SELECT_COLOR = (80, 130, 240)
 BOARD_FILL = (70, 80, 100)
+ActionTuple = Tuple[int, int, int, int, int]  # (use_hold, piece, rotation, x, y)
+
+
+@dataclass(frozen=True)
+class NativeAction:
+    use_hold: bool
+    placement_index: int
 
 
 def parse_args():
@@ -59,6 +67,18 @@ def parse_args():
     parser.add_argument("--queue-visible", type=int, default=8, help="How many queued pieces to display.")
     parser.add_argument("--ai", action="store_true", help="Start with AI autoplay enabled.")
     parser.add_argument("--think-ms", type=int, default=20, help="AI think budget per move in milliseconds.")
+    parser.add_argument(
+        "--bc-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to BC checkpoint. If set, autoplay uses BC instead of Cold Clear.",
+    )
+    parser.add_argument(
+        "--bc-device",
+        type=str,
+        default=None,
+        help="Torch device for BC inference (e.g. cpu, cuda, cuda:0).",
+    )
     parser.add_argument(
         "--auto-reset",
         action="store_true",
@@ -151,6 +171,13 @@ class EnvCtypes:
 
         self.lib.tetris_cc_env_reset.argtypes = [void_p, ctypes.c_uint32]
         self.lib.tetris_cc_env_reset.restype = None
+
+        self.lib.tetris_cc_env_snapshot_create.argtypes = [void_p]
+        self.lib.tetris_cc_env_snapshot_create.restype = void_p
+        self.lib.tetris_cc_snapshot_destroy.argtypes = [void_p]
+        self.lib.tetris_cc_snapshot_destroy.restype = None
+        self.lib.tetris_cc_env_restore_snapshot.argtypes = [void_p, void_p]
+        self.lib.tetris_cc_env_restore_snapshot.restype = ctypes.c_int
 
         self.lib.tetris_cc_env_step.argtypes = [void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
         self.lib.tetris_cc_env_step.restype = ctypes.c_int
@@ -532,6 +559,132 @@ class EnvCtypes:
             "lock_resets": int(vals[6].value),
         }
 
+    def get_state(self):
+        active = self.active()
+        hold = self.hold_info()
+        meta = self.meta()
+        return {
+            "board": self.board(),
+            "current_piece": int(active["piece"]) if active is not None else -1,
+            "current_rotation": int(active["rotation"]) if active is not None else -1,
+            "current_x": int(active["x"]) if active is not None else -1,
+            "current_y": int(active["y"]) if active is not None else -1,
+            "hold_piece": int(hold["hold_piece"]) if hold["has_hold"] else 7,
+            "hold_available": bool(hold["hold_available"]),
+            "queue": self.queue(),
+            "lines": int(meta["lines"]),
+            "combo": int(meta["combo"]),
+            "b2b": bool(meta["b2b"]),
+            "game_over": bool(meta["game_over"]),
+            "top_out": bool(meta["top_out"]),
+        }
+
+    def _enumerate_current_branch_actions(self, use_hold: bool, piece_id: int):
+        count = int(self.lib.tetris_cc_env_placement_count(self.handle))
+        out: List[Tuple[NativeAction, ActionTuple]] = []
+        for idx in range(count):
+            x = ctypes.c_int(0)
+            y = ctypes.c_int(0)
+            rot = ctypes.c_int(0)
+            lines = ctypes.c_int(0)
+            ok = self.lib.tetris_cc_env_placement_get(
+                self.handle,
+                idx,
+                ctypes.byref(x),
+                ctypes.byref(y),
+                ctypes.byref(rot),
+                ctypes.byref(lines),
+            )
+            if not ok:
+                continue
+            action_tuple: ActionTuple = (
+                int(bool(use_hold)),
+                int(piece_id),
+                int(rot.value),
+                int(x.value),
+                int(y.value),
+            )
+            out.append((NativeAction(bool(use_hold), int(idx)), action_tuple))
+        return out
+
+    def enumerate_legal_actions(self):
+        meta = self.meta()
+        if bool(meta["game_over"]):
+            return []
+
+        snapshot = self.lib.tetris_cc_env_snapshot_create(self.handle)
+        if not snapshot:
+            raise RuntimeError("Failed to create env snapshot.")
+
+        out: List[Tuple[NativeAction, ActionTuple]] = []
+        try:
+            active = self.active()
+            if active is not None and 0 <= int(active["piece"]) <= 6:
+                out.extend(
+                    self._enumerate_current_branch_actions(
+                        use_hold=False,
+                        piece_id=int(active["piece"]),
+                    )
+                )
+
+            hold = self.hold_info()
+            if bool(hold["hold_available"]):
+                self.lib.tetris_cc_env_restore_snapshot(self.handle, snapshot)
+                hold_reward = ctypes.c_float(0.0)
+                hold_ok = self.lib.tetris_cc_env_hold(self.handle, ctypes.byref(hold_reward))
+                if hold_ok:
+                    hold_active = self.active()
+                    if hold_active is not None and 0 <= int(hold_active["piece"]) <= 6:
+                        out.extend(
+                            self._enumerate_current_branch_actions(
+                                use_hold=True,
+                                piece_id=int(hold_active["piece"]),
+                            )
+                        )
+                self.lib.tetris_cc_env_restore_snapshot(self.handle, snapshot)
+        finally:
+            self.lib.tetris_cc_snapshot_destroy(snapshot)
+            self.bot_sync()
+        return out
+
+    def step_native_action(self, action: NativeAction):
+        used_hold = False
+        total_reward = 0.0
+        if bool(action.use_hold):
+            hold_reward = ctypes.c_float(0.0)
+            hold_ok = self.lib.tetris_cc_env_hold(self.handle, ctypes.byref(hold_reward))
+            if not hold_ok:
+                return {
+                    "success": False,
+                    "reward": 0.0,
+                    "lines": 0,
+                    "game_over": bool(self.meta()["game_over"]),
+                    "used_hold": True,
+                }
+            used_hold = True
+            total_reward += float(hold_reward.value)
+
+        reward = ctypes.c_float(0.0)
+        lines = ctypes.c_int(0)
+        game_over = ctypes.c_int(0)
+        ok = self.lib.tetris_cc_env_apply_placement_index(
+            self.handle,
+            int(action.placement_index),
+            ctypes.byref(reward),
+            ctypes.byref(lines),
+            ctypes.byref(game_over),
+        )
+        total_reward += float(reward.value)
+        if ok:
+            self.bot_sync()
+        return {
+            "success": bool(ok),
+            "reward": float(total_reward),
+            "lines": int(lines.value),
+            "game_over": bool(game_over.value),
+            "used_hold": used_hold,
+        }
+
     def placements(self):
         count = int(self.lib.tetris_cc_env_placement_count(self.handle))
         out = []
@@ -725,27 +878,54 @@ def main():
     inspector_idx = 0
     status = f"Loaded {lib_path.name}"
     seed = int(args.seed)
-    ai_available = env.has_bot()
+    ai_backend = "cold_clear"
+    ai_backend_label = "ColdClear"
+    bc_agent = None
+
+    if args.bc_checkpoint is not None:
+        ai_backend = "bc"
+        ai_backend_label = "BC"
+        try:
+            from bc.inference_agent import BCAgent  # Lazy import for optional torch dependency
+
+            bc_agent = BCAgent(args.bc_checkpoint, device=args.bc_device)
+            status = (
+                f"Loaded BC checkpoint {args.bc_checkpoint} "
+                f"(device={args.bc_device or 'auto'})"
+            )
+        except Exception as exc:
+            bc_agent = None
+            status = f"BC init failed: {exc}"
+
+    ai_available = bc_agent is not None if ai_backend == "bc" else env.has_bot()
     ai_enabled = bool(args.ai and ai_available)
     ai_metrics = {
         "pieces": 0,
         "lines": 0,
         "topouts": 0,
-        "last_think_ms": 0.0,
-        "avg_think_ms": 0.0,
+        "last_step_ms": 0.0,
+        "avg_step_ms": 0.0,
+        "step_sum_ms": 0.0,
+        "step_samples": 0,
+        "invalid_unmasked_predictions": 0,
+        "unseen_legal_fallbacks": 0,
         "last_nodes": 0,
         "last_nps": 0.0,
         "last_score": 0.0,
         "last_budget_miss": 0,
         "budget_misses": 0,
-        "think_sum_ms": 0.0,
-        "think_samples": 0,
         "start_ticks": pygame.time.get_ticks(),
     }
     if args.ai and not ai_available:
-        status = "AI requested, but bot API symbols were not found in shared library."
+        if ai_backend == "bc":
+            status = "AI[BC] requested, but BC checkpoint failed to initialize."
+        else:
+            status = "AI requested, but bot API symbols were not found in shared library."
     elif ai_enabled:
-        status = f"AI enabled at startup (think={max(1, int(args.think_ms))}ms)"
+        if ai_backend == "bc":
+            status = f"AI[BC] enabled at startup (device={args.bc_device or 'auto'})"
+        else:
+            status = f"AI[ColdClear] enabled at startup (think={max(1, int(args.think_ms))}ms)"
 
     info_h = 240
     list_y = board_y + info_h + 10
@@ -781,12 +961,20 @@ def main():
                             ai_enabled = not ai_enabled
                             if ai_enabled:
                                 ai_metrics["start_ticks"] = pygame.time.get_ticks()
-                                env.bot_sync()
-                                status = f"AI enabled (think={max(1, int(args.think_ms))}ms)"
+                                if ai_backend == "cold_clear":
+                                    env.bot_sync()
+                                    status = (
+                                        f"AI[ColdClear] enabled (think={max(1, int(args.think_ms))}ms)"
+                                    )
+                                else:
+                                    status = f"AI[BC] enabled (device={args.bc_device or 'auto'})"
                             else:
                                 status = "AI disabled."
                         else:
-                            status = "AI unavailable: bot symbols not exported by shared library."
+                            if ai_backend == "bc":
+                                status = "AI unavailable: BC checkpoint is not available."
+                            else:
+                                status = "AI unavailable: bot symbols not exported by shared library."
                     elif event.key == pygame.K_UP:
                         selected_index = max(0, selected_index - 1)
                         if selected_index < list_scroll:
@@ -859,42 +1047,100 @@ def main():
                     if args.auto_reset:
                         seed += 1
                         env.reset(seed)
-                        status = f"AI auto-reset to seed={seed}"
+                        status = f"AI[{ai_backend_label}] auto-reset to seed={seed}"
                     else:
                         ai_enabled = False
                         status = "AI paused on topout. Press R/N or toggle AI with A."
                 else:
-                    ai_result = env.bot_choose_and_apply(args.think_ms)
-                    if ai_result["success"]:
-                        ai_metrics["pieces"] += 1
-                        ai_metrics["lines"] += int(ai_result["lines"])
-                        ai_metrics["last_think_ms"] = float(ai_result["think_ms"])
-                        ai_metrics["think_sum_ms"] += float(ai_result["think_ms"])
-                        ai_metrics["think_samples"] += 1
-                        ai_metrics["avg_think_ms"] = (
-                            ai_metrics["think_sum_ms"] / max(1, ai_metrics["think_samples"])
-                        )
-                        ai_metrics["last_nodes"] = int(ai_result["nodes"])
-                        ai_metrics["last_nps"] = float(ai_result["nps"])
-                        ai_metrics["last_score"] = float(ai_result["score"])
-                        ai_metrics["last_budget_miss"] = int(ai_result["budget_miss"])
-                        ai_metrics["budget_misses"] += int(ai_result["budget_miss"])
-                        status = (
-                            f"AI move idx={ai_result['placement_index']} hold={ai_result['used_hold']} "
-                            f"score={ai_result['score']:.2f} lines+={ai_result['lines']}"
-                        )
-                        if ai_result["game_over"]:
-                            ai_metrics["topouts"] += 1
-                            if args.auto_reset:
-                                seed += 1
-                                env.reset(seed)
-                                status = f"AI topout -> auto-reset seed={seed}"
-                            else:
+                    if ai_backend == "bc":
+                        if bc_agent is None:
+                            ai_enabled = False
+                            status = "AI[BC] unavailable: checkpoint did not initialize."
+                        else:
+                            legal_actions = env.enumerate_legal_actions()
+                            if not legal_actions:
                                 ai_enabled = False
-                                status = "AI topout. Autoplay stopped (auto-reset disabled)."
+                                status = "AI[BC] no legal actions; autoplay disabled."
+                            else:
+                                step_start_ms = pygame.time.get_ticks()
+                                try:
+                                    state = env.get_state()
+                                    chosen_action, diag = bc_agent.predict_action_with_diagnostics(
+                                        state,
+                                        legal_actions=legal_actions,
+                                    )
+                                    ai_result = env.step_native_action(chosen_action)
+                                except Exception as exc:
+                                    ai_enabled = False
+                                    status = f"AI[BC] inference failed: {exc}"
+                                    ai_result = None
+
+                                if ai_result is not None and ai_result["success"]:
+                                    step_elapsed_ms = float(pygame.time.get_ticks() - step_start_ms)
+                                    ai_metrics["pieces"] += 1
+                                    ai_metrics["lines"] += int(ai_result["lines"])
+                                    ai_metrics["last_step_ms"] = step_elapsed_ms
+                                    ai_metrics["step_sum_ms"] += step_elapsed_ms
+                                    ai_metrics["step_samples"] += 1
+                                    ai_metrics["avg_step_ms"] = (
+                                        ai_metrics["step_sum_ms"] / max(1, ai_metrics["step_samples"])
+                                    )
+                                    ai_metrics["invalid_unmasked_predictions"] += int(
+                                        bool(diag["raw_argmax_invalid"])
+                                    )
+                                    ai_metrics["unseen_legal_fallbacks"] += int(
+                                        bool(diag["used_fallback_unseen_legal"])
+                                    )
+                                    status = (
+                                        f"AI[BC] move hold={int(chosen_action.use_hold)} "
+                                        f"idx={int(chosen_action.placement_index)} "
+                                        f"lines+={int(ai_result['lines'])}"
+                                    )
+                                    if ai_result["game_over"]:
+                                        ai_metrics["topouts"] += 1
+                                        if args.auto_reset:
+                                            seed += 1
+                                            env.reset(seed)
+                                            status = f"AI[BC] topout -> auto-reset seed={seed}"
+                                        else:
+                                            ai_enabled = False
+                                            status = "AI[BC] topout. Autoplay stopped (auto-reset disabled)."
+                                elif ai_result is not None:
+                                    ai_enabled = False
+                                    status = "AI[BC] action apply failed. Autoplay disabled."
                     else:
-                        ai_enabled = False
-                        status = "AI choose/apply failed. Autoplay disabled."
+                        ai_result = env.bot_choose_and_apply(args.think_ms)
+                        if ai_result["success"]:
+                            ai_metrics["pieces"] += 1
+                            ai_metrics["lines"] += int(ai_result["lines"])
+                            ai_metrics["last_step_ms"] = float(ai_result["think_ms"])
+                            ai_metrics["step_sum_ms"] += float(ai_result["think_ms"])
+                            ai_metrics["step_samples"] += 1
+                            ai_metrics["avg_step_ms"] = (
+                                ai_metrics["step_sum_ms"] / max(1, ai_metrics["step_samples"])
+                            )
+                            ai_metrics["last_nodes"] = int(ai_result["nodes"])
+                            ai_metrics["last_nps"] = float(ai_result["nps"])
+                            ai_metrics["last_score"] = float(ai_result["score"])
+                            ai_metrics["last_budget_miss"] = int(ai_result["budget_miss"])
+                            ai_metrics["budget_misses"] += int(ai_result["budget_miss"])
+                            status = (
+                                f"AI[ColdClear] move idx={ai_result['placement_index']} "
+                                f"hold={ai_result['used_hold']} score={ai_result['score']:.2f} "
+                                f"lines+={ai_result['lines']}"
+                            )
+                            if ai_result["game_over"]:
+                                ai_metrics["topouts"] += 1
+                                if args.auto_reset:
+                                    seed += 1
+                                    env.reset(seed)
+                                    status = f"AI[ColdClear] topout -> auto-reset seed={seed}"
+                                else:
+                                    ai_enabled = False
+                                    status = "AI topout. Autoplay stopped (auto-reset disabled)."
+                        else:
+                            ai_enabled = False
+                            status = "AI choose/apply failed. Autoplay disabled."
 
             board_piece_ids = env.board_piece_ids(include_active=True)
             hold = env.hold_info()
@@ -925,6 +1171,9 @@ def main():
             pygame.draw.rect(screen, PANEL_COLOR, (right_x, info_y, right_w, info_h), border_radius=8)
             ai_elapsed_s = max(1e-6, (pygame.time.get_ticks() - ai_metrics["start_ticks"]) / 1000.0)
             ai_pps = ai_metrics["pieces"] / ai_elapsed_s
+            ai_backend_info = ai_backend_label
+            if ai_backend == "bc":
+                ai_backend_info = f"BC ({args.bc_device or 'auto'})"
             lines = [
                 f"Seed: {seed}",
                 f"Obs size: {env.observation_size()}",
@@ -933,12 +1182,22 @@ def main():
                 f"GameOver={meta['game_over']} TopOut={meta['top_out']}",
                 f"Combo={meta['combo']} B2B={meta['b2b']} Lines={meta['lines']}",
                 f"LockTimer={meta['lock_timer']} Resets={meta['lock_resets']}",
-                f"AI: {'ON' if ai_enabled else 'OFF'} avail={ai_available} think={max(1, int(args.think_ms))}ms",
+                f"AI: {'ON' if ai_enabled else 'OFF'} backend={ai_backend_info} avail={ai_available}",
                 f"AI pieces={ai_metrics['pieces']} lines={ai_metrics['lines']} topouts={ai_metrics['topouts']}",
-                f"AI PPS={ai_pps:.2f} think(last/avg)={ai_metrics['last_think_ms']:.1f}/{ai_metrics['avg_think_ms']:.1f} ms",
-                f"AI nodes={ai_metrics['last_nodes']} nps={ai_metrics['last_nps']:.0f} score={ai_metrics['last_score']:.2f}",
-                f"AI budget_miss last/total={ai_metrics['last_budget_miss']}/{ai_metrics['budget_misses']}",
+                f"AI PPS={ai_pps:.2f} step_ms(last/avg)={ai_metrics['last_step_ms']:.1f}/{ai_metrics['avg_step_ms']:.1f}",
             ]
+            if ai_backend == "cold_clear":
+                lines.append(
+                    f"AI nodes={ai_metrics['last_nodes']} nps={ai_metrics['last_nps']:.0f} score={ai_metrics['last_score']:.2f}"
+                )
+                lines.append(
+                    f"AI budget_miss last/total={ai_metrics['last_budget_miss']}/{ai_metrics['budget_misses']}"
+                )
+            else:
+                lines.append(
+                    f"AI[BC] invalid_raw={ai_metrics['invalid_unmasked_predictions']} "
+                    f"fallbacks={ai_metrics['unseen_legal_fallbacks']}"
+                )
             for i, txt in enumerate(lines):
                 surface = small_font.render(txt, True, LOCK_TEXT)
                 screen.blit(surface, (right_x + 10, info_y + 10 + i * 19))
