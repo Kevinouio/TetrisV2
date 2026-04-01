@@ -3,51 +3,61 @@ title: Results
 permalink: /results/
 ---
 
-**Site Navigation:** [Home]({{ '/' | relative_url }}) | [Overview]({{ '/overview/' | relative_url }}) | [Version One]({{ '/version-one/' | relative_url }}) | [Version Two]({{ '/version-two/' | relative_url }}) | [Timeline]({{ '/timeline/' | relative_url }}) | [Videos]({{ '/videos/' | relative_url }}) | [Experiments]({{ '/experiments/' | relative_url }}) | [Results]({{ '/results/' | relative_url }})
+**Navigation:** [Home]({{ '/' | relative_url }}) | [System / Implementation]({{ '/system/' | relative_url }}) | [Algorithms]({{ '/algorithms/' | relative_url }}) | [Results]({{ '/results/' | relative_url }}) | [Media]({{ '/media/' | relative_url }}) | [Timeline]({{ '/timeline/' | relative_url }})
 
-## Results Summary
+## Current Working Baselines
 
-This page consolidates key metrics across PPO, expert gameplay, BC, and DAgger.
-
-## Current Status
-
-- Metrics below are a living summary.
-- Mark entries as **provisional** until backed by repeat runs and fixed seeds.
-
-## Version One PPO (Provisional)
-
-| Environment | Model | Metric Focus | Latest Status | Artifacts |
-|---|---|---|---|---|
-| Modern SRS | PPO baseline | Survival and line clears | In active tuning | `runs/ppo_modern_v1` |
-| NES-like | PPO baseline | Stability under classic constraints | In active tuning | `runs/ppo_nes_*` |
-
-## Version Two Cold Clear Expert
-
-| Component | Metric Focus | Latest Status | Artifacts |
+| Area | Baseline | Status | Main Artifact |
 |---|---|---|---|
-| C++ Cold Clear autoplay | Survival behavior sanity | Stable demo path | `TetrisVersionTwo/apps/cli_bot_play.cpp`, `Recordings/ColdClear.gif` |
-| Pygame viewer integration | Runtime visual validation | Stable | `TetrisVersionTwo/scripts/play_pygame.py` |
+| Expert Search | Cold Clear-compatible policy in Version Two | Working | Version Two CLI/pygame paths |
+| RL | PPO baseline in Version One | Working, iterating | `runs/ppo_*` |
+| Imitation | Top-1 BC | Working | `runs/bc_top1` |
+| Imitation | DAgger on top of BC | Working, iterating | `runs/dagger_top1`, `runs/dagger_random` |
 
-## Behavioral Cloning and DAgger
+## Qualitative Observations
 
-| Model | Dataset | Primary Metrics | Status | Artifacts |
+- BC improves immediate expert-likeness but can drift under novel board distributions.
+- DAgger improves learner-state coverage and reduces brittle behavior in off-distribution positions.
+- Offline classification gains do not always map directly to better long-run gameplay.
+- Viewer-based inspection remains critical for spotting policy failure modes.
+
+## Quantitative Placeholders
+
+### Offline Classification Metrics
+
+| Run | Split | Top-1 | Top-5 | Val Loss | Notes |
+|---|---|---|---|---|---|
+| `bc_top1` | test | `TBD` | `TBD` | `TBD` | Fill from `runs/bc_top1/summary.json` |
+| `dagger_top1` | test | `TBD` | `TBD` | `TBD` | Fill from latest round summary |
+
+### Online Gameplay Metrics
+
+| Run | Avg Lines | Avg Pieces | Topout Rate | Invalid Raw | Notes |
+|---|---|---|---|---|---|
+| `bc_top1` | `TBD` | `TBD` | `TBD` | `TBD` | |
+| `dagger_top1` | `TBD` | `TBD` | `TBD` | `TBD` | |
+| Cold Clear Expert | `TBD` | `TBD` | `TBD` | n/a | Reference baseline |
+
+## Completed Experiments (Merged from Previous Experiments Page)
+
+| Date | Run | Objective | Dataset | Outcome |
 |---|---|---|---|---|
-| BC top-1 | Expert rollout dataset | Top-1/top-5 offline + online lines/survival | Baseline established | `runs/bc_top1` |
-| DAgger fine-tuned | Aggregated BC + DAgger rounds | Round-wise policy quality and gameplay | Ongoing | `runs/dagger_top1`, `runs/dagger_random` |
+| 2026-03-31 | `bc_top1` | Top-1 BC baseline | `data/bc_top1` | Baseline established |
+| 2026-04-01 | `dagger_top1` | Learner-state aggregation | Aggregated BC+DAgger | Round-wise fine-tuning active |
+| Ongoing | `dagger_random` | Broader state coverage | Random-board rounds | In progress |
 
-## Recommended Reporting Block Per Run
+## Planned Comparison Areas
+
+- BC vs DAgger under identical online eval budgets.
+- Expert imitation quality vs gameplay stability tradeoff.
+- Random-board DAgger vs rollout-only DAgger.
+- PPO (Version One) vs imitation-based pipelines in common evaluation protocol.
+
+## Plot and Figure Placeholders
 
 ```markdown
-### <run_name> (YYYY-MM-DD)
-- Data: transitions=<n>, vocab=<n>
-- Train: best_val_loss=<x>, top1=<x>, top5=<x>
-- Online: avg_lines=<x>, avg_pieces=<x>, topout_rate=<x>
-- Notes: failure modes and next change
+![Offline Accuracy Curve]({{ '/assets/screenshots/offline_accuracy_curve.png' | relative_url }})
+![Online Lines Cleared Comparison]({{ '/assets/screenshots/online_lines_comparison.png' | relative_url }})
 ```
 
-## Interpretation Notes
-
-- Offline classification improvements do not always translate to better gameplay.
-- Online evaluation should include enough games to reduce noise.
-- DAgger rounds should be analyzed for both data quality and distribution shift effects.
-
+Use this section for stable figure names once plotting scripts are finalized.

@@ -1,64 +1,40 @@
 ---
-title: Version One
+title: Version One (Detail)
 permalink: /version-one/
 ---
 
-**Site Navigation:** [Home]({{ '/' | relative_url }}) | [Overview]({{ '/overview/' | relative_url }}) | [Version One]({{ '/version-one/' | relative_url }}) | [Version Two]({{ '/version-two/' | relative_url }}) | [Timeline]({{ '/timeline/' | relative_url }}) | [Videos]({{ '/videos/' | relative_url }}) | [Experiments]({{ '/experiments/' | relative_url }}) | [Results]({{ '/results/' | relative_url }})
+**Navigation:** [Home]({{ '/' | relative_url }}) | [System / Implementation]({{ '/system/' | relative_url }}) | [Algorithms]({{ '/algorithms/' | relative_url }}) | [Results]({{ '/results/' | relative_url }}) | [Media]({{ '/media/' | relative_url }}) | [Timeline]({{ '/timeline/' | relative_url }})
 
-## Scope
+## Version One Deep Dive
 
-Version One is the Python training playground with two environment families:
+Version One is the Python-first experimentation track focused on RL training speed and environment iteration.
 
-- NES-like rules
-- Modern SRS rules (hold, kicks, previews)
+## Implementation Surface
 
-Primary directories:
+- Environments: `TetrisVersionOne/env`
+- PPO: `TetrisVersionOne/agents/ppo`
+- Scripts: `TetrisVersionOne/scripts`
+- Tests: `TetrisVersionOne/tests`
+- Presets: `TetrisVersionOne/presets`
 
-- `TetrisVersionOne/env/`
-- `TetrisVersionOne/agents/ppo/`
-- `TetrisVersionOne/scripts/`
-- `TetrisVersionOne/tests/`
-- `TetrisVersionOne/presets/`
-
-## Training Workflow
-
-Install:
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Train PPO (modern example):
+## Workflow
 
 ```bash
 python -m TetrisVersionOne.scripts.train --env modern \
   --total-timesteps 1500000 --num-envs 8 --log-dir runs/ppo_modern_v1
-```
 
-Evaluate:
-
-```bash
 python -m TetrisVersionOne.scripts.eval runs/ppo_modern_v1/final_model.pt \
   --env modern --render
 ```
 
-Human play:
+## Engineering Role in the Full Project
 
-```bash
-python -m TetrisVersionOne.scripts.play_human --env modern --fps 60
-```
+- Fast lane for reward and curriculum exploration.
+- RL baseline line of evidence alongside BC/DAgger.
+- Useful for stress-testing design choices before deeper systems integration.
 
-## What This Track Is Good For
+## Limits and Next Work
 
-- Fast reward-shaping experiments.
-- Rapid policy architecture iteration in Python.
-- Controlled curriculum and preset testing.
-
-## Known Limitations
-
-- Python stack is slower than the C++ path for large-scale simulation.
-- Cross-track parity needs continuous validation when rules/features evolve.
-- Final deployment behavior should always be checked against Version Two.
-
-
+- Slower at large-scale simulation than C++ path.
+- Needs ongoing semantic parity checks with Version Two.
+- Continue using it as the RL prototyping lane.

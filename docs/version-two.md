@@ -1,63 +1,44 @@
 ---
-title: Version Two
+title: Version Two (Detail)
 permalink: /version-two/
 ---
 
-**Site Navigation:** [Home]({{ '/' | relative_url }}) | [Overview]({{ '/overview/' | relative_url }}) | [Version One]({{ '/version-one/' | relative_url }}) | [Version Two]({{ '/version-two/' | relative_url }}) | [Timeline]({{ '/timeline/' | relative_url }}) | [Videos]({{ '/videos/' | relative_url }}) | [Experiments]({{ '/experiments/' | relative_url }}) | [Results]({{ '/results/' | relative_url }})
+**Navigation:** [Home]({{ '/' | relative_url }}) | [System / Implementation]({{ '/system/' | relative_url }}) | [Algorithms]({{ '/algorithms/' | relative_url }}) | [Results]({{ '/results/' | relative_url }}) | [Media]({{ '/media/' | relative_url }}) | [Timeline]({{ '/timeline/' | relative_url }})
 
-## Scope
+## Version Two Deep Dive
 
-Version Two is the C++/interop track designed for stronger systems-level control and Cold Clear compatibility.
+Version Two is the C++ systems track and the primary expert-compatible runtime layer.
 
-Primary directories:
+## Implementation Surface
 
-- `TetrisVersionTwo/include/tetris_v2/`
-- `TetrisVersionTwo/src/`
-- `TetrisVersionTwo/apps/cli_bot_play.cpp`
-- `TetrisVersionTwo/scripts/play_pygame.py`
-- `TetrisVersionTwo/scripts/bc/`
+- C++ interfaces and core logic:
+  - `TetrisVersionTwo/include/tetris_v2`
+  - `TetrisVersionTwo/src`
+- Runtime apps/tooling:
+  - `TetrisVersionTwo/apps/cli_bot_play.cpp`
+  - `TetrisVersionTwo/scripts/play_pygame.py`
+- BC/DAgger orchestration:
+  - `TetrisVersionTwo/scripts/bc`
 
-## C++ Core and C API
-
-- Board/state logic and move application are implemented in C++.
-- A C API exposes environment lifecycle, state readout, and expert interactions.
-- Python tooling (viewer + BC/DAgger scripts) binds to the shared library (`libtetris_v2_c_api.so` in WSL builds).
-
-Build:
+## Build and Run
 
 ```bash
 cmake -S . -B build-wsl
 cmake --build build-wsl -j
-```
 
-## Cold Clear Integration
-
-- Version Two includes a C++ Cold Clear 2 integration layer.
-- The CLI app and pygame viewer can drive the expert in live gameplay.
-
-Pygame viewer:
-
-```bash
 python TetrisVersionTwo/scripts/play_pygame.py \
   --lib build-wsl/TetrisVersionTwo/libtetris_v2_c_api.so \
   --ai
 ```
 
-## BC and DAgger in Version Two
+## Engineering Role in the Full Project
 
-BC/DAgger pipeline modules:
+- Authoritative state/action semantics for expert imitation.
+- Cold Clear-compatible expert interface for supervision.
+- Shared runtime for data collection, evaluation, and viewer-based debugging.
 
-- `collect_data.py`
-- `train.py`
-- `evaluate.py`
-- `inference_agent.py`
-- `dagger.py`
+## BC/DAgger Connection
 
-These scripts operate directly on Version Two state/action semantics to avoid training-serving mismatch.
-
-## Interoperability Notes
-
-- Version Two is the authoritative path for Cold Clear-based data generation.
-- Policy checkpoints produced here can be run in the pygame viewer using `--bc-checkpoint`.
-- Tooling now supports long-running data jobs, progress tracking, and cleanup workflows.
-
+- Data collection and aggregation through `python -m bc.collect_data` and `python -m bc.dagger`.
+- Supervised training via `python -m bc.train`.
+- Offline and online evaluation via `python -m bc.evaluate`.

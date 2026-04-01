@@ -3,62 +3,49 @@ title: Timeline
 permalink: /timeline/
 ---
 
-**Site Navigation:** [Home]({{ '/' | relative_url }}) | [Overview]({{ '/overview/' | relative_url }}) | [Version One]({{ '/version-one/' | relative_url }}) | [Version Two]({{ '/version-two/' | relative_url }}) | [Timeline]({{ '/timeline/' | relative_url }}) | [Videos]({{ '/videos/' | relative_url }}) | [Experiments]({{ '/experiments/' | relative_url }}) | [Results]({{ '/results/' | relative_url }})
+**Navigation:** [Home]({{ '/' | relative_url }}) | [System / Implementation]({{ '/system/' | relative_url }}) | [Algorithms]({{ '/algorithms/' | relative_url }}) | [Results]({{ '/results/' | relative_url }}) | [Media]({{ '/media/' | relative_url }}) | [Timeline]({{ '/timeline/' | relative_url }})
 
-## Devlog
+## Development Timeline
 
-This page tracks major technical milestones. Dates below are seeded from repository history and then expanded with context.
+Chronological project milestones. This page is a supporting historical record, while Home/System/Algorithms/Results define the core project narrative.
 
 ### 2026-04-01
-
-- Integrated random-board workflows into DAgger collection.
-- Continued work on data generation controls and round orchestration.
+- Expanded DAgger with random-board generation integration.
+- Continued improvement of collection controls, orchestration, and artifacts.
 
 ### 2026-03-31
-
-- Added DAgger integration over the BC baseline.
-- Added board-randomization and learner/expert data flow updates.
-- Consolidated BC documentation and run commands.
+- Integrated DAgger over BC baseline.
+- Added board randomization path and learner/expert data-loop updates.
+- Consolidated BC command and documentation workflow.
 
 ### 2026-03-30
-
-- Landed model implementation milestones for the BC pipeline.
+- Model implementation milestone for BC pipeline.
 
 ### 2026-03-22
-
-- Major remake branch merge and stabilization checkpoint.
+- Major remake/stabilization merge checkpoint.
 
 ### 2026-03-08 to 2026-03-09
-
-- Viewer and gameplay telemetry improvements (including B2B-related updates).
+- Viewer and telemetry improvements, including B2B-related tracking updates.
 
 ### 2026-01-16
-
-- Added Docker support for easier reproducible setup.
+- Added Docker files for reproducible environments.
 
 ### 2025-12-03
-
-- Defined short-term roadmap and planning direction.
+- Short-term roadmap and planning milestone.
 
 ### 2025-11-23 to 2025-11-24
-
 - Initial Cold Clear C++ integration landed.
-- Added recording artifacts and README updates around the Version Two stack.
+- Added recording artifacts and documentation updates.
 
 ### 2025-11-17 to 2025-11-22
+- PPO baseline implementation period.
+- Training scripts, curriculum updates, bug fixes, and action-space revisions.
 
-- Implemented PPO baseline path.
-- Added training scripts, curriculum/reward updates, bug fixes, and action-space revisions.
-
-## Add New Entry Template
-
-Copy this block and fill it in when you push new milestones:
+## Entry Template
 
 ```markdown
 ### YYYY-MM-DD
-
-- Summary of what changed.
-- Why it mattered technically.
-- Links: PR/commit, run folder, media artifact.
+- What changed.
+- Why it mattered.
+- Links: commit/PR, run artifact, media.
 ```
-
