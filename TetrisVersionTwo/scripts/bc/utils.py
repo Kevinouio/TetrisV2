@@ -215,6 +215,17 @@ class BCEnvAdapter:
             ctypes.c_size_t,
         ]
         self.lib.tetris_cc_env_board_write.restype = ctypes.c_size_t
+        self._has_set_visible_board_mask = hasattr(
+            self.lib, "tetris_cc_env_set_visible_board_mask"
+        )
+        if self._has_set_visible_board_mask:
+            self.lib.tetris_cc_env_set_visible_board_mask.argtypes = [
+                void_p,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            self.lib.tetris_cc_env_set_visible_board_mask.restype = ctypes.c_int
         self.lib.tetris_cc_env_active_piece.argtypes = [void_p, int_p, int_p, int_p, int_p]
         self.lib.tetris_cc_env_active_piece.restype = ctypes.c_int
         self.lib.tetris_cc_env_hold_piece.argtypes = [void_p, int_p, int_p, int_p]
@@ -335,6 +346,26 @@ class BCEnvAdapter:
             raise RuntimeError("Failed to read board occupancy from C API.")
         flat = np.frombuffer(buf, dtype=np.uint8, count=len(buf))
         return flat.reshape(self.BOARD_ROWS, self.BOARD_COLS)
+
+    def set_visible_board_mask(self, mask: np.ndarray, reset_meta: bool = True) -> bool:
+        if not self._has_set_visible_board_mask:
+            raise RuntimeError("C API does not provide tetris_cc_env_set_visible_board_mask.")
+        arr = np.asarray(mask, dtype=np.uint8)
+        if arr.shape != (self.BOARD_ROWS, self.BOARD_COLS):
+            raise ValueError(
+                f"Expected mask shape {(self.BOARD_ROWS, self.BOARD_COLS)}, got {arr.shape}"
+            )
+        flat = np.ascontiguousarray(arr.reshape(-1), dtype=np.uint8)
+        ptr = flat.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        ok = self.lib.tetris_cc_env_set_visible_board_mask(
+            self.handle,
+            ptr,
+            ctypes.c_size_t(flat.size),
+            ctypes.c_int(1 if bool(reset_meta) else 0),
+        )
+        if ok:
+            self.bot_sync()
+        return bool(ok)
 
     def active_piece(self) -> Optional[Dict[str, int]]:
         piece = ctypes.c_int(-1)

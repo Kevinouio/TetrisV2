@@ -32,6 +32,8 @@ size_t tetris_cc_env_board_write(
     const tetris_cc_env_handle* handle, int include_active, uint8_t* out, size_t out_len);
 size_t tetris_cc_env_board_piece_ids_write(
     const tetris_cc_env_handle* handle, int include_active, uint8_t* out, size_t out_len);
+int tetris_cc_env_set_visible_board_mask(
+    tetris_cc_env_handle* handle, const uint8_t* cells, size_t cells_len, int reset_meta);
 
 int tetris_cc_env_active_piece(
     const tetris_cc_env_handle* handle, int* piece, int* rotation, int* x, int* y);

@@ -214,6 +214,51 @@ size_t tetris_cc_env_board_piece_ids_write(
     return n;
 }
 
+int tetris_cc_env_set_visible_board_mask(
+    tetris_cc_env_handle* handle, const uint8_t* cells, size_t cells_len, int reset_meta) {
+    if (!handle || !cells) {
+        return 0;
+    }
+    constexpr int kRows = tetris_v2::Board::kVisibleRows;
+    constexpr int kCols = tetris_v2::Board::kWidth;
+    constexpr size_t kTotal = static_cast<size_t>(kRows * kCols);
+    if (cells_len < kTotal) {
+        return 0;
+    }
+
+    auto state = handle->env.state();
+    for (int row = 0; row < kRows; ++row) {
+        int y = (kRows - 1) - row;
+        for (int x = 0; x < kCols; ++x) {
+            auto idx = static_cast<size_t>(row * kCols + x);
+            const bool filled = cells[idx] != 0;
+            state.board.set_cell(x, y, filled);
+            state.piece_ids[static_cast<size_t>(y)][static_cast<size_t>(x)] = -1;
+        }
+    }
+
+    if (reset_meta != 0) {
+        state.game_over = false;
+        state.top_out = false;
+        state.combo = -1;
+        state.back_to_back = false;
+        state.total_lines_cleared = 0;
+        state.lock_timer = 0;
+        state.lock_resets_used = 0;
+        state.gravity_accumulator = 0.0f;
+        state.spin_eligible = false;
+        state.last_rotate_used_kick = false;
+        state.last_rotate_kick_index = -1;
+        state.last_clear_spin = false;
+        state.last_clear_spin_type = tetris_v2::SpinType::None;
+        state.last_clear_difficult = false;
+        state.last_clear_b2b_bonus = false;
+    }
+
+    handle->env.restore(state);
+    return 1;
+}
+
 int tetris_cc_env_active_piece(
     const tetris_cc_env_handle* handle, int* piece, int* rotation, int* x, int* y) {
     if (!handle) {
