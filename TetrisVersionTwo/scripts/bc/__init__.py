@@ -2,9 +2,16 @@
 
 from .config import CollectionConfig, EncoderConfig, ModelConfig, SplitConfig, TrainConfig
 from .encoders import encode_state, flatten_aux_features
-from .inference_agent import BCAgent
-from .model import BCPolicyNet
 from .utils import ActionCodec, BCEnvAdapter, NativeAction
+
+try:
+    from .inference_agent import BCAgent
+    from .model import BCPolicyNet
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", None) != "torch":
+        raise
+    BCAgent = None  # type: ignore[assignment]
+    BCPolicyNet = None  # type: ignore[assignment]
 
 __all__ = [
     "ActionCodec",

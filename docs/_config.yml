@@ -1,0 +1,16 @@
+title: TetrisV2 Devlog
+description: Development log and technical progress for TetrisVersionOne, TetrisVersionTwo, BC, and DAgger.
+theme: minima
+url: "https://kevinouio.github.io"
+baseurl: "/TetrisV2"
+markdown: kramdown
+permalink: pretty
+header_pages:
+  - index.md
+  - overview.md
+  - version-one.md
+  - version-two.md
+  - timeline.md
+  - videos.md
+  - experiments.md
+  - results.md

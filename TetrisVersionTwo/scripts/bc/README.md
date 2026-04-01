@@ -140,6 +140,37 @@ Notes:
 - If collection is interrupted with `Ctrl+C`, outputs may be partial.
   Prefer stop-file based shutdown for clean finalization.
 
+## Storage Cleanup
+
+Use the cleanup utility to reclaim space from old DAgger artifacts while keeping
+latest rounds and runnable checkpoints.
+
+Dry-run (default, no deletion):
+
+```bash
+python -m bc.cleanup_data
+```
+
+Apply deletions:
+
+```bash
+python -m bc.cleanup_data --apply
+```
+
+Optional aggressive mode (also prune old round `aggregated_data` files):
+
+```bash
+python -m bc.cleanup_data --apply --prune_old_aggregated_data
+```
+
+Defaults:
+
+- dry-run mode unless `--apply` is passed
+- keep latest 2 rounds per DAgger run
+- preserve base dataset path (`data/bc_top1`)
+- prune old `round_XX/dagger_train/shards/*.pt` first
+- optional JSON report via `--json_report <path>`
+
 ## Module Map
 
 - `collect_data.py`: rollout collection + vocab build + sharding
@@ -149,4 +180,5 @@ Notes:
 - `train.py`: supervised training + checkpoints + metrics
 - `evaluate.py`: offline and online evaluation
 - `inference_agent.py`: legality-masked inference wrapper (`BCAgent`)
+- `cleanup_data.py`: safe disk cleanup for generated BC/DAgger artifacts
 - `utils.py`: C API adapter, action codec, split utilities

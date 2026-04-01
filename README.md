@@ -4,6 +4,11 @@ This repo now contains two tracks:
 - **Version One (Python)** — NES and modern SRS environments with PPO training (`TetrisVersionOne/`), plus scripts/tests/presets.
 - **Version Two (C++/Rust interop)** — A cold-clear-compatible environment (`TetrisVersionTwo/`) with a C++ port of Cold Clear 2 (`cold_clear_cpp`) and a pygame viewer.
 
+## Project Site
+
+- GitHub Pages devlog: https://kevinouio.github.io/TetrisV2/
+- Source content: `docs/` in this repository
+
 ## Version Two (Cold Clear)
 - C++ core: `TetrisVersionTwo/cold_clear_cpp` mirrors the Rust reference (`cold-clear-2/`).
 - Environment/wrapper: `TetrisVersionTwo/include/tetris_v2/`, `TetrisVersionTwo/src/`.
