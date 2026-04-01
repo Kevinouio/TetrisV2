@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=0,
+        help="If > 0, cap train samples to this exact count via deterministic sampling.",
+    )
     parser.add_argument("--conv_channels", type=str, default="32,64,64")
     parser.add_argument("--mlp_hidden", type=str, default="256,256")
     parser.add_argument(
@@ -209,6 +215,8 @@ def load_warm_start_checkpoint(model: BCPolicyNet, checkpoint_path: Path) -> Dic
 
 def main() -> int:
     args = parse_args()
+    if int(args.max_train_samples) < 0:
+        raise ValueError("--max_train_samples must be >= 0.")
     set_global_seeds(args.seed)
     device = select_device(args.device)
 
@@ -232,10 +240,23 @@ def main() -> int:
 
     train_ds: Dataset = BCDataset(args.data_dir, split="train")
     val_ds: Dataset = BCDataset(args.data_dir, split="val")
+    num_train_available = int(len(train_ds))
+    train_cap_applied = False
     if args.overfit_samples > 0:
         train_ds = make_subset(train_ds, args.overfit_samples)
         val_ds = make_subset(val_ds, args.overfit_samples)
         print(f"[train] overfit mode enabled with {len(train_ds)} samples.")
+    elif int(args.max_train_samples) > 0 and len(train_ds) > int(args.max_train_samples):
+        max_samples = int(args.max_train_samples)
+        sample_gen = torch.Generator()
+        sample_gen.manual_seed(int(args.seed))
+        sampled_indices = torch.randperm(len(train_ds), generator=sample_gen)[:max_samples].tolist()
+        train_ds = Subset(train_ds, sampled_indices)
+        train_cap_applied = True
+        print(
+            f"[train] applying deterministic train cap: "
+            f"available={num_train_available} used={len(train_ds)} max_train_samples={max_samples}"
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -404,6 +425,10 @@ def main() -> int:
         "best_val_loss": float(best_val_loss),
         "serialization_sanity": bool(serialization_ok),
         "num_train_samples": int(len(train_ds)),
+        "num_train_samples_available": int(num_train_available),
+        "num_train_samples_used": int(len(train_ds)),
+        "max_train_samples": int(args.max_train_samples),
+        "train_cap_applied": bool(train_cap_applied),
         "num_val_samples": int(len(val_ds)),
         "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint is not None else None,
         "warm_start": warm_start_stats,

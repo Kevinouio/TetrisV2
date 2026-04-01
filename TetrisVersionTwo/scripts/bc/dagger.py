@@ -41,6 +41,7 @@ _WORKER_STATE_SOURCE: str = "rollout"
 _WORKER_RANDOM_FILL_Y_MAX_EXCLUSIVE: int = 17
 _WORKER_RANDOM_FILL_PROB: float = 0.5
 _WORKER_RANDOM_MAX_RESAMPLES_PER_SAMPLE: int = 100
+_WORKER_RANDOM_POST_CLEAR_STEPS: int = 50
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random_fill_y_max_exclusive", type=int, default=17)
     parser.add_argument("--random_fill_prob", type=float, default=0.5)
     parser.add_argument("--random_max_resamples_per_sample", type=int, default=100)
+    parser.add_argument("--random_post_clear_steps", type=int, default=50)
 
     parser.add_argument(
         "--beta_schedule",
@@ -110,6 +112,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train_seed", type=int, default=TrainConfig.seed)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--max_train_transitions",
+        type=int,
+        default=0,
+        help="If > 0, cap train transitions passed to bc.train (--max_train_samples).",
+    )
     parser.add_argument("--conv_channels", type=str, default="32,64,64")
     parser.add_argument("--mlp_hidden", type=str, default="256,256")
 
@@ -165,6 +173,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--random_fill_prob must be in [0,1].")
     if int(args.random_max_resamples_per_sample) <= 0:
         raise ValueError("--random_max_resamples_per_sample must be > 0.")
+    if int(args.random_post_clear_steps) < 0:
+        raise ValueError("--random_post_clear_steps must be >= 0.")
+    if int(args.max_train_transitions) < 0:
+        raise ValueError("--max_train_transitions must be >= 0.")
 
 
 def _resolve_shard_paths(data_dir: Path, shard_values: Iterable[object]) -> List[str]:
@@ -302,6 +314,7 @@ def _worker_init(
     random_fill_y_max_exclusive: int,
     random_fill_prob: float,
     random_max_resamples_per_sample: int,
+    random_post_clear_steps: int,
 ) -> None:
     global _WORKER_ENV
     global _WORKER_AGENT
@@ -315,6 +328,7 @@ def _worker_init(
     global _WORKER_RANDOM_FILL_Y_MAX_EXCLUSIVE
     global _WORKER_RANDOM_FILL_PROB
     global _WORKER_RANDOM_MAX_RESAMPLES_PER_SAMPLE
+    global _WORKER_RANDOM_POST_CLEAR_STEPS
 
     _WORKER_ROUND_ID = int(round_id)
     _WORKER_BETA = float(beta)
@@ -325,6 +339,7 @@ def _worker_init(
     _WORKER_RANDOM_FILL_Y_MAX_EXCLUSIVE = int(random_fill_y_max_exclusive)
     _WORKER_RANDOM_FILL_PROB = float(random_fill_prob)
     _WORKER_RANDOM_MAX_RESAMPLES_PER_SAMPLE = int(random_max_resamples_per_sample)
+    _WORKER_RANDOM_POST_CLEAR_STEPS = int(random_post_clear_steps)
     _WORKER_ENCODER_CFG = EncoderConfig(
         board_height=int(encoder_cfg_dict["board_height"]),
         board_width=int(encoder_cfg_dict["board_width"]),
@@ -355,6 +370,7 @@ def _collect_episode_with_env(
     random_fill_y_max_exclusive: int,
     random_fill_prob: float,
     random_max_resamples_per_sample: int,
+    random_post_clear_steps: int,
 ) -> Dict[str, object]:
     env.reset(int(base_seed + episode_id))
 
@@ -499,12 +515,15 @@ def _collect_episode_with_env(
 
             attempt_transitions = 0
             attempt_terminated = False
+            cleared_during_attempt = False
+            post_clear_done = 0
             for step_idx in range(int(max_steps_per_episode)):
                 collected = try_collect_one(state_step_idx=step_idx, mix_rng=mix_rng)
                 if not collected:
                     attempt_terminated = True
                     if attempt_transitions > 0:
-                        episodes_topout_before_clear += 1
+                        if not cleared_during_attempt:
+                            episodes_topout_before_clear += 1
                         accepted = True
                     else:
                         resampled_samples += 1
@@ -512,24 +531,37 @@ def _collect_episode_with_env(
 
                 attempt_transitions += 1
                 remaining_garbage = count_injected_garbage_cells()
-                if remaining_garbage <= 0:
+                just_cleared_this_step = False
+                if (not cleared_during_attempt) and remaining_garbage <= 0:
                     episodes_cleared_garbage += 1
+                    cleared_during_attempt = True
+                    just_cleared_this_step = True
+                    if int(random_post_clear_steps) <= 0:
+                        accepted = True
+                        attempt_terminated = True
+                        break
+
+                state_now = env.get_state()
+                if bool(state_now["game_over"]):
+                    if not cleared_during_attempt:
+                        episodes_topout_before_clear += 1
                     accepted = True
                     attempt_terminated = True
                     break
 
-                state_now = env.get_state()
-                if bool(state_now["game_over"]):
-                    episodes_topout_before_clear += 1
-                    accepted = True
-                    attempt_terminated = True
-                    break
+                if cleared_during_attempt and (not just_cleared_this_step):
+                    post_clear_done += 1
+                    if post_clear_done >= int(random_post_clear_steps):
+                        accepted = True
+                        attempt_terminated = True
+                        break
 
             if accepted:
                 break
             if not attempt_terminated:
                 if attempt_transitions > 0:
-                    episodes_max_steps_before_clear += 1
+                    if not cleared_during_attempt:
+                        episodes_max_steps_before_clear += 1
                     accepted = True
                     break
                 resampled_samples += 1
@@ -586,6 +618,7 @@ def _collect_episode_worker(episode_id: int) -> Dict[str, object]:
         random_fill_y_max_exclusive=int(_WORKER_RANDOM_FILL_Y_MAX_EXCLUSIVE),
         random_fill_prob=float(_WORKER_RANDOM_FILL_PROB),
         random_max_resamples_per_sample=int(_WORKER_RANDOM_MAX_RESAMPLES_PER_SAMPLE),
+        random_post_clear_steps=int(_WORKER_RANDOM_POST_CLEAR_STEPS),
     )
 
 
@@ -645,6 +678,8 @@ def _run_train(
         str(int(args.train_seed)),
         "--num_workers",
         str(int(args.num_workers)),
+        "--max_train_samples",
+        str(int(args.max_train_transitions)),
         "--conv_channels",
         str(args.conv_channels),
         "--mlp_hidden",
@@ -733,6 +768,7 @@ def _collect_dagger_round(
     random_fill_y_max_exclusive: int,
     random_fill_prob: float,
     random_max_resamples_per_sample: int,
+    random_post_clear_steps: int,
 ) -> Tuple[Dict[int, List[Dict[str, object]]], Dict[str, object]]:
     if stop_file.exists():
         raise RuntimeError(
@@ -935,6 +971,7 @@ def _collect_dagger_round(
                         random_fill_y_max_exclusive=int(random_fill_y_max_exclusive),
                         random_fill_prob=float(random_fill_prob),
                         random_max_resamples_per_sample=int(random_max_resamples_per_sample),
+                        random_post_clear_steps=int(random_post_clear_steps),
                     )
                     ingest_episode_result(result)
         else:
@@ -961,6 +998,7 @@ def _collect_dagger_round(
                     int(random_fill_y_max_exclusive),
                     float(random_fill_prob),
                     int(random_max_resamples_per_sample),
+                    int(random_post_clear_steps),
                 ),
             )
             try:
@@ -1062,6 +1100,7 @@ def _collect_dagger_round(
         "random_fill_y_max_exclusive": int(random_fill_y_max_exclusive),
         "random_fill_prob": float(random_fill_prob),
         "random_max_resamples_per_sample": int(random_max_resamples_per_sample),
+        "random_post_clear_steps": int(random_post_clear_steps),
     }
 
     final_status = "stopped" if stopped_early else "done"
@@ -1274,6 +1313,7 @@ def main() -> int:
             "random_fill_y_max_exclusive": int(args.random_fill_y_max_exclusive),
             "random_fill_prob": float(args.random_fill_prob),
             "random_max_resamples_per_sample": int(args.random_max_resamples_per_sample),
+            "random_post_clear_steps": int(args.random_post_clear_steps),
             "beta_schedule": str(args.beta_schedule),
             "beta_start": float(args.beta_start),
             "beta_end": float(args.beta_end),
@@ -1281,6 +1321,7 @@ def main() -> int:
             "beta_decay_rounds": int(args.beta_decay_rounds),
             "fine_tune": bool(args.fine_tune),
             "eval_games": int(args.eval_games),
+            "max_train_transitions": int(args.max_train_transitions),
             "collect_workers": int(args.collect_workers),
             "worker_chunksize": int(args.worker_chunksize),
             "progress_mode": str(args.progress_mode),
@@ -1350,6 +1391,7 @@ def main() -> int:
             random_fill_y_max_exclusive=int(args.random_fill_y_max_exclusive),
             random_fill_prob=float(args.random_fill_prob),
             random_max_resamples_per_sample=int(args.random_max_resamples_per_sample),
+            random_post_clear_steps=int(args.random_post_clear_steps),
         )
 
         train_shard_root = round_dir / "dagger_train"
@@ -1401,6 +1443,7 @@ def main() -> int:
         if not train_summary_path.exists():
             raise FileNotFoundError(f"Missing training summary: {train_summary_path}")
         train_summary = load_json(train_summary_path)
+        train_samples_used = int(train_summary.get("num_train_samples_used", train_summary.get("num_train_samples", 0)))
 
         eval_metrics = _evaluate_round(
             checkpoint=next_checkpoint,
@@ -1417,6 +1460,8 @@ def main() -> int:
                 **collect_stats,
                 "new_dagger_samples": int(round_train_transitions),
                 "total_train_samples": int(round_total_train_samples),
+                "total_train_samples_available": int(round_total_train_samples),
+                "total_train_samples_used": int(train_samples_used),
             },
             "training": train_summary,
             "evaluation": eval_metrics,
