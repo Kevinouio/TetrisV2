@@ -20,6 +20,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train top-1 behavioral cloning policy.")
     parser.add_argument("--data_dir", type=Path, required=True)
     parser.add_argument("--out_dir", type=Path, default=Path("runs/bc_top1"))
+    parser.add_argument(
+        "--init_checkpoint",
+        type=Path,
+        default=None,
+        help="Optional checkpoint to warm-start from (supports vocab growth by partial head copy).",
+    )
     parser.add_argument("--batch_size", type=int, default=TrainConfig.batch_size)
     parser.add_argument("--learning_rate", type=float, default=TrainConfig.learning_rate)
     parser.add_argument("--weight_decay", type=float, default=TrainConfig.weight_decay)
@@ -149,6 +155,58 @@ def serialization_sanity(
     return torch.allclose(out1, out2, atol=1e-7, rtol=1e-6)
 
 
+def load_warm_start_checkpoint(model: BCPolicyNet, checkpoint_path: Path) -> Dict[str, int]:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"init checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state = checkpoint.get("model_state_dict", None)
+    if not isinstance(state, dict):
+        raise ValueError(f"Invalid checkpoint model_state_dict: {checkpoint_path}")
+
+    dst_state = model.state_dict()
+    loaded_exact = 0
+    loaded_partial = 0
+    skipped = 0
+
+    for key, src_val in state.items():
+        if key not in dst_state:
+            skipped += 1
+            continue
+        dst_val = dst_state[key]
+        if src_val.shape == dst_val.shape:
+            dst_val.copy_(src_val)
+            loaded_exact += 1
+            continue
+
+        can_partial = (
+            key.startswith("head.")
+            and src_val.ndim == dst_val.ndim
+            and src_val.ndim in (1, 2)
+        )
+        if not can_partial:
+            skipped += 1
+            continue
+
+        if src_val.ndim == 2:
+            if src_val.shape[1] != dst_val.shape[1]:
+                skipped += 1
+                continue
+            rows = min(int(src_val.shape[0]), int(dst_val.shape[0]))
+            dst_val[:rows, :].copy_(src_val[:rows, :])
+            loaded_partial += 1
+        else:
+            rows = min(int(src_val.shape[0]), int(dst_val.shape[0]))
+            dst_val[:rows].copy_(src_val[:rows])
+            loaded_partial += 1
+
+    model.load_state_dict(dst_state)
+    return {
+        "loaded_exact_tensors": int(loaded_exact),
+        "loaded_partial_tensors": int(loaded_partial),
+        "skipped_tensors": int(skipped),
+    }
+
+
 def main() -> int:
     args = parse_args()
     set_global_seeds(args.seed)
@@ -206,6 +264,16 @@ def main() -> int:
         conv_channels=model_hparams.conv_channels,
         mlp_hidden=model_hparams.mlp_hidden,
     ).to(device)
+    warm_start_stats: Optional[Dict[str, int]] = None
+    if args.init_checkpoint is not None:
+        warm_start_stats = load_warm_start_checkpoint(model, args.init_checkpoint)
+        print(
+            "[train] warm_start "
+            f"checkpoint={args.init_checkpoint} "
+            f"exact={warm_start_stats['loaded_exact_tensors']} "
+            f"partial={warm_start_stats['loaded_partial_tensors']} "
+            f"skipped={warm_start_stats['skipped_tensors']}"
+        )
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(
@@ -337,6 +405,8 @@ def main() -> int:
         "serialization_sanity": bool(serialization_ok),
         "num_train_samples": int(len(train_ds)),
         "num_val_samples": int(len(val_ds)),
+        "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint is not None else None,
+        "warm_start": warm_start_stats,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"[train] wrote checkpoints to {out_dir}")

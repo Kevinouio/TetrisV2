@@ -248,6 +248,12 @@ class BCEnvAdapter:
                 "tetris_cc_bot_choose_and_apply",
             )
         )
+        self._has_bot_choose_api = self._has_bot_api and hasattr(
+            self.lib, "tetris_cc_bot_choose"
+        )
+        self._has_bot_choose_api_ex = self._has_bot_api and hasattr(
+            self.lib, "tetris_cc_bot_choose_ex"
+        )
         self._has_bot_api_ex = self._has_bot_api and hasattr(
             self.lib, "tetris_cc_bot_choose_and_apply_ex"
         )
@@ -258,6 +264,24 @@ class BCEnvAdapter:
             self.lib.tetris_cc_bot_destroy.restype = None
             self.lib.tetris_cc_bot_sync_from_env.argtypes = [void_p, void_p]
             self.lib.tetris_cc_bot_sync_from_env.restype = ctypes.c_int
+
+            choose_only_args = [
+                void_p,
+                ctypes.c_int,
+                int_p,
+                size_t_p,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                int_p,
+            ]
+            if self._has_bot_choose_api:
+                self.lib.tetris_cc_bot_choose.argtypes = choose_only_args
+                self.lib.tetris_cc_bot_choose.restype = ctypes.c_int
+            if self._has_bot_choose_api_ex:
+                self.lib.tetris_cc_bot_choose_ex.argtypes = choose_only_args
+                self.lib.tetris_cc_bot_choose_ex.restype = ctypes.c_int
 
             choose_args = [
                 void_p,
@@ -487,6 +511,83 @@ class BCEnvAdapter:
             self.bot_sync()
 
         return out
+
+    def expert_choose(self, think_ms: int = 20) -> Dict[str, object]:
+        if not self._has_bot_api or self.bot_handle is None:
+            return {
+                "success": False,
+                "used_hold": False,
+                "placement_index": -1,
+                "score": 0.0,
+                "nodes": 0,
+                "think_ms": 0.0,
+                "nps": 0.0,
+                "budget_miss": 0,
+                "via_snapshot_rollback": False,
+            }
+
+        if self._has_bot_choose_api or self._has_bot_choose_api_ex:
+            used_hold = ctypes.c_int(0)
+            placement_index = ctypes.c_size_t(0)
+            score = ctypes.c_float(0.0)
+            nodes = ctypes.c_uint64(0)
+            think = ctypes.c_double(0.0)
+            nps = ctypes.c_double(0.0)
+            budget_miss = ctypes.c_int(0)
+            fn = self.lib.tetris_cc_bot_choose_ex if self._has_bot_choose_api_ex else self.lib.tetris_cc_bot_choose
+            ok = fn(
+                self.bot_handle,
+                int(max(1, think_ms)),
+                ctypes.byref(used_hold),
+                ctypes.byref(placement_index),
+                ctypes.byref(score),
+                ctypes.byref(nodes),
+                ctypes.byref(think),
+                ctypes.byref(nps),
+                ctypes.byref(budget_miss),
+            )
+            return {
+                "success": bool(ok),
+                "used_hold": bool(used_hold.value),
+                "placement_index": int(placement_index.value),
+                "score": float(score.value),
+                "nodes": int(nodes.value),
+                "think_ms": float(think.value),
+                "nps": float(nps.value),
+                "budget_miss": int(budget_miss.value),
+                "via_snapshot_rollback": False,
+            }
+
+        snapshot = self.lib.tetris_cc_env_snapshot_create(self.handle)
+        if not snapshot:
+            return {
+                "success": False,
+                "used_hold": False,
+                "placement_index": -1,
+                "score": 0.0,
+                "nodes": 0,
+                "think_ms": 0.0,
+                "nps": 0.0,
+                "budget_miss": 0,
+                "via_snapshot_rollback": True,
+            }
+        try:
+            chosen = self.expert_choose_and_apply(think_ms=think_ms)
+            restored = bool(self.lib.tetris_cc_env_restore_snapshot(self.handle, snapshot))
+            self.bot_sync()
+            return {
+                "success": bool(chosen["success"]) and restored,
+                "used_hold": bool(chosen["used_hold"]),
+                "placement_index": int(chosen["placement_index"]),
+                "score": float(chosen["score"]),
+                "nodes": int(chosen["nodes"]),
+                "think_ms": float(chosen["think_ms"]),
+                "nps": float(chosen["nps"]),
+                "budget_miss": int(chosen["budget_miss"]),
+                "via_snapshot_rollback": True,
+            }
+        finally:
+            self.lib.tetris_cc_snapshot_destroy(snapshot)
 
     def expert_choose_and_apply(self, think_ms: int = 20) -> Dict[str, object]:
         if not self._has_bot_api or self.bot_handle is None:
