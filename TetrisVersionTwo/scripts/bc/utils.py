@@ -215,6 +215,13 @@ class BCEnvAdapter:
             ctypes.c_size_t,
         ]
         self.lib.tetris_cc_env_board_write.restype = ctypes.c_size_t
+        self.lib.tetris_cc_env_board_piece_ids_write.argtypes = [
+            void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_size_t,
+        ]
+        self.lib.tetris_cc_env_board_piece_ids_write.restype = ctypes.c_size_t
         self._has_set_visible_board_mask = hasattr(
             self.lib, "tetris_cc_env_set_visible_board_mask"
         )
@@ -344,6 +351,19 @@ class BCEnvAdapter:
         written = self.lib.tetris_cc_env_board_write(self.handle, 0, buf, len(buf))
         if written != len(buf):
             raise RuntimeError("Failed to read board occupancy from C API.")
+        flat = np.frombuffer(buf, dtype=np.uint8, count=len(buf))
+        return flat.reshape(self.BOARD_ROWS, self.BOARD_COLS)
+
+    def board_piece_ids(self, include_active: bool = False) -> np.ndarray:
+        buf = (ctypes.c_uint8 * (self.BOARD_ROWS * self.BOARD_COLS))()
+        written = self.lib.tetris_cc_env_board_piece_ids_write(
+            self.handle,
+            ctypes.c_int(1 if bool(include_active) else 0),
+            buf,
+            len(buf),
+        )
+        if written != len(buf):
+            raise RuntimeError("Failed to read board piece ids from C API.")
         flat = np.frombuffer(buf, dtype=np.uint8, count=len(buf))
         return flat.reshape(self.BOARD_ROWS, self.BOARD_COLS)
 
