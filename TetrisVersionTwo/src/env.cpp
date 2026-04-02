@@ -172,6 +172,7 @@ void ModernTetrisEnv::reset(std::optional<std::uint32_t> seed) {
     for (auto& row : state_.piece_ids) {
         row.fill(-1);
     }
+    invalidate_placement_cache();
     ensure_queue(static_cast<std::size_t>(config_.queue_size) + 1u);
     spawn_next_piece(true);
 }
@@ -185,6 +186,7 @@ StepResult ModernTetrisEnv::step(Action action) {
         result.back_to_back = state_.back_to_back;
         return result;
     }
+    invalidate_placement_cache();
 
     bool skip_gravity = false;
     bool moved_while_grounded = false;
@@ -312,7 +314,25 @@ StepResult ModernTetrisEnv::step(Action action) {
     return result;
 }
 
+void ModernTetrisEnv::invalidate_placement_cache() const {
+    placement_cache_valid_ = false;
+    ++placement_cache_epoch_;
+}
+
+const std::vector<PlacementOption>& ModernTetrisEnv::placement_options_cached() const {
+    if (!placement_cache_valid_ || placement_cache_built_epoch_ != placement_cache_epoch_) {
+        placement_cache_ = build_placement_options_uncached();
+        placement_cache_built_epoch_ = placement_cache_epoch_;
+        placement_cache_valid_ = true;
+    }
+    return placement_cache_;
+}
+
 std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements() const {
+    return placement_options_cached();
+}
+
+std::vector<PlacementOption> ModernTetrisEnv::build_placement_options_uncached() const {
     std::vector<PlacementOption> options;
     if (state_.game_over || state_.active.piece == Piece::None || collides(state_.active)) {
         return options;
@@ -490,7 +510,7 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
 }
 
 std::optional<PlacementOption> ModernTetrisEnv::placement_option_at(std::size_t index) const {
-    auto options = enumerate_active_piece_placements();
+    const auto& options = placement_options_cached();
     if (index >= options.size()) {
         return std::nullopt;
     }
@@ -579,7 +599,7 @@ StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
         return result;
     }
 
-    auto options = enumerate_active_piece_placements();
+    const auto& options = placement_options_cached();
     auto it = std::find_if(options.begin(), options.end(), [&](const PlacementOption& opt) {
         return opt.placement == placement;
     });
@@ -592,6 +612,7 @@ StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
         return result;
     }
 
+    invalidate_placement_cache();
     state_.active = it->placement;
     state_.spin_eligible = it->spin_eligible_path;
     state_.last_rotate_used_kick = it->last_rotate_used_kick_path;
@@ -625,6 +646,7 @@ StepResult ModernTetrisEnv::apply_placement_index(std::size_t index) {
         return result;
     }
 
+    invalidate_placement_cache();
     state_.active = option->placement;
     state_.spin_eligible = option->spin_eligible_path;
     state_.last_rotate_used_kick = option->last_rotate_used_kick_path;
@@ -710,9 +732,13 @@ EnvSnapshot ModernTetrisEnv::snapshot() const {
 void ModernTetrisEnv::restore(const EnvSnapshot& snapshot) {
     state_ = snapshot.state;
     randomizer_ = snapshot.randomizer;
+    invalidate_placement_cache();
 }
 
-void ModernTetrisEnv::restore(const EnvState& state) { state_ = state; }
+void ModernTetrisEnv::restore(const EnvState& state) {
+    state_ = state;
+    invalidate_placement_cache();
+}
 
 std::vector<std::string> ModernTetrisEnv::render_rows(int visible_rows) const {
     auto rows = state_.board.render_rows(visible_rows);
@@ -747,6 +773,7 @@ void ModernTetrisEnv::ensure_queue(std::size_t minimum) {
 }
 
 void ModernTetrisEnv::spawn_next_piece(bool reset_hold_availability) {
+    invalidate_placement_cache();
     ensure_queue(static_cast<std::size_t>(config_.queue_size) + 1u);
     if (state_.queue.empty()) {
         state_.game_over = true;
@@ -791,6 +818,7 @@ bool ModernTetrisEnv::try_move(int dx, int dy) {
     if (collides(candidate)) {
         return false;
     }
+    invalidate_placement_cache();
     state_.active = candidate;
     return true;
 }
@@ -813,6 +841,7 @@ bool ModernTetrisEnv::try_rotate(Rotation target_rotation, bool* used_kick, int*
     if (kick_index) {
         *kick_index = passed;
     }
+    invalidate_placement_cache();
     state_.active = *rotated;
     return true;
 }
@@ -903,6 +932,7 @@ bool ModernTetrisEnv::apply_hold() {
         return false;
     }
 
+    invalidate_placement_cache();
     Piece current = state_.active.piece;
     if (state_.hold.has_value()) {
         Piece swapped = *state_.hold;
@@ -928,6 +958,7 @@ bool ModernTetrisEnv::apply_hold() {
 }
 
 void ModernTetrisEnv::lock_active_piece(StepResult& result) {
+    invalidate_placement_cache();
     auto cells = piece_cells(state_.active.piece, state_.active.rotation);
     auto pid = static_cast<std::int8_t>(piece_index(state_.active.piece));
     for (const auto& cell : cells) {

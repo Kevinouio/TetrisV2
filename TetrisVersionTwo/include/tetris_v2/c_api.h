@@ -68,6 +68,19 @@ size_t tetris_cc_env_placement_board_write(
     const tetris_cc_env_handle* handle, size_t index, uint8_t* out, size_t out_len);
 size_t tetris_cc_env_placement_board_piece_ids_write(
     const tetris_cc_env_handle* handle, size_t index, uint8_t* out, size_t out_len);
+size_t tetris_cc_env_candidate_count(const tetris_cc_env_handle* handle);
+int tetris_cc_env_candidate_get(
+    const tetris_cc_env_handle* handle,
+    size_t index,
+    int* use_hold,
+    size_t* placement_index,
+    int* piece,
+    int* rotation,
+    int* x,
+    int* y,
+    int* lines_cleared);
+size_t tetris_cc_env_candidate_features_write(
+    const tetris_cc_env_handle* handle, float* out, size_t out_len);
 int tetris_cc_env_apply_placement_index(
     tetris_cc_env_handle* handle, size_t index, float* reward_out, int* lines_cleared_out, int* game_over_out);
 int tetris_cc_env_last_clear_meta(

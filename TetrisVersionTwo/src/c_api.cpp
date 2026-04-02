@@ -4,6 +4,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <new>
 #include <optional>
 #include <vector>
@@ -15,7 +17,23 @@
 
 struct tetris_cc_env_handle {
     explicit tetris_cc_env_handle(std::uint32_t seed) : env(tetris_v2::EnvConfig{seed}) {}
+
+    struct CandidateCacheEntry {
+        int use_hold{0};
+        std::size_t placement_index{0};
+        int piece{static_cast<int>(tetris_v2::Piece::None)};
+        int rotation{0};
+        int x{0};
+        int y{0};
+        int lines_cleared{0};
+    };
+
     tetris_v2::cc::Env env;
+    std::uint64_t mutation_epoch{1};
+    mutable std::uint64_t candidate_cache_epoch{0};
+    mutable bool candidate_cache_valid{false};
+    mutable std::vector<CandidateCacheEntry> candidate_cache{};
+    mutable std::vector<float> candidate_features_cache{};
 };
 
 struct tetris_cc_bot_handle {
@@ -27,6 +45,8 @@ struct tetris_cc_snapshot_handle {
 };
 
 namespace {
+
+constexpr std::size_t kCandidateFeatureDim = 6;
 
 tetris_v2::Action parse_action(int action) {
     if (action < static_cast<int>(tetris_v2::Action::None) ||
@@ -105,6 +125,138 @@ void maybe_set_double(double* dst, double value) {
     }
 }
 
+void mark_env_mutated(tetris_cc_env_handle* handle) {
+    if (!handle) {
+        return;
+    }
+    if (handle->mutation_epoch == std::numeric_limits<std::uint64_t>::max()) {
+        handle->mutation_epoch = 1;
+    } else {
+        ++handle->mutation_epoch;
+    }
+    handle->candidate_cache_valid = false;
+}
+
+bool active_piece_supported(const tetris_v2::EnvState& state) {
+    auto piece = static_cast<int>(state.active.piece);
+    return piece >= 0 && piece <= 6;
+}
+
+void append_candidate_features(
+    const tetris_v2::Board& board_after_lock,
+    int y_pos,
+    int lines_removed,
+    std::vector<float>& out) {
+    std::array<int, tetris_v2::Board::kWidth> cols{};
+    int holes = 0;
+    int bumpiness = 0;
+
+    for (int c = 0; c < tetris_v2::Board::kWidth; ++c) {
+        bool block_seen = false;
+        for (int r = 0; r < tetris_v2::Board::kVisibleRows; ++r) {
+            const int y = (tetris_v2::Board::kVisibleRows - 1) - r;
+            const bool filled = board_after_lock.occupied(c, y);
+            if (filled && !block_seen) {
+                block_seen = true;
+                cols[static_cast<std::size_t>(c)] = tetris_v2::Board::kVisibleRows - r;
+            }
+            if (!filled && block_seen) {
+                ++holes;
+            }
+        }
+        if (c > 0) {
+            bumpiness += std::abs(
+                cols[static_cast<std::size_t>(c)] - cols[static_cast<std::size_t>(c - 1)]);
+        }
+    }
+
+    int total_height = 0;
+    for (int v : cols) {
+        total_height += v;
+    }
+
+    int pillar = 0;
+    for (int i = 1; i < tetris_v2::Board::kWidth - 1; ++i) {
+        if ((cols[static_cast<std::size_t>(i - 1)] - cols[static_cast<std::size_t>(i)] >= 3) &&
+            (cols[static_cast<std::size_t>(i + 1)] - cols[static_cast<std::size_t>(i)] >= 3)) {
+            pillar = 1;
+            break;
+        }
+    }
+    if (pillar == 0) {
+        if ((cols[1] - cols[0] >= 3) ||
+            (cols[tetris_v2::Board::kWidth - 2] - cols[tetris_v2::Board::kWidth - 1] >= 3)) {
+            pillar = 1;
+        }
+    }
+
+    out.push_back(static_cast<float>(total_height));
+    out.push_back(static_cast<float>(bumpiness));
+    out.push_back(static_cast<float>(lines_removed));
+    out.push_back(static_cast<float>(holes));
+    out.push_back(static_cast<float>(y_pos));
+    out.push_back(static_cast<float>(pillar));
+}
+
+void append_candidate_branch(tetris_cc_env_handle* handle, bool use_hold) {
+    const auto& state = handle->env.state();
+    if (state.game_over || !active_piece_supported(state)) {
+        return;
+    }
+
+    const int piece = static_cast<int>(state.active.piece);
+    auto placements = handle->env.enumerate_active_piece_placements();
+    handle->candidate_cache.reserve(handle->candidate_cache.size() + placements.size());
+    handle->candidate_features_cache.reserve(
+        handle->candidate_features_cache.size() + placements.size() * kCandidateFeatureDim);
+    for (std::size_t idx = 0; idx < placements.size(); ++idx) {
+        const auto& option = placements[idx];
+        tetris_cc_env_handle::CandidateCacheEntry row{};
+        row.use_hold = use_hold ? 1 : 0;
+        row.placement_index = idx;
+        row.piece = piece;
+        row.rotation = static_cast<int>(option.placement.rotation);
+        row.x = option.placement.x;
+        row.y = option.placement.y;
+        row.lines_cleared = option.lines_cleared;
+        handle->candidate_cache.push_back(row);
+        append_candidate_features(
+            option.board_after_lock,
+            option.placement.y,
+            option.lines_cleared,
+            handle->candidate_features_cache);
+    }
+}
+
+void ensure_candidate_cache(const tetris_cc_env_handle* handle) {
+    if (!handle) {
+        return;
+    }
+    auto* mutable_handle = const_cast<tetris_cc_env_handle*>(handle);
+    if (mutable_handle->candidate_cache_valid &&
+        mutable_handle->candidate_cache_epoch == mutable_handle->mutation_epoch) {
+        return;
+    }
+
+    mutable_handle->candidate_cache.clear();
+    mutable_handle->candidate_features_cache.clear();
+
+    const auto snapshot = mutable_handle->env.snapshot();
+    append_candidate_branch(mutable_handle, false);
+
+    const auto hold_available = mutable_handle->env.state().hold_available;
+    if (hold_available) {
+        auto hold_result = mutable_handle->env.step(tetris_v2::Action::Hold);
+        if (hold_result.action_succeeded) {
+            append_candidate_branch(mutable_handle, true);
+        }
+        mutable_handle->env.restore(snapshot);
+    }
+
+    mutable_handle->candidate_cache_epoch = mutable_handle->mutation_epoch;
+    mutable_handle->candidate_cache_valid = true;
+}
+
 }  // namespace
 
 extern "C" {
@@ -124,6 +276,7 @@ void tetris_cc_env_reset(tetris_cc_env_handle* handle, uint32_t seed) {
         return;
     }
     handle->env.reset(seed);
+    mark_env_mutated(handle);
 }
 
 int tetris_cc_env_step(tetris_cc_env_handle* handle, int action, float* reward_out) {
@@ -131,6 +284,7 @@ int tetris_cc_env_step(tetris_cc_env_handle* handle, int action, float* reward_o
         return 1;
     }
     auto result = handle->env.step(parse_action(action));
+    mark_env_mutated(handle);
     if (reward_out) {
         *reward_out = result.reward;
     }
@@ -142,6 +296,9 @@ int tetris_cc_env_hold(tetris_cc_env_handle* handle, float* reward_out) {
         return 0;
     }
     auto result = handle->env.step(tetris_v2::Action::Hold);
+    if (result.action_succeeded) {
+        mark_env_mutated(handle);
+    }
     if (reward_out) {
         *reward_out = result.reward;
     }
@@ -168,6 +325,7 @@ int tetris_cc_env_restore_snapshot(tetris_cc_env_handle* handle, const tetris_cc
         return 0;
     }
     handle->env.restore(snapshot->snapshot);
+    mark_env_mutated(handle);
     return 1;
 }
 
@@ -256,6 +414,7 @@ int tetris_cc_env_set_visible_board_mask(
     }
 
     handle->env.restore(state);
+    mark_env_mutated(handle);
     return 1;
 }
 
@@ -404,6 +563,58 @@ size_t tetris_cc_env_placement_board_piece_ids_write(
     return n;
 }
 
+size_t tetris_cc_env_candidate_count(const tetris_cc_env_handle* handle) {
+    if (!handle) {
+        return 0;
+    }
+    ensure_candidate_cache(handle);
+    return handle->candidate_cache.size();
+}
+
+int tetris_cc_env_candidate_get(
+    const tetris_cc_env_handle* handle,
+    size_t index,
+    int* use_hold,
+    size_t* placement_index,
+    int* piece,
+    int* rotation,
+    int* x,
+    int* y,
+    int* lines_cleared) {
+    if (!handle) {
+        return 0;
+    }
+    ensure_candidate_cache(handle);
+    if (index >= handle->candidate_cache.size()) {
+        return 0;
+    }
+    const auto& row = handle->candidate_cache[index];
+    maybe_set_int(use_hold, row.use_hold);
+    if (placement_index) {
+        *placement_index = row.placement_index;
+    }
+    maybe_set_int(piece, row.piece);
+    maybe_set_int(rotation, row.rotation);
+    maybe_set_int(x, row.x);
+    maybe_set_int(y, row.y);
+    maybe_set_int(lines_cleared, row.lines_cleared);
+    return 1;
+}
+
+size_t tetris_cc_env_candidate_features_write(
+    const tetris_cc_env_handle* handle, float* out, size_t out_len) {
+    if (!handle || !out) {
+        return 0;
+    }
+    ensure_candidate_cache(handle);
+    auto n = std::min(out_len, handle->candidate_features_cache.size());
+    std::copy(
+        handle->candidate_features_cache.begin(),
+        handle->candidate_features_cache.begin() + static_cast<std::ptrdiff_t>(n),
+        out);
+    return n;
+}
+
 int tetris_cc_env_apply_placement_index(
     tetris_cc_env_handle* handle, size_t index, float* reward_out, int* lines_cleared_out, int* game_over_out) {
     if (!handle) {
@@ -413,6 +624,7 @@ int tetris_cc_env_apply_placement_index(
     if (!result.action_succeeded) {
         return 0;
     }
+    mark_env_mutated(handle);
     if (reward_out) {
         *reward_out = result.reward;
     }
@@ -616,6 +828,7 @@ int tetris_cc_bot_apply_choice(
     if (!bot->bot.apply_last_choice(env->env, &result, &used_hold, &placement_index)) {
         return 0;
     }
+    mark_env_mutated(env);
 
     if (reward_out) {
         *reward_out = result.reward;
@@ -662,6 +875,7 @@ int tetris_cc_bot_choose_and_apply(
             &placement_index)) {
         return 0;
     }
+    mark_env_mutated(env);
 
     if (reward_out) {
         *reward_out = result.reward;

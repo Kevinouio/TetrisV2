@@ -52,6 +52,56 @@ std::vector<std::uint8_t> board_from_cpp_state(const EnvState& state, bool inclu
     return out;
 }
 
+std::array<float, 6> features_from_visible_board(
+    const std::vector<std::uint8_t>& board_after,
+    int y_pos,
+    int lines_removed) {
+    assert(board_after.size() == 200);
+    std::array<int, 10> cols{};
+    int holes = 0;
+    int bumpiness = 0;
+    for (int c = 0; c < 10; ++c) {
+        bool block_seen = false;
+        for (int r = 0; r < 20; ++r) {
+            auto v = board_after[static_cast<std::size_t>(r * 10 + c)];
+            if (v > 0 && !block_seen) {
+                block_seen = true;
+                cols[static_cast<std::size_t>(c)] = 20 - r;
+            }
+            if (v == 0 && block_seen) {
+                ++holes;
+            }
+        }
+        if (c > 0) {
+            bumpiness += std::abs(
+                cols[static_cast<std::size_t>(c)] - cols[static_cast<std::size_t>(c - 1)]);
+        }
+    }
+    int total_height = 0;
+    for (int v : cols) {
+        total_height += v;
+    }
+    int pillar = 0;
+    for (int i = 1; i < 9; ++i) {
+        if ((cols[static_cast<std::size_t>(i - 1)] - cols[static_cast<std::size_t>(i)] >= 3) &&
+            (cols[static_cast<std::size_t>(i + 1)] - cols[static_cast<std::size_t>(i)] >= 3)) {
+            pillar = 1;
+            break;
+        }
+    }
+    if (pillar == 0 && ((cols[1] - cols[0] >= 3) || (cols[8] - cols[9] >= 3))) {
+        pillar = 1;
+    }
+    return std::array<float, 6>{
+        static_cast<float>(total_height),
+        static_cast<float>(bumpiness),
+        static_cast<float>(lines_removed),
+        static_cast<float>(holes),
+        static_cast<float>(y_pos),
+        static_cast<float>(pillar),
+    };
+}
+
 void test_cc_smoke_and_state_exports() {
     auto* env = tetris_cc_env_create(1337);
     assert(env != nullptr);
@@ -218,6 +268,73 @@ void test_cc_snapshot_restore_keeps_future_deterministic() {
     tetris_cc_env_destroy(env_b);
 }
 
+void test_cc_candidate_batch_api_matches_placement_api() {
+    auto* env = tetris_cc_env_create(4242);
+    assert(env != nullptr);
+
+    const auto candidate_count = tetris_cc_env_candidate_count(env);
+    const auto feature_count = candidate_count * 6;
+    std::vector<float> features(feature_count, 0.0f);
+    auto feature_written = tetris_cc_env_candidate_features_write(env, features.data(), features.size());
+    assert(feature_written == feature_count);
+
+    for (std::size_t i = 0; i < candidate_count; ++i) {
+        int use_hold = 0;
+        std::size_t placement_index = 0;
+        int piece = -1;
+        int rotation = 0;
+        int x = 0;
+        int y = 0;
+        int lines = 0;
+        assert(
+            tetris_cc_env_candidate_get(
+                env,
+                i,
+                &use_hold,
+                &placement_index,
+                &piece,
+                &rotation,
+                &x,
+                &y,
+                &lines) == 1);
+        assert(use_hold == 0 || use_hold == 1);
+        assert(piece >= 0 && piece <= 6);
+        assert(rotation >= 0 && rotation <= 3);
+        assert(lines >= 0 && lines <= 4);
+
+        if (use_hold == 0) {
+            int px = 0;
+            int py = 0;
+            int prot = 0;
+            int plines = 0;
+            assert(
+                tetris_cc_env_placement_get(
+                    env,
+                    placement_index,
+                    &px,
+                    &py,
+                    &prot,
+                    &plines) == 1);
+            assert(px == x);
+            assert(py == y);
+            assert(prot == rotation);
+            assert(plines == lines);
+
+            std::vector<std::uint8_t> board_after(200, 0);
+            auto wrote = tetris_cc_env_placement_board_write(
+                env, placement_index, board_after.data(), board_after.size());
+            assert(wrote == board_after.size());
+            auto expected = features_from_visible_board(board_after, y, lines);
+            for (std::size_t j = 0; j < expected.size(); ++j) {
+                auto got = features[static_cast<std::size_t>(i * 6 + j)];
+                assert(std::fabs(got - expected[j]) <= 1e-4f);
+            }
+        }
+    }
+
+    tetris_cc_env_destroy(env);
+}
+
 void test_cc_rotation_trace_disables_rotate180() {
     auto* env = tetris_cc_env_create(99);
     assert(env != nullptr);
@@ -364,6 +481,7 @@ int main() {
     test_cc_smoke_and_state_exports();
     test_cc_matches_cpp_env_for_basic_state();
     test_cc_snapshot_restore_keeps_future_deterministic();
+    test_cc_candidate_batch_api_matches_placement_api();
     test_cc_rotation_trace_disables_rotate180();
     test_cc_bot_null_safety();
     test_cc_bot_loop_and_budget_scaling();

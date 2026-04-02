@@ -2,12 +2,12 @@
 
 #include <cstddef>
 #include <array>
-#include <cstdint>
 #include <deque>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstdint>
 
 #include "tetris_v2/board.hpp"
 #include "tetris_v2/randomizer.hpp"
@@ -117,6 +117,9 @@ public:
     std::string render_ascii(int visible_rows = Board::kVisibleRows) const;
 
 private:
+    void invalidate_placement_cache() const;
+    const std::vector<PlacementOption>& placement_options_cached() const;
+    std::vector<PlacementOption> build_placement_options_uncached() const;
     void ensure_queue(std::size_t minimum);
     void spawn_next_piece(bool reset_hold_availability);
     bool collides(const ActivePiece& piece) const;
@@ -136,6 +139,10 @@ private:
     EnvConfig config_;
     SevenBagRandomizer randomizer_;
     EnvState state_{};
+    mutable std::vector<PlacementOption> placement_cache_{};
+    mutable bool placement_cache_valid_{false};
+    mutable std::uint64_t placement_cache_epoch_{0};
+    mutable std::uint64_t placement_cache_built_epoch_{0};
 };
 
 }  // namespace tetris_v2
