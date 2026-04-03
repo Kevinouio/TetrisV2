@@ -372,6 +372,27 @@ size_t tetris_cc_env_board_piece_ids_write(
     return n;
 }
 
+size_t tetris_cc_env_visible_garbage_count(const tetris_cc_env_handle* handle) {
+    if (!handle) {
+        return 0;
+    }
+    constexpr int kRows = tetris_v2::Board::kVisibleRows;
+    constexpr int kCols = tetris_v2::Board::kWidth;
+    std::size_t count = 0;
+    const auto& state = handle->env.state();
+    for (int y = 0; y < kRows; ++y) {
+        for (int x = 0; x < kCols; ++x) {
+            if (!state.board.occupied(x, y)) {
+                continue;
+            }
+            if (state.piece_ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] == -1) {
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
 int tetris_cc_env_set_visible_board_mask(
     tetris_cc_env_handle* handle, const uint8_t* cells, size_t cells_len, int reset_meta) {
     if (!handle || !cells) {

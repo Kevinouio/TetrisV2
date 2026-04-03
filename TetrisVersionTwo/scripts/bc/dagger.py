@@ -128,6 +128,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collect_workers", type=int, default=1)
     parser.add_argument("--worker_chunksize", type=int, default=1)
     parser.add_argument(
+        "--worker_maxtasksperchild",
+        type=int,
+        default=64,
+        help="Recycle worker processes after this many tasks (0 disables recycling).",
+    )
+    parser.add_argument(
         "--progress_mode",
         type=str,
         choices=("console", "json", "both"),
@@ -165,6 +171,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--collect_workers must be >= 1.")
     if int(args.worker_chunksize) <= 0:
         raise ValueError("--worker_chunksize must be >= 1.")
+    if int(args.worker_maxtasksperchild) < 0:
+        raise ValueError("--worker_maxtasksperchild must be >= 0.")
     if float(args.progress_every_sec) <= 0.0:
         raise ValueError("--progress_every_sec must be > 0.")
     if int(args.random_fill_y_max_exclusive) < 0 or int(args.random_fill_y_max_exclusive) > 20:
@@ -261,6 +269,66 @@ def _normalize_tuple(raw: Sequence[int]) -> ActionTuple:
     if len(values) != 5:
         raise ValueError(f"Expected action tuple length 5, got {values}.")
     return (values[0], values[1], values[2], values[3], values[4])
+
+
+def _pack_dagger_rows_for_ipc(rows: List[Dict[str, object]]) -> Dict[str, object]:
+    if not rows:
+        return {"n": 0}
+    return {
+        "n": int(len(rows)),
+        "board": np.stack([r["board"] for r in rows], axis=0).astype(np.float32, copy=False),
+        "piece": np.stack([r["piece"] for r in rows], axis=0).astype(np.float32, copy=False),
+        "hold": np.stack([r["hold"] for r in rows], axis=0).astype(np.float32, copy=False),
+        "queue": np.stack([r["queue"] for r in rows], axis=0).astype(np.float32, copy=False),
+        "scalars": np.stack([r["scalars"] for r in rows], axis=0).astype(np.float32, copy=False),
+        "expert_action_tuple": np.asarray([r["expert_action_tuple"] for r in rows], dtype=np.int64),
+        "learner_action_tuple": np.asarray([r["learner_action_tuple"] for r in rows], dtype=np.int64),
+        "episode_id": np.asarray([r["episode_id"] for r in rows], dtype=np.int64),
+        "step_idx": np.asarray([r["step_idx"] for r in rows], dtype=np.int64),
+        "round_id": np.asarray([r["round_id"] for r in rows], dtype=np.int64),
+        "acted_by_expert": np.asarray([r["acted_by_expert"] for r in rows], dtype=np.uint8),
+        "learner_raw_invalid": np.asarray([r["learner_raw_invalid"] for r in rows], dtype=np.uint8),
+        "learner_used_fallback": np.asarray([r["learner_used_fallback"] for r in rows], dtype=np.uint8),
+    }
+
+
+def _unpack_dagger_rows_from_ipc(payload: Dict[str, object]) -> List[Dict[str, object]]:
+    n = int(payload.get("n", 0))
+    if n <= 0:
+        return []
+    board = np.asarray(payload["board"], dtype=np.float32)
+    piece = np.asarray(payload["piece"], dtype=np.float32)
+    hold = np.asarray(payload["hold"], dtype=np.float32)
+    queue = np.asarray(payload["queue"], dtype=np.float32)
+    scalars = np.asarray(payload["scalars"], dtype=np.float32)
+    expert_action_tuple = np.asarray(payload["expert_action_tuple"], dtype=np.int64)
+    learner_action_tuple = np.asarray(payload["learner_action_tuple"], dtype=np.int64)
+    episode_id = np.asarray(payload["episode_id"], dtype=np.int64)
+    step_idx = np.asarray(payload["step_idx"], dtype=np.int64)
+    round_id = np.asarray(payload["round_id"], dtype=np.int64)
+    acted_by_expert = np.asarray(payload["acted_by_expert"], dtype=np.uint8)
+    learner_raw_invalid = np.asarray(payload["learner_raw_invalid"], dtype=np.uint8)
+    learner_used_fallback = np.asarray(payload["learner_used_fallback"], dtype=np.uint8)
+    out: List[Dict[str, object]] = []
+    for i in range(n):
+        out.append(
+            {
+                "board": board[i],
+                "piece": piece[i],
+                "hold": hold[i],
+                "queue": queue[i],
+                "scalars": scalars[i],
+                "expert_action_tuple": expert_action_tuple[i],
+                "learner_action_tuple": learner_action_tuple[i],
+                "episode_id": int(episode_id[i]),
+                "step_idx": int(step_idx[i]),
+                "round_id": int(round_id[i]),
+                "acted_by_expert": int(acted_by_expert[i]),
+                "learner_raw_invalid": int(learner_raw_invalid[i]),
+                "learner_used_fallback": int(learner_used_fallback[i]),
+            }
+        )
+    return out
 
 
 def _write_progress_json(path: Path, payload: Dict[str, object]) -> None:
@@ -392,12 +460,9 @@ def _collect_episode_with_env(
     episodes_no_data_after_resamples = 0
 
     def count_injected_garbage_cells() -> int:
-        board = env.board_occupancy()
-        piece_ids = env.board_piece_ids(include_active=False)
-        injected = np.logical_and(board != 0, piece_ids == np.uint8(255))
-        return int(np.count_nonzero(injected))
+        return int(env.visible_garbage_count())
 
-    def try_collect_one(state_step_idx: int, mix_rng: np.random.Generator) -> bool:
+    def try_collect_one(state_step_idx: int, mix_rng: np.random.Generator) -> Optional[bool]:
         nonlocal skipped_no_legal
         nonlocal skipped_invalid_expert
         nonlocal skipped_missing_tuple
@@ -410,12 +475,12 @@ def _collect_episode_with_env(
 
         state = env.get_state()
         if bool(state["game_over"]):
-            return False
+            return None
 
         legal_actions = env.enumerate_legal_actions()
         if not legal_actions:
             skipped_no_legal += 1
-            return False
+            return None
 
         legal_by_native = {native.key(): tup for native, tup in legal_actions}
         legal_tuples = set(tup for _, tup in legal_actions)
@@ -423,7 +488,7 @@ def _collect_episode_with_env(
         expert = env.expert_choose(think_ms=think_ms)
         if not bool(expert["success"]):
             skipped_invalid_expert += 1
-            return False
+            return None
 
         expert_native = NativeAction(
             use_hold=bool(expert["used_hold"]),
@@ -432,25 +497,36 @@ def _collect_episode_with_env(
         expert_tuple = legal_by_native.get(expert_native.key())
         if expert_tuple is None:
             skipped_missing_tuple += 1
-            return False
+            return None
         if expert_tuple not in legal_tuples:
             label_illegal_count += 1
             raise AssertionError("Expert label is not legal in learner-visited state.")
 
-        learner_native, learner_diag = learner.predict_action_with_diagnostics(
-            state,
-            legal_actions=legal_actions,
-        )
-        learner_tuple = legal_by_native.get(learner_native.key())
-        invalid_learner_raw += int(bool(learner_diag["raw_argmax_invalid"]))
-        unseen_learner_fallback += int(bool(learner_diag["used_fallback_unseen_legal"]))
-
         acted_by_expert = bool(mix_rng.random() < float(beta))
-        executed_native = expert_native if acted_by_expert else learner_native
+        learner_diag = {
+            "raw_argmax_invalid": False,
+            "used_fallback_unseen_legal": False,
+        }
+        learner_tuple: Optional[ActionTuple] = None
+
+        if acted_by_expert:
+            executed_native = expert_native
+            expert_steps += 1
+        else:
+            learner_native, learner_diag = learner.predict_action_with_diagnostics(
+                state,
+                legal_actions=legal_actions,
+            )
+            learner_tuple = legal_by_native.get(learner_native.key())
+            invalid_learner_raw += int(bool(learner_diag["raw_argmax_invalid"]))
+            unseen_learner_fallback += int(bool(learner_diag["used_fallback_unseen_legal"]))
+            executed_native = learner_native
+            learner_steps += 1
+
         step_result = env.step_native_action(executed_native)
         if not bool(step_result["success"]):
             failed_steps += 1
-            return False
+            return None
 
         encoded = encode_state(state, encoder_config)
         rows.append(
@@ -472,12 +548,7 @@ def _collect_episode_with_env(
                 "learner_used_fallback": int(bool(learner_diag["used_fallback_unseen_legal"])),
             }
         )
-
-        if acted_by_expert:
-            expert_steps += 1
-        else:
-            learner_steps += 1
-        return True
+        return bool(step_result["game_over"])
 
     mode = str(state_source).strip().lower()
     if mode == "random_board":
@@ -504,7 +575,7 @@ def _collect_episode_with_env(
             if not env.set_visible_board_mask(mask, reset_meta=True):
                 raise RuntimeError("Failed to set randomized visible board mask via C API.")
 
-            if bool(env.get_state()["game_over"]):
+            if bool(env.meta()["game_over"]):
                 resampled_samples += 1
                 continue
 
@@ -518,8 +589,8 @@ def _collect_episode_with_env(
             cleared_during_attempt = False
             post_clear_done = 0
             for step_idx in range(int(max_steps_per_episode)):
-                collected = try_collect_one(state_step_idx=step_idx, mix_rng=mix_rng)
-                if not collected:
+                step_game_over = try_collect_one(state_step_idx=step_idx, mix_rng=mix_rng)
+                if step_game_over is None:
                     attempt_terminated = True
                     if attempt_transitions > 0:
                         if not cleared_during_attempt:
@@ -541,8 +612,7 @@ def _collect_episode_with_env(
                         attempt_terminated = True
                         break
 
-                state_now = env.get_state()
-                if bool(state_now["game_over"]):
+                if bool(step_game_over):
                     if not cleared_during_attempt:
                         episodes_topout_before_clear += 1
                     accepted = True
@@ -572,11 +642,10 @@ def _collect_episode_with_env(
     else:
         mix_rng = np.random.default_rng(_mix_seed(base_seed, round_id, episode_id))
         for step_idx in range(int(max_steps_per_episode)):
-            collected = try_collect_one(state_step_idx=step_idx, mix_rng=mix_rng)
-            if not collected:
+            step_game_over = try_collect_one(state_step_idx=step_idx, mix_rng=mix_rng)
+            if step_game_over is None:
                 break
-            state_now = env.get_state()
-            if bool(state_now["game_over"]):
+            if bool(step_game_over):
                 break
 
     return {
@@ -604,7 +673,7 @@ def _collect_episode_with_env(
 def _collect_episode_worker(episode_id: int) -> Dict[str, object]:
     if _WORKER_ENV is None or _WORKER_AGENT is None or _WORKER_ENCODER_CFG is None:
         raise RuntimeError("DAgger worker state was not initialized.")
-    return _collect_episode_with_env(
+    result = _collect_episode_with_env(
         env=_WORKER_ENV,
         learner=_WORKER_AGENT,
         encoder_config=_WORKER_ENCODER_CFG,
@@ -620,6 +689,8 @@ def _collect_episode_worker(episode_id: int) -> Dict[str, object]:
         random_max_resamples_per_sample=int(_WORKER_RANDOM_MAX_RESAMPLES_PER_SAMPLE),
         random_post_clear_steps=int(_WORKER_RANDOM_POST_CLEAR_STEPS),
     )
+    result["records_packed"] = _pack_dagger_rows_for_ipc(result.pop("records"))
+    return result
 
 
 def _beta_for_round(args: argparse.Namespace, round_id: int) -> float:
@@ -760,6 +831,7 @@ def _collect_dagger_round(
     log_every: int,
     collect_workers: int,
     worker_chunksize: int,
+    worker_maxtasksperchild: int,
     progress_mode: str,
     progress_every_sec: float,
     progress_path: Path,
@@ -778,6 +850,15 @@ def _collect_dagger_round(
     progress_mode = str(progress_mode).strip().lower()
     progress_console = progress_mode in ("console", "both")
     progress_json = progress_mode in ("json", "both")
+    # Collection-time learner inference is intentionally CPU-first.
+    # Multi-process CUDA inference can be unstable and rarely helps throughput here.
+    collect_device = "cpu" if device is None else str(device)
+    if int(collect_workers) > 1 and collect_device.lower() != "cpu":
+        print(
+            "[dagger] warning: parallel collection with non-CPU device can be unstable; "
+            "forcing CPU for collection workers."
+        )
+        collect_device = "cpu"
 
     episode_ids = [int(round_id * 1_000_000 + ep) for ep in range(int(episodes_per_round))]
     episode_records: Dict[int, List[Dict[str, object]]] = {}
@@ -854,6 +935,8 @@ def _collect_dagger_round(
             "episodes_no_data_after_resamples": int(episodes_no_data_after_resamples),
             "collect_workers": int(collect_workers),
             "worker_chunksize": int(worker_chunksize),
+            "worker_maxtasksperchild": int(worker_maxtasksperchild),
+            "collect_device": str(collect_device),
             "progress_mode": progress_mode,
             "progress_path": str(progress_path).replace("\\", "/"),
             "stop_file": str(stop_file).replace("\\", "/"),
@@ -907,7 +990,13 @@ def _collect_dagger_round(
         nonlocal episodes_no_data_after_resamples
 
         episode_id = int(result["episode_id"])
-        records = result["records"]
+        records_obj = result.get("records")
+        if records_obj is None and "records_packed" in result:
+            records = _unpack_dagger_rows_from_ipc(result["records_packed"])  # type: ignore[arg-type]
+        elif isinstance(records_obj, list):
+            records = records_obj
+        else:
+            raise ValueError(f"Expected list records or packed records for episode {episode_id}.")
         if not isinstance(records, list):
             raise ValueError(f"Expected list of records for episode {episode_id}.")
         episode_records[episode_id] = records
@@ -948,7 +1037,7 @@ def _collect_dagger_round(
             with BCEnvAdapter(lib_path=lib_path, seed=seed + round_id) as env:
                 learner = BCAgent(
                     checkpoint_path=learner_checkpoint,
-                    device=device,
+                    device=collect_device,
                     env_adapter=env,
                 )
                 for episode_id in episode_ids:
@@ -982,7 +1071,7 @@ def _collect_dagger_round(
                 initargs=(
                     str(lib_path),
                     str(learner_checkpoint),
-                    device,
+                    collect_device,
                     {
                         "board_height": int(encoder_config.board_height),
                         "board_width": int(encoder_config.board_width),
@@ -999,6 +1088,11 @@ def _collect_dagger_round(
                     float(random_fill_prob),
                     int(random_max_resamples_per_sample),
                     int(random_post_clear_steps),
+                ),
+                maxtasksperchild=(
+                    int(worker_maxtasksperchild)
+                    if int(worker_maxtasksperchild) > 0
+                    else None
                 ),
             )
             try:
@@ -1091,6 +1185,8 @@ def _collect_dagger_round(
         "vocab_new_labels_seen": int(vocab_end - vocab_start),
         "collect_workers": int(collect_workers),
         "worker_chunksize": int(worker_chunksize),
+        "worker_maxtasksperchild": int(worker_maxtasksperchild),
+        "collect_device": str(collect_device),
         "progress_mode": progress_mode,
         "progress_path": str(progress_path).replace("\\", "/"),
         "stop_file": str(stop_file).replace("\\", "/"),
@@ -1324,6 +1420,7 @@ def main() -> int:
             "max_train_transitions": int(args.max_train_transitions),
             "collect_workers": int(args.collect_workers),
             "worker_chunksize": int(args.worker_chunksize),
+            "worker_maxtasksperchild": int(args.worker_maxtasksperchild),
             "progress_mode": str(args.progress_mode),
             "progress_every_sec": float(args.progress_every_sec),
             "progress_path": str(args.progress_path) if args.progress_path is not None else None,
@@ -1383,6 +1480,7 @@ def main() -> int:
             log_every=int(args.log_every),
             collect_workers=int(args.collect_workers),
             worker_chunksize=int(args.worker_chunksize),
+            worker_maxtasksperchild=int(args.worker_maxtasksperchild),
             progress_mode=str(args.progress_mode),
             progress_every_sec=float(args.progress_every_sec),
             progress_path=round_progress_path,

@@ -222,6 +222,12 @@ class BCEnvAdapter:
             ctypes.c_size_t,
         ]
         self.lib.tetris_cc_env_board_piece_ids_write.restype = ctypes.c_size_t
+        self._has_visible_garbage_count = hasattr(
+            self.lib, "tetris_cc_env_visible_garbage_count"
+        )
+        if self._has_visible_garbage_count:
+            self.lib.tetris_cc_env_visible_garbage_count.argtypes = [void_p]
+            self.lib.tetris_cc_env_visible_garbage_count.restype = ctypes.c_size_t
         self._has_set_visible_board_mask = hasattr(
             self.lib, "tetris_cc_env_set_visible_board_mask"
         )
@@ -248,6 +254,28 @@ class BCEnvAdapter:
         self.lib.tetris_cc_env_placement_count.restype = ctypes.c_size_t
         self.lib.tetris_cc_env_placement_get.argtypes = [void_p, ctypes.c_size_t, int_p, int_p, int_p, int_p]
         self.lib.tetris_cc_env_placement_get.restype = ctypes.c_int
+        self._has_candidate_api = all(
+            hasattr(self.lib, name)
+            for name in (
+                "tetris_cc_env_candidate_count",
+                "tetris_cc_env_candidate_get",
+            )
+        )
+        if self._has_candidate_api:
+            self.lib.tetris_cc_env_candidate_count.argtypes = [void_p]
+            self.lib.tetris_cc_env_candidate_count.restype = ctypes.c_size_t
+            self.lib.tetris_cc_env_candidate_get.argtypes = [
+                void_p,
+                ctypes.c_size_t,
+                int_p,
+                size_t_p,
+                int_p,
+                int_p,
+                int_p,
+                int_p,
+                int_p,
+            ]
+            self.lib.tetris_cc_env_candidate_get.restype = ctypes.c_int
         self.lib.tetris_cc_env_apply_placement_index.argtypes = [
             void_p,
             ctypes.c_size_t,
@@ -366,6 +394,14 @@ class BCEnvAdapter:
             raise RuntimeError("Failed to read board piece ids from C API.")
         flat = np.frombuffer(buf, dtype=np.uint8, count=len(buf))
         return flat.reshape(self.BOARD_ROWS, self.BOARD_COLS)
+
+    def visible_garbage_count(self) -> int:
+        if self._has_visible_garbage_count:
+            return int(self.lib.tetris_cc_env_visible_garbage_count(self.handle))
+        board = self.board_occupancy()
+        piece_ids = self.board_piece_ids(include_active=False)
+        injected = np.logical_and(board != 0, piece_ids == np.uint8(255))
+        return int(np.count_nonzero(injected))
 
     def set_visible_board_mask(self, mask: np.ndarray, reset_meta: bool = True) -> bool:
         if not self._has_set_visible_board_mask:
@@ -522,10 +558,53 @@ class BCEnvAdapter:
             out.append((native_action, tuple_action))
         return out
 
+    def _enumerate_legal_actions_via_candidates(self) -> List[Tuple[NativeAction, ActionTuple]]:
+        count = int(self.lib.tetris_cc_env_candidate_count(self.handle))
+        out: List[Tuple[NativeAction, ActionTuple]] = []
+        for idx in range(count):
+            use_hold = ctypes.c_int(0)
+            placement_index = ctypes.c_size_t(0)
+            piece = ctypes.c_int(-1)
+            rotation = ctypes.c_int(0)
+            x = ctypes.c_int(0)
+            y = ctypes.c_int(0)
+            lines = ctypes.c_int(0)
+            ok = self.lib.tetris_cc_env_candidate_get(
+                self.handle,
+                ctypes.c_size_t(idx),
+                ctypes.byref(use_hold),
+                ctypes.byref(placement_index),
+                ctypes.byref(piece),
+                ctypes.byref(rotation),
+                ctypes.byref(x),
+                ctypes.byref(y),
+                ctypes.byref(lines),
+            )
+            if not ok:
+                continue
+            piece_id = int(piece.value)
+            if not (0 <= piece_id <= 6):
+                continue
+            native_action = NativeAction(
+                use_hold=bool(use_hold.value),
+                placement_index=int(placement_index.value),
+            )
+            tuple_action = canonical_action_tuple(
+                use_hold=bool(use_hold.value),
+                piece=piece_id,
+                rotation=int(rotation.value),
+                x=int(x.value),
+                y=int(y.value),
+            )
+            out.append((native_action, tuple_action))
+        return out
+
     def enumerate_legal_actions(self) -> List[Tuple[NativeAction, ActionTuple]]:
         meta = self.meta()
         if bool(meta["game_over"]):
             return []
+        if self._has_candidate_api:
+            return self._enumerate_legal_actions_via_candidates()
 
         snapshot = self.lib.tetris_cc_env_snapshot_create(self.handle)
         if not snapshot:

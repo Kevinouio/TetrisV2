@@ -28,6 +28,16 @@ FAILED = (255, 115, 115)
 EMPTY = (23, 30, 43)
 FILLED = (130, 170, 255)
 GRID = (36, 48, 66)
+EMPTY_CELL_ID = 255
+PIECE_COLORS = {
+    0: (0, 230, 230),   # I
+    1: (240, 220, 0),   # O
+    2: (170, 70, 230),  # T
+    3: (255, 150, 60),  # L
+    4: (80, 110, 255),  # J
+    5: (80, 220, 100),  # S
+    6: (240, 90, 90),   # Z
+}
 
 
 @dataclass
@@ -46,6 +56,9 @@ class AgentViewState:
     fitness_final: Optional[float] = None
     board: np.ndarray = field(
         default_factory=lambda: np.zeros((BOARD_ROWS, BOARD_COLS), dtype=np.uint8)
+    )
+    board_piece_ids: np.ndarray = field(
+        default_factory=lambda: np.full((BOARD_ROWS, BOARD_COLS), EMPTY_CELL_ID, dtype=np.uint8)
     )
     recent_episodes: List[Dict[str, float]] = field(default_factory=list)
     last_update_ts: float = 0.0
@@ -158,6 +171,17 @@ class LiveTrainingViewer:
             return np.zeros((BOARD_ROWS, BOARD_COLS), dtype=np.uint8)
         return arr.reshape(BOARD_ROWS, BOARD_COLS)
 
+    def _normalize_piece_ids(self, payload: object) -> np.ndarray:
+        if isinstance(payload, np.ndarray):
+            arr = payload.astype(np.uint8, copy=False)
+            if arr.shape == (BOARD_ROWS, BOARD_COLS):
+                return arr
+            return arr.reshape(BOARD_ROWS, BOARD_COLS)
+        arr = np.asarray(payload, dtype=np.uint8)
+        if arr.size != BOARD_ROWS * BOARD_COLS:
+            return np.full((BOARD_ROWS, BOARD_COLS), EMPTY_CELL_ID, dtype=np.uint8)
+        return arr.reshape(BOARD_ROWS, BOARD_COLS)
+
     def process_event(self, event: Dict[str, object]) -> None:
         event_type = str(event.get("type", ""))
         agent_index = int(event.get("agent_index", 0) or 0)
@@ -187,6 +211,7 @@ class LiveTrainingViewer:
             state.lines_total = 0
             state.episode_return_running = 0.0
             state.fitness_provisional = 0.0
+            state.board_piece_ids.fill(EMPTY_CELL_ID)
         elif event_type == "step_snapshot":
             state.status = str(event.get("status", "active"))
             state.episode_index = int(event.get("episode_index", state.episode_index))
@@ -202,6 +227,8 @@ class LiveTrainingViewer:
             )
             if "board" in event:
                 state.board = self._normalize_board(event.get("board"))
+            if "board_piece_ids" in event:
+                state.board_piece_ids = self._normalize_piece_ids(event.get("board_piece_ids"))
         elif event_type == "episode_done":
             state.status = str(event.get("status", state.status or "active"))
             state.episode_index = int(event.get("episode_index", state.episode_index))
@@ -215,6 +242,10 @@ class LiveTrainingViewer:
             state.fitness_provisional = float(
                 event.get("fitness_provisional", state.fitness_provisional)
             )
+            if "board" in event:
+                state.board = self._normalize_board(event.get("board"))
+            if "board_piece_ids" in event:
+                state.board_piece_ids = self._normalize_piece_ids(event.get("board_piece_ids"))
             recent = {
                 "episode_index": float(state.episode_index),
                 "episode_return": float(event.get("episode_return", 0.0)),
@@ -239,6 +270,7 @@ class LiveTrainingViewer:
         y: int,
         tile: int,
         board: np.ndarray,
+        board_piece_ids: Optional[np.ndarray],
         border_color: Tuple[int, int, int],
     ) -> None:
         if not self.ready:
@@ -253,6 +285,12 @@ class LiveTrainingViewer:
             for c in range(BOARD_COLS):
                 v = int(board[r, c])
                 color = FILLED if v else EMPTY
+                if board_piece_ids is not None:
+                    pid = int(board_piece_ids[r, c])
+                    if pid in PIECE_COLORS:
+                        color = PIECE_COLORS[pid]
+                    elif pid == EMPTY_CELL_ID and v == 0:
+                        color = EMPTY
                 rx = x + c * tile
                 ry = y + r * tile
                 pygame.draw.rect(screen, color, (rx, ry, tile - 1, tile - 1))
@@ -386,7 +424,7 @@ class LiveTrainingViewer:
             )
             bx = x + (card_w - BOARD_COLS * tile) // 2
             by = y + 6
-            self._draw_board(bx, by, tile, st.board, border)
+            self._draw_board(bx, by, tile, st.board, st.board_piece_ids, border)
 
             label = f"A{agent_idx:02d}  {st.status}"
             ep = f"ep {st.episode_index}/{st.games_per_agent or self.games_per_agent}"
@@ -419,7 +457,7 @@ class LiveTrainingViewer:
         big_bw = BOARD_COLS * tile_big
         bx = rx + (rw - big_bw) // 2
         by = ry + 66
-        self._draw_board(bx, by, tile_big, sel.board, self._status_color(sel.status))
+        self._draw_board(bx, by, tile_big, sel.board, sel.board_piece_ids, self._status_color(sel.status))
 
         metrics_y = by + BOARD_ROWS * tile_big + 14
         metrics = [
@@ -457,4 +495,3 @@ class LiveTrainingViewer:
 
         pygame.display.flip()
         self._clock.tick(self.fps)
-

@@ -63,6 +63,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--progress_path", type=Path, default=None)
     parser.add_argument("--worker_chunksize", type=int, default=1)
     parser.add_argument(
+        "--worker_maxtasksperchild",
+        type=int,
+        default=64,
+        help="Recycle worker processes after this many tasks (0 disables recycling).",
+    )
+    parser.add_argument(
         "--stop_file",
         type=Path,
         default=None,
@@ -106,6 +112,51 @@ def _normalize_action_tuple(raw: Sequence[int] | np.ndarray) -> Tuple[int, int, 
         int(values[3]),
         int(values[4]),
     )
+
+
+def _pack_records_for_ipc(records: List[Dict[str, object]]) -> Dict[str, object]:
+    if not records:
+        return {"n": 0}
+    return {
+        "n": int(len(records)),
+        "board": np.stack([r["board"] for r in records], axis=0).astype(np.float32, copy=False),
+        "piece": np.stack([r["piece"] for r in records], axis=0).astype(np.float32, copy=False),
+        "hold": np.stack([r["hold"] for r in records], axis=0).astype(np.float32, copy=False),
+        "queue": np.stack([r["queue"] for r in records], axis=0).astype(np.float32, copy=False),
+        "scalars": np.stack([r["scalars"] for r in records], axis=0).astype(np.float32, copy=False),
+        "action_tuple": np.asarray([r["action_tuple"] for r in records], dtype=np.int64),
+        "episode_id": np.asarray([r["episode_id"] for r in records], dtype=np.int64),
+        "step_idx": np.asarray([r["step_idx"] for r in records], dtype=np.int64),
+    }
+
+
+def _unpack_records_from_ipc(payload: Dict[str, object]) -> List[Dict[str, object]]:
+    n = int(payload.get("n", 0))
+    if n <= 0:
+        return []
+    board = np.asarray(payload["board"], dtype=np.float32)
+    piece = np.asarray(payload["piece"], dtype=np.float32)
+    hold = np.asarray(payload["hold"], dtype=np.float32)
+    queue = np.asarray(payload["queue"], dtype=np.float32)
+    scalars = np.asarray(payload["scalars"], dtype=np.float32)
+    action_tuple = np.asarray(payload["action_tuple"], dtype=np.int64)
+    episode_id = np.asarray(payload["episode_id"], dtype=np.int64)
+    step_idx = np.asarray(payload["step_idx"], dtype=np.int64)
+    out: List[Dict[str, object]] = []
+    for i in range(n):
+        out.append(
+            {
+                "board": board[i],
+                "piece": piece[i],
+                "hold": hold[i],
+                "queue": queue[i],
+                "scalars": scalars[i],
+                "action_tuple": action_tuple[i],
+                "episode_id": int(episode_id[i]),
+                "step_idx": int(step_idx[i]),
+            }
+        )
+    return out
 
 
 def _collect_episode_with_env(
@@ -216,7 +267,7 @@ def _worker_init(
 def _collect_episode_worker(episode_id: int) -> Dict[str, object]:
     if _WORKER_ENV is None or _WORKER_ENCODER_CFG is None:
         raise RuntimeError("Worker not initialized.")
-    return _collect_episode_with_env(
+    result = _collect_episode_with_env(
         env=_WORKER_ENV,
         episode_id=int(episode_id),
         base_seed=_WORKER_BASE_SEED,
@@ -224,6 +275,8 @@ def _collect_episode_worker(episode_id: int) -> Dict[str, object]:
         think_ms=_WORKER_THINK_MS,
         encoder_cfg=_WORKER_ENCODER_CFG,
     )
+    result["records_packed"] = _pack_records_for_ipc(result.pop("records"))
+    return result
 
 
 def _write_progress_json(path: Path, payload: Dict[str, object]) -> None:
@@ -255,6 +308,10 @@ def main() -> int:
         raise ValueError(f"--progress_every_sec must be > 0, got {args.progress_every_sec}.")
     if int(args.worker_chunksize) <= 0:
         raise ValueError(f"--worker_chunksize must be >= 1, got {args.worker_chunksize}.")
+    if int(args.worker_maxtasksperchild) < 0:
+        raise ValueError(
+            f"--worker_maxtasksperchild must be >= 0, got {args.worker_maxtasksperchild}."
+        )
 
     split_cfg = SplitConfig(
         train_fraction=args.train_fraction,
@@ -327,6 +384,7 @@ def main() -> int:
             "progress_mode": progress_mode,
             "progress_path": str(progress_path).replace("\\", "/"),
             "stop_file": str(stop_file).replace("\\", "/"),
+            "worker_maxtasksperchild": int(args.worker_maxtasksperchild),
             "stopped_early": bool(stopped_early),
             "stop_reason": str(stop_reason),
         }
@@ -365,7 +423,13 @@ def main() -> int:
         nonlocal skipped_missing_tuple
 
         episode_id = int(result["episode_id"])
-        records = result["records"]
+        records_obj = result.get("records")
+        if records_obj is None and "records_packed" in result:
+            records = _unpack_records_from_ipc(result["records_packed"])  # type: ignore[arg-type]
+        elif isinstance(records_obj, list):
+            records = records_obj
+        else:
+            raise ValueError(f"Expected list records or packed records for episode {episode_id}.")
         if not isinstance(records, list):
             raise ValueError(f"Expected list of records for episode {episode_id}.")
         episode_records[episode_id] = records
@@ -416,6 +480,11 @@ def main() -> int:
                     int(args.max_steps_per_episode),
                     int(args.think_ms),
                     dataclass_to_dict(encoder_cfg),
+                ),
+                maxtasksperchild=(
+                    int(args.worker_maxtasksperchild)
+                    if int(args.worker_maxtasksperchild) > 0
+                    else None
                 ),
             )
             try:
@@ -511,6 +580,7 @@ def main() -> int:
             "episodes_per_shard": int(args.episodes_per_shard),
             "collect_workers": int(args.collect_workers),
             "worker_chunksize": int(args.worker_chunksize),
+            "worker_maxtasksperchild": int(args.worker_maxtasksperchild),
             "progress_mode": progress_mode,
             "progress_every_sec": float(args.progress_every_sec),
             "progress_path": str(progress_path).replace("\\", "/"),

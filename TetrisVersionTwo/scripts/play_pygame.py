@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pygame
 
 
@@ -58,6 +59,15 @@ class NativeAction:
     placement_index: int
 
 
+@dataclass(frozen=True)
+class DQNCandidate:
+    native_action: NativeAction
+    action_tuple: ActionTuple
+    feature_vector: np.ndarray
+    lines_removed: int
+    y_pos: int
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Pygame Placement + Kick Explorer via ctypes.")
     parser.add_argument("--lib", type=Path, default=None, help="Path to tetris_v2_c_api shared library.")
@@ -78,6 +88,18 @@ def parse_args():
         type=str,
         default=None,
         help="Torch device for BC inference (e.g. cpu, cuda, cuda:0).",
+    )
+    parser.add_argument(
+        "--dqn-checkpoint",
+        type=Path,
+        default=None,
+        help="Path to DQN checkpoint. If set, autoplay uses DQN instead of BC/Cold Clear.",
+    )
+    parser.add_argument(
+        "--dqn-device",
+        type=str,
+        default=None,
+        help="Torch device for DQN inference (e.g. cpu, cuda, cuda:0).",
     )
     parser.add_argument(
         "--auto-reset",
@@ -162,6 +184,14 @@ class EnvCtypes:
                 "tetris_cc_bot_choose_and_apply_ex",
             )
         )
+        self._has_candidate_batch_api = all(
+            hasattr(self.lib, name)
+            for name in (
+                "tetris_cc_env_candidate_count",
+                "tetris_cc_env_candidate_get",
+                "tetris_cc_env_candidate_features_write",
+            )
+        )
 
         self.lib.tetris_cc_env_create.argtypes = [ctypes.c_uint32]
         self.lib.tetris_cc_env_create.restype = void_p
@@ -242,6 +272,29 @@ class EnvCtypes:
                 ctypes.c_size_t,
             ]
             self.lib.tetris_cc_env_placement_board_piece_ids_write.restype = ctypes.c_size_t
+
+        if self._has_candidate_batch_api:
+            size_p = ctypes.POINTER(ctypes.c_size_t)
+            self.lib.tetris_cc_env_candidate_count.argtypes = [void_p]
+            self.lib.tetris_cc_env_candidate_count.restype = ctypes.c_size_t
+            self.lib.tetris_cc_env_candidate_get.argtypes = [
+                void_p,
+                ctypes.c_size_t,
+                c_int_p,
+                size_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+            ]
+            self.lib.tetris_cc_env_candidate_get.restype = ctypes.c_int
+            self.lib.tetris_cc_env_candidate_features_write.argtypes = [
+                void_p,
+                ctypes.POINTER(ctypes.c_float),
+                ctypes.c_size_t,
+            ]
+            self.lib.tetris_cc_env_candidate_features_write.restype = ctypes.c_size_t
 
         self.lib.tetris_cc_env_apply_placement_index.argtypes = [
             void_p,
@@ -607,6 +660,108 @@ class EnvCtypes:
             out.append((NativeAction(bool(use_hold), int(idx)), action_tuple))
         return out
 
+    def _enumerate_current_branch_dqn_candidates(self, use_hold: bool, piece_id: int):
+        from dqn_ref.features import compute_features_from_board
+
+        count = int(self.lib.tetris_cc_env_placement_count(self.handle))
+        out: List[DQNCandidate] = []
+        for idx in range(count):
+            x = ctypes.c_int(0)
+            y = ctypes.c_int(0)
+            rot = ctypes.c_int(0)
+            lines = ctypes.c_int(0)
+            ok = self.lib.tetris_cc_env_placement_get(
+                self.handle,
+                idx,
+                ctypes.byref(x),
+                ctypes.byref(y),
+                ctypes.byref(rot),
+                ctypes.byref(lines),
+            )
+            if not ok:
+                continue
+            board_after = np.asarray(self.placement_board(int(idx)), dtype=np.uint8)
+            features = compute_features_from_board(
+                board_after=board_after,
+                y_pos=int(y.value),
+                lines_removed=int(lines.value),
+            ).as_array()
+            action_tuple: ActionTuple = (
+                int(bool(use_hold)),
+                int(piece_id),
+                int(rot.value),
+                int(x.value),
+                int(y.value),
+            )
+            out.append(
+                DQNCandidate(
+                    native_action=NativeAction(bool(use_hold), int(idx)),
+                    action_tuple=action_tuple,
+                    feature_vector=np.asarray(features, dtype=np.float32),
+                    lines_removed=int(lines.value),
+                    y_pos=int(y.value),
+                )
+            )
+        return out
+
+    def _enumerate_dqn_candidates_batch(self):
+        count = int(self.lib.tetris_cc_env_candidate_count(self.handle))
+        if count <= 0:
+            return []
+
+        needed = int(count * 6)
+        feature_buf = (ctypes.c_float * needed)()
+        written = self.lib.tetris_cc_env_candidate_features_write(
+            self.handle,
+            feature_buf,
+            needed,
+        )
+        if int(written) != needed:
+            return []
+
+        feature_flat = np.ctypeslib.as_array(feature_buf)[:needed]
+        feature_mat = feature_flat.reshape(count, 6)
+
+        out: List[DQNCandidate] = []
+        for idx in range(count):
+            use_hold = ctypes.c_int(0)
+            placement_index = ctypes.c_size_t(0)
+            piece = ctypes.c_int(-1)
+            rotation = ctypes.c_int(0)
+            x = ctypes.c_int(0)
+            y = ctypes.c_int(0)
+            lines = ctypes.c_int(0)
+            ok = self.lib.tetris_cc_env_candidate_get(
+                self.handle,
+                ctypes.c_size_t(idx),
+                ctypes.byref(use_hold),
+                ctypes.byref(placement_index),
+                ctypes.byref(piece),
+                ctypes.byref(rotation),
+                ctypes.byref(x),
+                ctypes.byref(y),
+                ctypes.byref(lines),
+            )
+            if not ok:
+                continue
+
+            out.append(
+                DQNCandidate(
+                    native_action=NativeAction(bool(use_hold.value), int(placement_index.value)),
+                    action_tuple=(
+                        int(bool(use_hold.value)),
+                        int(piece.value),
+                        int(rotation.value),
+                        int(x.value),
+                        int(y.value),
+                    ),
+                    feature_vector=np.asarray(feature_mat[idx], dtype=np.float32).copy(),
+                    lines_removed=int(lines.value),
+                    y_pos=int(y.value),
+                )
+            )
+        return out
+
     def enumerate_legal_actions(self):
         meta = self.meta()
         if bool(meta["game_over"]):
@@ -637,6 +792,48 @@ class EnvCtypes:
                     if hold_active is not None and 0 <= int(hold_active["piece"]) <= 6:
                         out.extend(
                             self._enumerate_current_branch_actions(
+                                use_hold=True,
+                                piece_id=int(hold_active["piece"]),
+                            )
+                        )
+                self.lib.tetris_cc_env_restore_snapshot(self.handle, snapshot)
+        finally:
+            self.lib.tetris_cc_snapshot_destroy(snapshot)
+            self.bot_sync()
+        return out
+
+    def enumerate_dqn_candidates(self):
+        meta = self.meta()
+        if bool(meta["game_over"]):
+            return []
+        if self._has_candidate_batch_api:
+            return self._enumerate_dqn_candidates_batch()
+
+        snapshot = self.lib.tetris_cc_env_snapshot_create(self.handle)
+        if not snapshot:
+            raise RuntimeError("Failed to create env snapshot.")
+
+        out: List[DQNCandidate] = []
+        try:
+            active = self.active()
+            if active is not None and 0 <= int(active["piece"]) <= 6:
+                out.extend(
+                    self._enumerate_current_branch_dqn_candidates(
+                        use_hold=False,
+                        piece_id=int(active["piece"]),
+                    )
+                )
+
+            hold = self.hold_info()
+            if bool(hold["hold_available"]):
+                self.lib.tetris_cc_env_restore_snapshot(self.handle, snapshot)
+                hold_reward = ctypes.c_float(0.0)
+                hold_ok = self.lib.tetris_cc_env_hold(self.handle, ctypes.byref(hold_reward))
+                if hold_ok:
+                    hold_active = self.active()
+                    if hold_active is not None and 0 <= int(hold_active["piece"]) <= 6:
+                        out.extend(
+                            self._enumerate_current_branch_dqn_candidates(
                                 use_hold=True,
                                 piece_id=int(hold_active["piece"]),
                             )
@@ -849,6 +1046,13 @@ def action_name(action: int):
 
 def main():
     args = parse_args()
+    if args.bc_checkpoint is not None and args.dqn_checkpoint is not None:
+        print(
+            "Error: --bc-checkpoint and --dqn-checkpoint are mutually exclusive. "
+            "Pass only one learned backend checkpoint.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     try:
         lib_path = find_library(args.lib)
     except FileNotFoundError as exc:
@@ -881,8 +1085,23 @@ def main():
     ai_backend = "cold_clear"
     ai_backend_label = "ColdClear"
     bc_agent = None
+    dqn_agent = None
 
-    if args.bc_checkpoint is not None:
+    if args.dqn_checkpoint is not None:
+        ai_backend = "dqn"
+        ai_backend_label = "DQN"
+        try:
+            from dqn_ref.inference_agent import DQNRefInferenceAgent  # Lazy import for optional torch dependency
+
+            dqn_agent = DQNRefInferenceAgent(args.dqn_checkpoint, device=args.dqn_device)
+            status = (
+                f"Loaded DQN checkpoint {args.dqn_checkpoint} "
+                f"(device={args.dqn_device or 'auto'})"
+            )
+        except Exception as exc:
+            dqn_agent = None
+            status = f"DQN init failed: {exc}"
+    elif args.bc_checkpoint is not None:
         ai_backend = "bc"
         ai_backend_label = "BC"
         try:
@@ -897,7 +1116,12 @@ def main():
             bc_agent = None
             status = f"BC init failed: {exc}"
 
-    ai_available = bc_agent is not None if ai_backend == "bc" else env.has_bot()
+    if ai_backend == "bc":
+        ai_available = bc_agent is not None
+    elif ai_backend == "dqn":
+        ai_available = dqn_agent is not None
+    else:
+        ai_available = env.has_bot()
     ai_enabled = bool(args.ai and ai_available)
     ai_metrics = {
         "pieces": 0,
@@ -914,16 +1138,22 @@ def main():
         "last_score": 0.0,
         "last_budget_miss": 0,
         "budget_misses": 0,
+        "last_q": 0.0,
+        "last_candidate_count": 0,
         "start_ticks": pygame.time.get_ticks(),
     }
     if args.ai and not ai_available:
         if ai_backend == "bc":
             status = "AI[BC] requested, but BC checkpoint failed to initialize."
+        elif ai_backend == "dqn":
+            status = "AI[DQN] requested, but DQN checkpoint failed to initialize."
         else:
             status = "AI requested, but bot API symbols were not found in shared library."
     elif ai_enabled:
         if ai_backend == "bc":
             status = f"AI[BC] enabled at startup (device={args.bc_device or 'auto'})"
+        elif ai_backend == "dqn":
+            status = f"AI[DQN] enabled at startup (device={args.dqn_device or 'auto'})"
         else:
             status = f"AI[ColdClear] enabled at startup (think={max(1, int(args.think_ms))}ms)"
 
@@ -966,6 +1196,8 @@ def main():
                                     status = (
                                         f"AI[ColdClear] enabled (think={max(1, int(args.think_ms))}ms)"
                                     )
+                                elif ai_backend == "dqn":
+                                    status = f"AI[DQN] enabled (device={args.dqn_device or 'auto'})"
                                 else:
                                     status = f"AI[BC] enabled (device={args.bc_device or 'auto'})"
                             else:
@@ -973,6 +1205,8 @@ def main():
                         else:
                             if ai_backend == "bc":
                                 status = "AI unavailable: BC checkpoint is not available."
+                            elif ai_backend == "dqn":
+                                status = "AI unavailable: DQN checkpoint is not available."
                             else:
                                 status = "AI unavailable: bot symbols not exported by shared library."
                     elif event.key == pygame.K_UP:
@@ -1108,6 +1342,57 @@ def main():
                                 elif ai_result is not None:
                                     ai_enabled = False
                                     status = "AI[BC] action apply failed. Autoplay disabled."
+                    elif ai_backend == "dqn":
+                        if dqn_agent is None:
+                            ai_enabled = False
+                            status = "AI[DQN] unavailable: checkpoint did not initialize."
+                        else:
+                            candidates = env.enumerate_dqn_candidates()
+                            if not candidates:
+                                ai_enabled = False
+                                status = "AI[DQN] no legal candidates; autoplay disabled."
+                            else:
+                                step_start_ms = pygame.time.get_ticks()
+                                try:
+                                    chosen_action, diag = dqn_agent.predict_action_with_diagnostics(candidates)
+                                    ai_result = env.step_native_action(chosen_action)
+                                except Exception as exc:
+                                    ai_enabled = False
+                                    status = f"AI[DQN] inference failed: {exc}"
+                                    ai_result = None
+
+                                if ai_result is not None and ai_result["success"]:
+                                    step_elapsed_ms = float(pygame.time.get_ticks() - step_start_ms)
+                                    ai_metrics["pieces"] += 1
+                                    ai_metrics["lines"] += int(ai_result["lines"])
+                                    ai_metrics["last_step_ms"] = step_elapsed_ms
+                                    ai_metrics["step_sum_ms"] += step_elapsed_ms
+                                    ai_metrics["step_samples"] += 1
+                                    ai_metrics["avg_step_ms"] = (
+                                        ai_metrics["step_sum_ms"] / max(1, ai_metrics["step_samples"])
+                                    )
+                                    ai_metrics["last_q"] = float(diag.get("best_q", 0.0))
+                                    ai_metrics["last_candidate_count"] = int(
+                                        diag.get("candidate_count", len(candidates))
+                                    )
+                                    status = (
+                                        f"AI[DQN] move hold={int(chosen_action.use_hold)} "
+                                        f"idx={int(chosen_action.placement_index)} "
+                                        f"q={float(ai_metrics['last_q']):.3f} "
+                                        f"lines+={int(ai_result['lines'])}"
+                                    )
+                                    if ai_result["game_over"]:
+                                        ai_metrics["topouts"] += 1
+                                        if args.auto_reset:
+                                            seed += 1
+                                            env.reset(seed)
+                                            status = f"AI[DQN] topout -> auto-reset seed={seed}"
+                                        else:
+                                            ai_enabled = False
+                                            status = "AI[DQN] topout. Autoplay stopped (auto-reset disabled)."
+                                elif ai_result is not None:
+                                    ai_enabled = False
+                                    status = "AI[DQN] action apply failed. Autoplay disabled."
                     else:
                         ai_result = env.bot_choose_and_apply(args.think_ms)
                         if ai_result["success"]:
@@ -1174,6 +1459,8 @@ def main():
             ai_backend_info = ai_backend_label
             if ai_backend == "bc":
                 ai_backend_info = f"BC ({args.bc_device or 'auto'})"
+            elif ai_backend == "dqn":
+                ai_backend_info = f"DQN ({args.dqn_device or 'auto'})"
             lines = [
                 f"Seed: {seed}",
                 f"Obs size: {env.observation_size()}",
@@ -1193,10 +1480,15 @@ def main():
                 lines.append(
                     f"AI budget_miss last/total={ai_metrics['last_budget_miss']}/{ai_metrics['budget_misses']}"
                 )
-            else:
+            elif ai_backend == "bc":
                 lines.append(
                     f"AI[BC] invalid_raw={ai_metrics['invalid_unmasked_predictions']} "
                     f"fallbacks={ai_metrics['unseen_legal_fallbacks']}"
+                )
+            else:
+                lines.append(
+                    f"AI[DQN] q={ai_metrics['last_q']:.3f} "
+                    f"candidates={int(ai_metrics['last_candidate_count'])}"
                 )
             for i, txt in enumerate(lines):
                 surface = small_font.render(txt, True, LOCK_TEXT)

@@ -46,16 +46,16 @@ class CollectionConfig:
 
 @dataclass
 class ModelConfig:
-    conv_channels: Tuple[int, int, int] = (32, 64, 64)
-    mlp_hidden: Tuple[int, int] = (256, 256)
+    conv_channels: Tuple[int, int, int] = (64, 128, 128)
+    mlp_hidden: Tuple[int, int] = (512, 512)
 
 
 @dataclass
 class TrainConfig:
-    batch_size: int = 256
+    batch_size: int = 512
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
-    epochs: int = 30
+    epochs: int = 50
     patience: int = 6
     seed: int = 123
 
