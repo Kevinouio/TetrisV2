@@ -1,0 +1,6 @@
+tetris_smoke 1 0.00249833
+tetris_kick_search_tests 1 0.00294935
+tetris_b2b_spin_tests 1 0.00444559
+tetris_twist_dataset_tests 1 0.0021273
+tetris_c_api_tests 2 1.08649
+---

@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from ..bc.utils import find_library
+from ..bc.utils import NativeAction, find_library
 from .agent import DQNRefAgent
 from .config import DQNRefConfig, GAConfig, RuntimeConfig, TrainingConfig
 from .env_bridge import DQNRefEnvBridge
@@ -36,6 +36,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channels_last", action="store_true", default=defaults.runtime.channels_last)
     parser.add_argument("--log_every_episodes", type=int, default=defaults.runtime.log_every_episodes)
     parser.add_argument(
+        "--torch_num_threads",
+        type=int,
+        default=defaults.runtime.torch_num_threads,
+        help="Torch intra-op CPU threads (0 keeps current default).",
+    )
+    parser.add_argument(
+        "--torch_num_interop_threads",
+        type=int,
+        default=defaults.runtime.torch_num_interop_threads,
+        help="Torch inter-op CPU threads (0 keeps current default).",
+    )
+    parser.add_argument(
+        "--omp_num_threads",
+        type=int,
+        default=defaults.runtime.omp_num_threads,
+        help="Set OMP_NUM_THREADS when > 0.",
+    )
+    parser.add_argument(
+        "--mkl_num_threads",
+        type=int,
+        default=defaults.runtime.mkl_num_threads,
+        help="Set MKL_NUM_THREADS when > 0.",
+    )
+    parser.add_argument(
         "--agent_workers",
         type=int,
         default=1,
@@ -49,6 +73,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generation_rate", type=int, default=defaults.ga.generation_rate)
     parser.add_argument("--elite_count", type=int, default=defaults.ga.elite_count)
     parser.add_argument("--max_steps_per_episode", type=int, default=defaults.training.max_steps_per_episode)
+    parser.add_argument(
+        "--fast_priority_updates",
+        action=argparse.BooleanOptionalAction,
+        default=defaults.training.fast_priority_updates,
+        help="Enable deferred replay priority heapify (optional fast mode).",
+    )
+    parser.add_argument(
+        "--priority_heapify_interval",
+        type=int,
+        default=defaults.training.priority_heapify_interval,
+        help="When fast priority updates are enabled, heapify replay priorities every N updates.",
+    )
     parser.add_argument("--viewer", action="store_true", help="Enable live pygame viewer dashboard.")
     parser.add_argument(
         "--viewer_fullscreen",
@@ -62,6 +98,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Publish telemetry snapshots every N steps per episode.",
+    )
+    parser.add_argument(
+        "--viewer_compact_telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reduce telemetry overhead by sending board snapshots less frequently.",
+    )
+    parser.add_argument(
+        "--viewer_board_every_steps",
+        type=int,
+        default=50,
+        help="When compact telemetry is enabled, include board snapshots every N steps.",
     )
     parser.add_argument(
         "--viewer_max_queue",
@@ -95,6 +143,23 @@ def resolve_device(device_arg: str | None) -> torch.device:
     if device_arg:
         return torch.device(device_arg)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def apply_runtime_thread_config(runtime: RuntimeConfig) -> None:
+    if int(runtime.omp_num_threads) > 0:
+        os.environ["OMP_NUM_THREADS"] = str(int(runtime.omp_num_threads))
+    if int(runtime.mkl_num_threads) > 0:
+        os.environ["MKL_NUM_THREADS"] = str(int(runtime.mkl_num_threads))
+    if int(runtime.torch_num_threads) > 0:
+        try:
+            torch.set_num_threads(int(runtime.torch_num_threads))
+        except Exception:
+            pass
+    if int(runtime.torch_num_interop_threads) > 0:
+        try:
+            torch.set_num_interop_threads(int(runtime.torch_num_interop_threads))
+        except Exception:
+            pass
 
 
 def episode_seed(base_seed: int, generation: int, agent_idx: int, episode_idx: int) -> int:
@@ -171,6 +236,8 @@ def run_episode(
     games_per_agent: int,
     total_lines_before_episode: float,
     publish_every_steps: int,
+    compact_telemetry: bool = True,
+    board_every_steps: int = 50,
     publish_event: Optional[Callable[[Dict[str, object]], None]] = None,
 ) -> Dict[str, float]:
     env.reset(seed)
@@ -192,21 +259,33 @@ def run_episode(
 
     publish_step_interval = max(1, int(publish_every_steps))
 
+    board_step_interval = max(1, int(board_every_steps))
+
     for step_idx in range(int(max_steps_per_episode)):
-        candidates = env.enumerate_candidates()
-        if not candidates:
-            break
-        chosen = agent.get_action(candidates)
-        if chosen is None:
+        chosen_action: Optional[NativeAction] = None
+        chosen_feature_vec: Optional[np.ndarray] = None
+
+        candidate_batch = env.enumerate_candidate_batch()
+        if candidate_batch is not None:
+            chosen_action, chosen_feature_vec = agent.choose_from_batch(candidate_batch)
+        else:
+            candidates = env.enumerate_candidates()
+            if candidates:
+                chosen = agent.get_action(candidates)
+                if chosen is not None:
+                    chosen_action = chosen.native_action
+                    chosen_feature_vec = np.asarray(chosen.feature_vector, dtype=np.float32)
+
+        if chosen_action is None or chosen_feature_vec is None:
             break
 
-        step = env.step(chosen.native_action)
+        step = env.step(chosen_action)
         done = bool(step["game_over"])
-        reward_terms = agent.calculate_reward(chosen.feature_vector, finished=done)
+        reward_terms = agent.calculate_reward(chosen_feature_vec, finished=done)
         reward_value = float(reward_terms.total)
 
-        agent.remember(old_state, chosen.feature_vector, reward_value, done)
-        old_state = chosen.feature_vector
+        agent.remember(old_state, chosen_feature_vec, reward_value, done)
+        old_state = chosen_feature_vec
         agent.check_steps()
 
         ep_return += reward_value
@@ -222,25 +301,30 @@ def run_episode(
             fitness_prov = (float(total_lines_before_episode) + float(lines_total)) / float(
                 max(1, games_per_agent)
             )
-            publish_event(
-                {
-                    "type": "step_snapshot",
-                    "generation": int(generation),
-                    "agent_index": int(agent_index),
-                    "episode_index": int(episode_index),
-                    "games_per_agent": int(games_per_agent),
-                    "step_in_episode": int(step_idx + 1),
-                    "board": _board_for_event(state_now.get("board")),
-                    "board_piece_ids": _piece_ids_for_event(state_now.get("board_piece_ids")),
-                    "lines_total": int(lines_total),
-                    "episode_return_running": float(ep_return),
-                    "epsilon": float(agent.epsilon),
-                    "loss_last": float(agent.last_loss),
-                    "fitness_provisional": float(fitness_prov),
-                    "status": "active",
-                    "timestamp": float(time.time()),
-                }
+            include_board = (
+                (not bool(compact_telemetry))
+                or done
+                or ((step_idx + 1) % board_step_interval == 0)
             )
+            event_payload: Dict[str, object] = {
+                "type": "step_snapshot",
+                "generation": int(generation),
+                "agent_index": int(agent_index),
+                "episode_index": int(episode_index),
+                "games_per_agent": int(games_per_agent),
+                "step_in_episode": int(step_idx + 1),
+                "lines_total": int(lines_total),
+                "episode_return_running": float(ep_return),
+                "epsilon": float(agent.epsilon),
+                "loss_last": float(agent.last_loss),
+                "fitness_provisional": float(fitness_prov),
+                "status": "active",
+                "timestamp": float(time.time()),
+            }
+            if include_board:
+                event_payload["board"] = _board_for_event(state_now.get("board"))
+                event_payload["board_piece_ids"] = _piece_ids_for_event(state_now.get("board_piece_ids"))
+            publish_event(event_payload)
 
         if done:
             break
@@ -301,6 +385,8 @@ def _evaluate_agent_worker(
     checkpoint_path: str | None,
     viewer_queue: Any = None,
     viewer_publish_every_steps: int = 10,
+    viewer_compact_telemetry: bool = True,
+    viewer_board_every_steps: int = 50,
 ) -> Dict[str, Any]:
     if str(device_str).lower().startswith("cpu"):
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -311,9 +397,19 @@ def _evaluate_agent_worker(
             torch.cuda.is_available = lambda: False  # type: ignore[assignment]
         except Exception:
             pass
+    worker_torch_threads = int(config.runtime.torch_num_threads) if int(config.runtime.torch_num_threads) > 0 else 1
+    worker_torch_interop = (
+        int(config.runtime.torch_num_interop_threads) if int(config.runtime.torch_num_interop_threads) > 0 else 1
+    )
+    os.environ["OMP_NUM_THREADS"] = str(
+        int(config.runtime.omp_num_threads) if int(config.runtime.omp_num_threads) > 0 else 1
+    )
+    os.environ["MKL_NUM_THREADS"] = str(
+        int(config.runtime.mkl_num_threads) if int(config.runtime.mkl_num_threads) > 0 else 1
+    )
     try:
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
+        torch.set_num_threads(worker_torch_threads)
+        torch.set_num_interop_threads(worker_torch_interop)
     except Exception:
         pass
 
@@ -360,6 +456,8 @@ def _evaluate_agent_worker(
                 games_per_agent=int(config.ga.total_games_per_agent),
                 total_lines_before_episode=float(total_lines),
                 publish_every_steps=int(viewer_publish_every_steps),
+                compact_telemetry=bool(viewer_compact_telemetry),
+                board_every_steps=int(viewer_board_every_steps),
                 publish_event=lambda e: _queue_put_best_effort(viewer_queue, e),
             )
             total_lines += float(metrics["lines_cleared"])
@@ -423,6 +521,8 @@ def main() -> int:
     training_cfg = replace(
         base_cfg.training,
         max_steps_per_episode=int(args.max_steps_per_episode),
+        fast_priority_updates=bool(args.fast_priority_updates),
+        priority_heapify_interval=max(1, int(args.priority_heapify_interval)),
     )
     runtime_cfg = RuntimeConfig(
         seed=int(args.seed),
@@ -430,6 +530,10 @@ def main() -> int:
         torch_compile=bool(args.torch_compile),
         channels_last=bool(args.channels_last),
         log_every_episodes=max(1, int(args.log_every_episodes)),
+        torch_num_threads=max(0, int(args.torch_num_threads)),
+        torch_num_interop_threads=max(0, int(args.torch_num_interop_threads)),
+        omp_num_threads=max(0, int(args.omp_num_threads)),
+        mkl_num_threads=max(0, int(args.mkl_num_threads)),
     )
     cfg = DQNRefConfig(
         model=base_cfg.model,
@@ -445,6 +549,8 @@ def main() -> int:
             ga=replace(cfg.ga, population_size=4, generations=1, total_games_per_agent=2, elite_count=2),
             training=replace(cfg.training, max_steps_per_episode=min(300, cfg.training.max_steps_per_episode)),
         )
+
+    apply_runtime_thread_config(cfg.runtime)
 
     if cfg.ga.population_size <= 0 or cfg.ga.generations <= 0 or cfg.ga.total_games_per_agent <= 0:
         raise ValueError("population_size, generations, and games_per_agent must all be > 0.")
@@ -535,6 +641,8 @@ def main() -> int:
             "fullscreen": bool(args.viewer_fullscreen),
             "fps": int(args.viewer_fps),
             "publish_every_steps": int(args.viewer_publish_every_steps),
+            "compact_telemetry": bool(args.viewer_compact_telemetry),
+            "board_every_steps": int(args.viewer_board_every_steps),
             "max_queue": int(args.viewer_max_queue),
             "grid_padding": int(args.viewer_grid_padding),
             "min_tile_px": int(args.viewer_min_tile_px),
@@ -700,6 +808,8 @@ def main() -> int:
                                 games_per_agent=int(cfg.ga.total_games_per_agent),
                                 total_lines_before_episode=float(total_lines),
                                 publish_every_steps=int(args.viewer_publish_every_steps),
+                                compact_telemetry=bool(args.viewer_compact_telemetry),
+                                board_every_steps=int(args.viewer_board_every_steps),
                                 publish_event=publish_and_pump if viewer is not None else None,
                             )
                             total_lines += float(metrics["lines_cleared"])
@@ -784,6 +894,8 @@ def main() -> int:
                                 ),
                                 viewer_queue=viewer_queue,
                                 viewer_publish_every_steps=int(args.viewer_publish_every_steps),
+                                viewer_compact_telemetry=bool(args.viewer_compact_telemetry),
+                                viewer_board_every_steps=int(args.viewer_board_every_steps),
                             )
                         )
                     done_agents = 0

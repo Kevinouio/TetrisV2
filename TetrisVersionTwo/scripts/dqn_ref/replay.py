@@ -21,11 +21,15 @@ class PrioritizedReplay:
         self.max_size = int(max_size)
         self.memory: List[Tuple[np.float32, int, Transition]] = []
         self.counter: int = 0
+        self._pending_heapify = False
 
     def __len__(self) -> int:
         return len(self.memory)
 
     def add(self, experience: Transition, priority: float) -> None:
+        if self._pending_heapify:
+            heapq.heapify(self.memory)
+            self._pending_heapify = False
         pri = np.float32(max(float(priority), 1e-6))
         item = (pri, self.counter, experience)
         if len(self.memory) < self.max_size:
@@ -57,11 +61,26 @@ class PrioritizedReplay:
         weights /= np.max(weights)
         return batch, indices.astype(np.int64), weights.astype(np.float32)
 
-    def update_priority(self, indices: Sequence[int], td_errors: Sequence[float]) -> None:
+    def update_priority(
+        self,
+        indices: Sequence[int],
+        td_errors: Sequence[float],
+        *,
+        defer_heapify: bool = False,
+    ) -> None:
         for idx, td_error in zip(indices, td_errors):
             i = int(idx)
             priority = np.float32(max(float(td_error), 1e-6))
             old = self.memory[i]
             self.memory[i] = (priority, old[1], old[2])
+        if defer_heapify:
+            self._pending_heapify = True
+            return
         heapq.heapify(self.memory)
+        self._pending_heapify = False
 
+    def flush_priority_updates(self) -> None:
+        if not self._pending_heapify:
+            return
+        heapq.heapify(self.memory)
+        self._pending_heapify = False

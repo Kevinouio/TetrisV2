@@ -636,6 +636,31 @@ size_t tetris_cc_env_candidate_features_write(
     return n;
 }
 
+size_t tetris_cc_env_candidate_rows_write(
+    const tetris_cc_env_handle* handle, tetris_cc_candidate_row* out, size_t out_len) {
+    if (!handle || !out) {
+        return 0;
+    }
+    ensure_candidate_cache(handle);
+    const auto n = std::min(out_len, handle->candidate_cache.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto& cached = handle->candidate_cache[i];
+        auto& row = out[i];
+        row.use_hold = cached.use_hold;
+        row.placement_index = cached.placement_index;
+        row.piece = cached.piece;
+        row.rotation = cached.rotation;
+        row.x = cached.x;
+        row.y = cached.y;
+        row.lines_cleared = cached.lines_cleared;
+        const auto feat_offset = static_cast<std::size_t>(i * kCandidateFeatureDim);
+        for (std::size_t j = 0; j < kCandidateFeatureDim; ++j) {
+            row.features[j] = handle->candidate_features_cache[feat_offset + j];
+        }
+    }
+    return n;
+}
+
 int tetris_cc_env_apply_placement_index(
     tetris_cc_env_handle* handle, size_t index, float* reward_out, int* lines_cleared_out, int* game_over_out) {
     if (!handle) {

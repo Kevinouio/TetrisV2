@@ -22,6 +22,7 @@ from .utils import (
     ActionTuple,
     BCEnvAdapter,
     NativeAction,
+    configure_cpu_runtime,
     ensure_dir,
     find_library,
     load_json,
@@ -397,6 +398,14 @@ def _worker_init(
     global _WORKER_RANDOM_FILL_PROB
     global _WORKER_RANDOM_MAX_RESAMPLES_PER_SAMPLE
     global _WORKER_RANDOM_POST_CLEAR_STEPS
+
+    configure_cpu_runtime(
+        torch_num_threads=1,
+        torch_num_interop_threads=1,
+        omp_num_threads=1,
+        mkl_num_threads=1,
+        openblas_num_threads=1,
+    )
 
     _WORKER_ROUND_ID = int(round_id)
     _WORKER_BETA = float(beta)
@@ -1034,6 +1043,13 @@ def _collect_dagger_round(
     emit_progress(status="running", force=True)
     try:
         if int(collect_workers) == 1:
+            configure_cpu_runtime(
+                torch_num_threads=1,
+                torch_num_interop_threads=1,
+                omp_num_threads=1,
+                mkl_num_threads=1,
+                openblas_num_threads=1,
+            )
             with BCEnvAdapter(lib_path=lib_path, seed=seed + round_id) as env:
                 learner = BCAgent(
                     checkpoint_path=learner_checkpoint,

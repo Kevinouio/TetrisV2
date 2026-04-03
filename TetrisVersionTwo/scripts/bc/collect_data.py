@@ -21,6 +21,7 @@ from .utils import (
     chunk_list,
     ensure_dir,
     find_library,
+    configure_cpu_runtime,
     save_json,
     set_global_seeds,
     split_episode_ids,
@@ -68,6 +69,21 @@ def parse_args() -> argparse.Namespace:
         default=64,
         help="Recycle worker processes after this many tasks (0 disables recycling).",
     )
+    parser.add_argument(
+        "--torch_num_threads",
+        type=int,
+        default=1,
+        help="Torch intra-op threads used by collection workers (0 keeps defaults).",
+    )
+    parser.add_argument(
+        "--torch_num_interop_threads",
+        type=int,
+        default=1,
+        help="Torch inter-op threads used by collection workers (0 keeps defaults).",
+    )
+    parser.add_argument("--omp_num_threads", type=int, default=1)
+    parser.add_argument("--mkl_num_threads", type=int, default=1)
+    parser.add_argument("--openblas_num_threads", type=int, default=1)
     parser.add_argument(
         "--stop_file",
         type=Path,
@@ -244,12 +260,25 @@ def _worker_init(
     max_steps_per_episode: int,
     think_ms: int,
     encoder_cfg_dict: Dict[str, object],
+    torch_num_threads: int,
+    torch_num_interop_threads: int,
+    omp_num_threads: int,
+    mkl_num_threads: int,
+    openblas_num_threads: int,
 ) -> None:
     global _WORKER_ENV
     global _WORKER_ENCODER_CFG
     global _WORKER_BASE_SEED
     global _WORKER_MAX_STEPS
     global _WORKER_THINK_MS
+
+    configure_cpu_runtime(
+        torch_num_threads=max(0, int(torch_num_threads)),
+        torch_num_interop_threads=max(0, int(torch_num_interop_threads)),
+        omp_num_threads=max(0, int(omp_num_threads)),
+        mkl_num_threads=max(0, int(mkl_num_threads)),
+        openblas_num_threads=max(0, int(openblas_num_threads)),
+    )
 
     _WORKER_BASE_SEED = int(base_seed)
     _WORKER_MAX_STEPS = int(max_steps_per_episode)
@@ -300,7 +329,6 @@ def _assign_action_ids(episode_records: Dict[int, List[Dict[str, object]]]) -> A
 
 def main() -> int:
     args = parse_args()
-    set_global_seeds(args.seed)
 
     if int(args.collect_workers) <= 0:
         raise ValueError(f"--collect_workers must be >= 1, got {args.collect_workers}.")
@@ -312,6 +340,24 @@ def main() -> int:
         raise ValueError(
             f"--worker_maxtasksperchild must be >= 0, got {args.worker_maxtasksperchild}."
         )
+    for name in (
+        "torch_num_threads",
+        "torch_num_interop_threads",
+        "omp_num_threads",
+        "mkl_num_threads",
+        "openblas_num_threads",
+    ):
+        if int(getattr(args, name)) < 0:
+            raise ValueError(f"--{name} must be >= 0, got {getattr(args, name)}.")
+
+    configure_cpu_runtime(
+        torch_num_threads=max(0, int(args.torch_num_threads)),
+        torch_num_interop_threads=max(0, int(args.torch_num_interop_threads)),
+        omp_num_threads=max(0, int(args.omp_num_threads)),
+        mkl_num_threads=max(0, int(args.mkl_num_threads)),
+        openblas_num_threads=max(0, int(args.openblas_num_threads)),
+    )
+    set_global_seeds(args.seed)
 
     split_cfg = SplitConfig(
         train_fraction=args.train_fraction,
@@ -385,6 +431,11 @@ def main() -> int:
             "progress_path": str(progress_path).replace("\\", "/"),
             "stop_file": str(stop_file).replace("\\", "/"),
             "worker_maxtasksperchild": int(args.worker_maxtasksperchild),
+            "torch_num_threads": int(args.torch_num_threads),
+            "torch_num_interop_threads": int(args.torch_num_interop_threads),
+            "omp_num_threads": int(args.omp_num_threads),
+            "mkl_num_threads": int(args.mkl_num_threads),
+            "openblas_num_threads": int(args.openblas_num_threads),
             "stopped_early": bool(stopped_early),
             "stop_reason": str(stop_reason),
         }
@@ -480,6 +531,11 @@ def main() -> int:
                     int(args.max_steps_per_episode),
                     int(args.think_ms),
                     dataclass_to_dict(encoder_cfg),
+                    int(args.torch_num_threads),
+                    int(args.torch_num_interop_threads),
+                    int(args.omp_num_threads),
+                    int(args.mkl_num_threads),
+                    int(args.openblas_num_threads),
                 ),
                 maxtasksperchild=(
                     int(args.worker_maxtasksperchild)
@@ -581,6 +637,11 @@ def main() -> int:
             "collect_workers": int(args.collect_workers),
             "worker_chunksize": int(args.worker_chunksize),
             "worker_maxtasksperchild": int(args.worker_maxtasksperchild),
+            "torch_num_threads": int(args.torch_num_threads),
+            "torch_num_interop_threads": int(args.torch_num_interop_threads),
+            "omp_num_threads": int(args.omp_num_threads),
+            "mkl_num_threads": int(args.mkl_num_threads),
+            "openblas_num_threads": int(args.openblas_num_threads),
             "progress_mode": progress_mode,
             "progress_every_sec": float(args.progress_every_sec),
             "progress_path": str(progress_path).replace("\\", "/"),

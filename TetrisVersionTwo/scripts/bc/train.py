@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from .config import ModelConfig, TrainConfig, parse_int_tuple
 from .dataset import BCDataset, class_histogram, load_metadata
 from .model import BCPolicyNet
-from .utils import ensure_dir, set_global_seeds
+from .utils import configure_cpu_runtime, ensure_dir, set_global_seeds
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +34,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=TrainConfig.seed)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument(
+        "--pin_memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Pin host memory in DataLoader (default: auto on CUDA).",
+    )
+    parser.add_argument(
+        "--persistent_workers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Keep DataLoader workers alive across epochs (default: enabled when num_workers > 0).",
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=2,
+        help="DataLoader prefetch factor when num_workers > 0.",
+    )
+    parser.add_argument("--torch_num_threads", type=int, default=0)
+    parser.add_argument("--torch_num_interop_threads", type=int, default=0)
+    parser.add_argument("--omp_num_threads", type=int, default=0)
+    parser.add_argument("--mkl_num_threads", type=int, default=0)
+    parser.add_argument("--openblas_num_threads", type=int, default=0)
     parser.add_argument(
         "--max_train_samples",
         type=int,
@@ -217,6 +240,15 @@ def main() -> int:
     args = parse_args()
     if int(args.max_train_samples) < 0:
         raise ValueError("--max_train_samples must be >= 0.")
+    if int(args.prefetch_factor) <= 0:
+        raise ValueError("--prefetch_factor must be > 0.")
+    configure_cpu_runtime(
+        torch_num_threads=max(0, int(args.torch_num_threads)),
+        torch_num_interop_threads=max(0, int(args.torch_num_interop_threads)),
+        omp_num_threads=max(0, int(args.omp_num_threads)),
+        mkl_num_threads=max(0, int(args.mkl_num_threads)),
+        openblas_num_threads=max(0, int(args.openblas_num_threads)),
+    )
     set_global_seeds(args.seed)
     device = select_device(args.device)
 
@@ -258,19 +290,28 @@ def main() -> int:
             f"available={num_train_available} used={len(train_ds)} max_train_samples={max_samples}"
         )
 
+    pin_memory = bool(args.pin_memory) if args.pin_memory is not None else (device.type != "cpu")
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "drop_last": False,
+        "pin_memory": pin_memory,
+    }
+    if int(args.num_workers) > 0:
+        loader_kwargs["persistent_workers"] = (
+            bool(args.persistent_workers) if args.persistent_workers is not None else True
+        )
+        loader_kwargs["prefetch_factor"] = int(args.prefetch_factor)
+
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        drop_last=False,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        drop_last=False,
+        **loader_kwargs,
     )
 
     train_dataset_ref = train_ds.dataset if isinstance(train_ds, Subset) else train_ds

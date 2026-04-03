@@ -54,6 +54,12 @@ Train:
 python -m bc.train --data_dir data/bc_top1 --out_dir runs/bc_top1
 ```
 
+Loader/runtime tuning knobs:
+- `--pin_memory` / `--no-pin_memory`
+- `--persistent_workers` / `--no-persistent_workers`
+- `--prefetch_factor`
+- `--torch_num_threads`, `--torch_num_interop_threads`, `--omp_num_threads`, `--mkl_num_threads`, `--openblas_num_threads`
+
 Offline eval:
 
 ```bash
@@ -83,6 +89,12 @@ Parallel collection:
 
 - `--collect_workers N` controls process count (default `1`).
 - `--worker_chunksize` controls episode scheduling granularity (default `1`).
+- Thread caps for worker CPU usage:
+  - `--torch_num_threads`
+  - `--torch_num_interop_threads`
+  - `--omp_num_threads`
+  - `--mkl_num_threads`
+  - `--openblas_num_threads`
 
 Live progress:
 

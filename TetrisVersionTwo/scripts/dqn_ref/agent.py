@@ -7,8 +7,9 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
+from ..bc.utils import NativeAction
 from .config import DQNRefConfig
-from .env_bridge import CandidateAfterstate
+from .env_bridge import CandidateAfterstate, CandidateBatch
 from .model import LinearQNet, QTrainer
 from .replay import PrioritizedReplay
 from .reward import ReferenceReward, RewardTerms
@@ -64,6 +65,8 @@ class DQNRefAgent:
             batch_size=int(config.replay.batch_size),
             replay_beta=float(config.replay.beta),
             grad_clip_norm=float(config.training.grad_clip_norm),
+            fast_priority_updates=bool(config.training.fast_priority_updates),
+            priority_heapify_interval=int(config.training.priority_heapify_interval),
             device=device,
         )
         self.reward = ReferenceReward(self.weight)
@@ -146,19 +149,32 @@ class DQNRefAgent:
     def update_target_network(self) -> None:
         self.model2.load_state_dict(self.model1.state_dict())
 
+    def select_action_index_from_features(self, feature_batch: np.ndarray) -> Optional[int]:
+        if feature_batch.size == 0:
+            return None
+        if random.random() < self.epsilon:
+            self.random = True
+            return int(np.random.randint(0, int(feature_batch.shape[0])))
+
+        self.random = False
+        with torch.no_grad():
+            q_values = self.model1(torch.as_tensor(feature_batch, dtype=torch.float32, device=self.device)).view(-1)
+        return int(torch.argmax(q_values).item())
+
+    def choose_from_batch(self, batch: CandidateBatch) -> tuple[Optional[NativeAction], Optional[np.ndarray]]:
+        chosen_idx = self.select_action_index_from_features(batch.feature_matrix)
+        if chosen_idx is None:
+            return None, None
+        return batch.native_action_at(chosen_idx), np.asarray(batch.feature_matrix[chosen_idx], dtype=np.float32)
+
     def get_action(self, candidates: List[CandidateAfterstate]) -> Optional[CandidateAfterstate]:
         if not candidates:
             return None
 
-        if random.random() < self.epsilon:
-            self.random = True
-            return random.choice(candidates)
-
-        self.random = False
         feature_batch = np.stack([c.feature_vector for c in candidates], axis=0).astype(np.float32, copy=False)
-        with torch.no_grad():
-            q_values = self.model1(torch.as_tensor(feature_batch, dtype=torch.float32, device=self.device)).view(-1)
-        best_idx = int(torch.argmax(q_values).item())
+        best_idx = self.select_action_index_from_features(feature_batch)
+        if best_idx is None:
+            return None
         return candidates[best_idx]
 
     def check_steps(self) -> Optional[float]:
@@ -186,4 +202,3 @@ class DQNRefAgent:
 
     def calculate_reward(self, feature_vector: np.ndarray, finished: bool) -> RewardTerms:
         return self.reward.compute(feature_vector, finished=finished)
-

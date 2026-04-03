@@ -16,6 +16,17 @@ python -m dqn_ref.train \
   --run_dir runs/dqn_ref
 ```
 
+## Recommended Build Profile
+Prefer a Release library for throughput:
+
+```bash
+cmake -S . -B build-wsl-rel -DCMAKE_BUILD_TYPE=Release
+cmake --build build-wsl-rel -j8 --target tetris_v2_c_api
+```
+
+If `CMAKE_BUILD_TYPE` is omitted for single-config generators, `TetrisVersionTwo/CMakeLists.txt`
+now defaults to `Release`.
+
 ## Parallel Agent Evaluation
 ```bash
 python -m dqn_ref.train \
@@ -46,6 +57,10 @@ CUDA_VISIBLE_DEVICES="" python -m dqn_ref.train \
   --viewer_fps 20 \
   --viewer_publish_every_steps 10
 ```
+
+Telemetry controls:
+- `--viewer_compact_telemetry` / `--no-viewer_compact_telemetry`
+- `--viewer_board_every_steps 50`
 
 ## Pygame Playback in Shared Env Viewer
 Run DQN in the same `play_pygame.py` runtime path used by BC:
@@ -105,3 +120,14 @@ python -m dqn_ref.bench_throughput \
 ```
 
 See `OPTIMIZATION_NOTES.md` for the benchmark workflow and before/after table template.
+
+## Optional Fast Mode (Off by Default)
+Replay priority updates can be batched to reduce CPU overhead:
+
+```bash
+python -m dqn_ref.train \
+  --lib build-wsl-rel/TetrisVersionTwo/libtetris_v2_c_api.so \
+  --run_dir runs/dqn_ref_fast \
+  --fast_priority_updates \
+  --priority_heapify_interval 32
+```

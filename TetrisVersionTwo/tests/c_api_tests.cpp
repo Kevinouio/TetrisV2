@@ -277,6 +277,9 @@ void test_cc_candidate_batch_api_matches_placement_api() {
     std::vector<float> features(feature_count, 0.0f);
     auto feature_written = tetris_cc_env_candidate_features_write(env, features.data(), features.size());
     assert(feature_written == feature_count);
+    std::vector<tetris_cc_candidate_row> rows(candidate_count);
+    auto row_written = tetris_cc_env_candidate_rows_write(env, rows.data(), rows.size());
+    assert(row_written == candidate_count);
 
     for (std::size_t i = 0; i < candidate_count; ++i) {
         int use_hold = 0;
@@ -297,6 +300,13 @@ void test_cc_candidate_batch_api_matches_placement_api() {
                 &x,
                 &y,
                 &lines) == 1);
+        assert(rows[i].use_hold == use_hold);
+        assert(rows[i].placement_index == placement_index);
+        assert(rows[i].piece == piece);
+        assert(rows[i].rotation == rotation);
+        assert(rows[i].x == x);
+        assert(rows[i].y == y);
+        assert(rows[i].lines_cleared == lines);
         assert(use_hold == 0 || use_hold == 1);
         assert(piece >= 0 && piece <= 6);
         assert(rotation >= 0 && rotation <= 3);
@@ -327,7 +337,9 @@ void test_cc_candidate_batch_api_matches_placement_api() {
             auto expected = features_from_visible_board(board_after, y, lines);
             for (std::size_t j = 0; j < expected.size(); ++j) {
                 auto got = features[static_cast<std::size_t>(i * 6 + j)];
+                auto got_row = rows[i].features[j];
                 assert(std::fabs(got - expected[j]) <= 1e-4f);
+                assert(std::fabs(got_row - expected[j]) <= 1e-4f);
             }
         }
     }

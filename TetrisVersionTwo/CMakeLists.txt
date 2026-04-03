@@ -4,8 +4,31 @@ project(TetrisVersionTwo LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# For single-config generators (Ninja/Unix Makefiles), default to Release when
+# users do not explicitly choose a build type.
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE
+        Release
+        CACHE STRING "Build type (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
+endif()
+
+option(
+    TETRIS_V2_ENABLE_IPO
+    "Enable IPO/LTO for Release builds when supported by toolchain"
+    ON)
+
 find_package(Python3 COMPONENTS Interpreter)
 include(CTest)
+include(CheckIPOSupported)
+
+if(TETRIS_V2_ENABLE_IPO)
+    check_ipo_supported(RESULT TETRIS_V2_IPO_SUPPORTED OUTPUT TETRIS_V2_IPO_ERROR)
+    if(TETRIS_V2_IPO_SUPPORTED)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+    else()
+        message(STATUS "IPO/LTO disabled: ${TETRIS_V2_IPO_ERROR}")
+    endif()
+endif()
 
 add_library(
     tetris_v2

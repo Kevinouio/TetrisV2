@@ -11,6 +11,17 @@ typedef struct tetris_cc_env_handle tetris_cc_env_handle;
 typedef struct tetris_cc_bot_handle tetris_cc_bot_handle;
 typedef struct tetris_cc_snapshot_handle tetris_cc_snapshot_handle;
 
+typedef struct tetris_cc_candidate_row {
+    int use_hold;
+    size_t placement_index;
+    int piece;
+    int rotation;
+    int x;
+    int y;
+    int lines_cleared;
+    float features[6];
+} tetris_cc_candidate_row;
+
 /*
  * Clean-rewrite CC API surface (action-step primary).
  * Spin type encoding: 0=None, 1=Mini, 2=Full.
@@ -82,6 +93,8 @@ int tetris_cc_env_candidate_get(
     int* lines_cleared);
 size_t tetris_cc_env_candidate_features_write(
     const tetris_cc_env_handle* handle, float* out, size_t out_len);
+size_t tetris_cc_env_candidate_rows_write(
+    const tetris_cc_env_handle* handle, tetris_cc_candidate_row* out, size_t out_len);
 int tetris_cc_env_apply_placement_index(
     tetris_cc_env_handle* handle, size_t index, float* reward_out, int* lines_cleared_out, int* game_over_out);
 int tetris_cc_env_last_clear_meta(

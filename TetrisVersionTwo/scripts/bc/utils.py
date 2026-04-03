@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,6 +110,36 @@ def set_global_seeds(seed: int) -> None:
         pass
 
 
+def configure_cpu_runtime(
+    *,
+    torch_num_threads: int = 0,
+    torch_num_interop_threads: int = 0,
+    omp_num_threads: int = 0,
+    mkl_num_threads: int = 0,
+    openblas_num_threads: int = 0,
+) -> None:
+    if int(omp_num_threads) > 0:
+        os.environ["OMP_NUM_THREADS"] = str(int(omp_num_threads))
+    if int(mkl_num_threads) > 0:
+        os.environ["MKL_NUM_THREADS"] = str(int(mkl_num_threads))
+    if int(openblas_num_threads) > 0:
+        os.environ["OPENBLAS_NUM_THREADS"] = str(int(openblas_num_threads))
+    if int(torch_num_threads) > 0:
+        try:
+            import torch
+
+            torch.set_num_threads(int(torch_num_threads))
+        except Exception:
+            pass
+    if int(torch_num_interop_threads) > 0:
+        try:
+            import torch
+
+            torch.set_num_interop_threads(int(torch_num_interop_threads))
+        except Exception:
+            pass
+
+
 def split_episode_ids(
     episode_ids: Sequence[int],
     train_fraction: float,
@@ -140,28 +171,67 @@ def chunk_list(values: Sequence[int], chunk_size: int) -> List[List[int]]:
     return [list(values[i : i + chunk_size]) for i in range(0, len(values), chunk_size)]
 
 
+_REQUIRED_C_API_SYMBOLS: Tuple[str, ...] = (
+    "tetris_cc_env_create",
+    "tetris_cc_env_destroy",
+    "tetris_cc_env_reset",
+    "tetris_cc_env_meta",
+    "tetris_cc_env_placement_count",
+    "tetris_cc_env_placement_get",
+    "tetris_cc_env_apply_placement_index",
+)
+
+
+def _validate_library_symbols(path: Path) -> Optional[str]:
+    try:
+        lib = ctypes.CDLL(str(path))
+    except OSError as exc:
+        return f"load error: {exc}"
+    missing = [name for name in _REQUIRED_C_API_SYMBOLS if not hasattr(lib, name)]
+    if missing:
+        return f"missing symbols: {', '.join(missing)}"
+    return None
+
+
 def find_library(explicit_path: Optional[Path] = None) -> Path:
     if explicit_path is not None:
         if explicit_path.exists():
-            return explicit_path
+            err = _validate_library_symbols(explicit_path)
+            if err is None:
+                return explicit_path
+            raise RuntimeError(f"Invalid C API library '{explicit_path}': {err}")
         raise FileNotFoundError(f"Library not found: {explicit_path}")
 
     candidates = [
+        Path("build-wsl-rel/TetrisVersionTwo/libtetris_v2_c_api.so"),
+        Path("build-wsl/TetrisVersionTwo/libtetris_v2_c_api.so"),
+        Path("build/TetrisVersionTwo/Release/tetris_v2_c_api.dll"),
+        Path("build/TetrisVersionTwo/RelWithDebInfo/tetris_v2_c_api.dll"),
         Path("build/TetrisVersionTwo/tetris_v2_c_api.dll"),
         Path("build/TetrisVersionTwo/Debug/tetris_v2_c_api.dll"),
-        Path("build/TetrisVersionTwo/Release/tetris_v2_c_api.dll"),
         Path("build/TetrisVersionTwo/libtetris_v2_c_api.so"),
         Path("build/TetrisVersionTwo/libtetris_v2_c_api.dylib"),
-        Path("build-wsl/TetrisVersionTwo/libtetris_v2_c_api.so"),
+        Path("TetrisVersionTwo/build/Release/tetris_v2_c_api.dll"),
+        Path("TetrisVersionTwo/build/RelWithDebInfo/tetris_v2_c_api.dll"),
         Path("TetrisVersionTwo/build/tetris_v2_c_api.dll"),
         Path("TetrisVersionTwo/build/Debug/tetris_v2_c_api.dll"),
-        Path("TetrisVersionTwo/build/Release/tetris_v2_c_api.dll"),
         Path("TetrisVersionTwo/build/libtetris_v2_c_api.so"),
         Path("TetrisVersionTwo/build/libtetris_v2_c_api.dylib"),
     ]
+    failures: List[str] = []
     for candidate in candidates:
-        if candidate.exists():
+        if not candidate.exists():
+            continue
+        err = _validate_library_symbols(candidate)
+        if err is None:
             return candidate
+        failures.append(f"{candidate}: {err}")
+    if failures:
+        details = "\n  - ".join(failures)
+        raise RuntimeError(
+            "Found tetris_v2_c_api candidates, but none passed symbol validation.\n"
+            f"  - {details}"
+        )
     raise FileNotFoundError(
         "Could not locate tetris_v2_c_api shared library. "
         "Build CMake targets first or pass --lib explicitly."

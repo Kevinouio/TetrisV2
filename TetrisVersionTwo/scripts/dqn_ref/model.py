@@ -38,6 +38,8 @@ class QTrainer:
         batch_size: int,
         replay_beta: float,
         grad_clip_norm: float,
+        fast_priority_updates: bool,
+        priority_heapify_interval: int,
         device: torch.device,
     ):
         self.memory = memory
@@ -47,12 +49,15 @@ class QTrainer:
         self.batch_size = int(batch_size)
         self.replay_beta = float(replay_beta)
         self.grad_clip_norm = float(grad_clip_norm)
+        self.fast_priority_updates = bool(fast_priority_updates)
+        self.priority_heapify_interval = max(1, int(priority_heapify_interval))
         self.model1 = model1
         self.model2 = model2
         self.device = device
         self.optimizer1 = optim.Adam(model1.parameters(), lr=self.lr)
         self.criterion = nn.SmoothL1Loss()
         self.q_values = []
+        self._priority_updates_since_heapify = 0
 
     def update_lr(self, new_lr: float) -> None:
         self.lr = float(new_lr)
@@ -100,7 +105,16 @@ class QTrainer:
         )
 
         td_errors = torch.abs(target_q_values - current_q_values.gather(1, max_actions.view(-1, 1)))
-        self.memory.update_priority(indices, td_errors.detach().cpu().view(-1).tolist())
+        self.memory.update_priority(
+            indices,
+            td_errors.detach().cpu().view(-1).tolist(),
+            defer_heapify=self.fast_priority_updates,
+        )
+        if self.fast_priority_updates:
+            self._priority_updates_since_heapify += 1
+            if self._priority_updates_since_heapify >= self.priority_heapify_interval:
+                self.memory.flush_priority_updates()
+                self._priority_updates_since_heapify = 0
 
         return self.fit(state_batch, target_q_values.detach())
 
@@ -108,6 +122,9 @@ class QTrainer:
         total_loss = 0.0
         for _ in range(self.train_epochs):
             total_loss += self.train_step()
+        if self.fast_priority_updates:
+            self.memory.flush_priority_updates()
+            self._priority_updates_since_heapify = 0
         return float(total_loss)
 
     def load_optimizer_state(self, state_dict: dict) -> None:
@@ -115,4 +132,3 @@ class QTrainer:
 
     def optimizer_state(self) -> dict:
         return self.optimizer1.state_dict()
-

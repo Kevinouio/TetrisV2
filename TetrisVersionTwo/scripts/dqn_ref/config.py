@@ -59,6 +59,8 @@ class TrainingConfig:
     max_steps_per_episode: int = 2_000
     train_fallback_games: int = 5
     grad_clip_norm: float = 1.0
+    fast_priority_updates: bool = False
+    priority_heapify_interval: int = 32
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,10 @@ class RuntimeConfig:
     torch_compile: bool = False
     channels_last: bool = False
     log_every_episodes: int = 10
+    torch_num_threads: int = 0
+    torch_num_interop_threads: int = 0
+    omp_num_threads: int = 0
+    mkl_num_threads: int = 0
 
 
 @dataclass(frozen=True)
@@ -93,4 +99,3 @@ class DQNRefConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     ga: GAConfig = field(default_factory=GAConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-

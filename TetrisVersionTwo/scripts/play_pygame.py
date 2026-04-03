@@ -117,6 +117,15 @@ def parse_args():
 
 
 def find_library(explicit_path: Optional[Path]) -> Path:
+    shared_find_library = None
+    try:
+        from TetrisVersionTwo.scripts.bc.utils import find_library as shared_find_library
+    except Exception:
+        # Keep this viewer script usable as a standalone fallback if package imports fail.
+        shared_find_library = None
+    if shared_find_library is not None:
+        return shared_find_library(explicit_path)
+
     if explicit_path is not None:
         if explicit_path.exists():
             return explicit_path

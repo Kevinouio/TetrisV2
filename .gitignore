@@ -21,6 +21,7 @@ coverage*
 # C/C++ builds
 build/
 build-wsl/
+Tetris-A.I/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
