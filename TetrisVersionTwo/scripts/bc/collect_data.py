@@ -4,10 +4,13 @@ import atexit
 import argparse
 import json
 import multiprocessing as mp
+import os
+import queue as queue_mod
+import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -26,6 +29,7 @@ from .utils import (
     set_global_seeds,
     split_episode_ids,
 )
+from .viewer_live import board_for_event, piece_ids_for_event, queue_put_best_effort
 
 
 _WORKER_ENV: Optional[BCEnvAdapter] = None
@@ -33,9 +37,20 @@ _WORKER_ENCODER_CFG: Optional[EncoderConfig] = None
 _WORKER_BASE_SEED: int = 0
 _WORKER_MAX_STEPS: int = 0
 _WORKER_THINK_MS: int = 20
+_WORKER_VIEWER_QUEUE: Any = None
+_WORKER_VIEWER_PUBLISH_EVERY_STEPS: int = 10
+_WORKER_VIEWER_COMPACT_TELEMETRY: bool = True
+_WORKER_VIEWER_BOARD_EVERY_STEPS: int = 50
+_WORKER_SLOT: int = 1
+_WORKER_LABEL: str = "PID"
 
 
-def parse_args() -> argparse.Namespace:
+def _argv_has_flag(argv: Sequence[str], flag: str) -> bool:
+    return any(token == flag or token.startswith(f"{flag}=") for token in argv)
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    argv_list = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Collect top-1 behavioral cloning data from Cold Clear.")
     parser.add_argument("--lib", type=Path, default=None, help="Path to tetris_v2_c_api shared library.")
     parser.add_argument("--out_dir", type=Path, default=Path("data/bc_top1"))
@@ -52,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_fraction", type=float, default=SplitConfig.val_fraction)
     parser.add_argument("--test_fraction", type=float, default=SplitConfig.test_fraction)
     parser.add_argument("--split_seed", type=int, default=SplitConfig.seed)
-    parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--collect_workers", type=int, default=1)
     parser.add_argument(
         "--progress_mode",
@@ -90,7 +105,54 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="If this file appears while collecting, stop early and save partial dataset.",
     )
-    return parser.parse_args()
+    parser.add_argument("--viewer", action="store_true", help="Enable live pygame collection viewer.")
+    parser.add_argument(
+        "--viewer_fullscreen",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Start viewer in fullscreen mode (default: true).",
+    )
+    parser.add_argument("--viewer_fps", type=int, default=20, help="Viewer redraw FPS.")
+    parser.add_argument(
+        "--viewer_publish_every_steps",
+        type=int,
+        default=10,
+        help="Publish viewer step snapshots every N steps per episode (auto 1 when --viewer unless set).",
+    )
+    parser.add_argument(
+        "--viewer_compact_telemetry",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reduce viewer overhead by publishing board snapshots less frequently.",
+    )
+    parser.add_argument(
+        "--viewer_board_every_steps",
+        type=int,
+        default=50,
+        help="When compact telemetry is enabled, include boards every N steps (auto 1 when --viewer unless set).",
+    )
+    parser.add_argument(
+        "--viewer_max_queue",
+        type=int,
+        default=4096,
+        help="Maximum queued viewer events before dropping telemetry.",
+    )
+    parser.add_argument("--viewer_grid_padding", type=int, default=8, help="Viewer card padding.")
+    parser.add_argument("--viewer_min_tile_px", type=int, default=6, help="Minimum viewer tile size.")
+    parser.add_argument("--viewer_agent", type=int, default=1, help="Initial selected worker card id.")
+    parser.add_argument(
+        "--viewer_reopen_file",
+        type=Path,
+        default=None,
+        help="Optional trigger file path used to reopen a closed viewer window.",
+    )
+    args = parser.parse_args(argv_list)
+    if bool(args.viewer):
+        if not _argv_has_flag(argv_list, "--viewer_publish_every_steps"):
+            args.viewer_publish_every_steps = 1
+        if not _argv_has_flag(argv_list, "--viewer_board_every_steps"):
+            args.viewer_board_every_steps = 1
+    return args
 
 
 def _build_payload(records: List[Dict[str, object]]) -> Dict[str, torch.Tensor]:
@@ -175,6 +237,19 @@ def _unpack_records_from_ipc(payload: Dict[str, object]) -> List[Dict[str, objec
     return out
 
 
+def _worker_emit_viewer_event(event: Dict[str, object]) -> None:
+    if _WORKER_VIEWER_QUEUE is None:
+        return
+    payload = dict(event)
+    payload.setdefault("type", "step_snapshot")
+    payload.setdefault("mode", "collect_data")
+    payload.setdefault("timestamp", float(time.time()))
+    payload.setdefault("worker_slot", int(_WORKER_SLOT))
+    payload.setdefault("worker_label", str(_WORKER_LABEL))
+    payload.setdefault("worker_key", f"pid:{os.getpid()}")
+    queue_put_best_effort(_WORKER_VIEWER_QUEUE, payload)
+
+
 def _collect_episode_with_env(
     env: BCEnvAdapter,
     episode_id: int,
@@ -182,12 +257,27 @@ def _collect_episode_with_env(
     max_steps_per_episode: int,
     think_ms: int,
     encoder_cfg: EncoderConfig,
+    publish_event: Optional[Callable[[Dict[str, object]], None]] = None,
+    publish_every_steps: int = 10,
+    compact_telemetry: bool = True,
+    board_every_steps: int = 50,
+    worker_slot: int = 1,
+    worker_label: str = "PID",
 ) -> Dict[str, object]:
+    worker_pid = int(os.getpid())
+    worker_key = f"pid:{worker_pid}"
+    if not str(worker_label).strip():
+        worker_label = f"PID {worker_pid}"
+
     env.reset(base_seed + int(episode_id))
     records: List[Dict[str, object]] = []
     skipped_no_legal = 0
     skipped_invalid_expert = 0
     skipped_missing_tuple = 0
+    episode_steps = 0
+    last_lines_total = 0
+    publish_step_interval = max(1, int(publish_every_steps))
+    board_step_interval = max(1, int(board_every_steps))
 
     for step_idx in range(int(max_steps_per_episode)):
         state = env.get_state()
@@ -234,8 +324,65 @@ def _collect_episode_with_env(
                 "step_idx": int(step_idx),
             }
         )
+        episode_steps = int(step_idx + 1)
+        last_lines_total = int(state.get("lines", 0))
+
+        done = bool(expert["game_over"])
+        if publish_event is not None and ((step_idx + 1) % publish_step_interval == 0 or done):
+            include_board = (not bool(compact_telemetry)) or done or ((step_idx + 1) % board_step_interval == 0)
+            state_now = env.get_state()
+            event_payload: Dict[str, object] = {
+                "type": "step_snapshot",
+                "mode": "collect_data",
+                "status": "done" if done else "active",
+                "worker_slot": int(worker_slot),
+                "worker_label": str(worker_label),
+                "worker_key": worker_key,
+                "episode_id": int(episode_id),
+                "step_in_episode": int(step_idx + 1),
+                "lines_total": int(state_now.get("lines", 0)),
+                "transitions_collected": int(len(records)),
+                "skipped_no_legal": int(skipped_no_legal),
+                "skipped_invalid_expert": int(skipped_invalid_expert),
+                "skipped_missing_tuple": int(skipped_missing_tuple),
+                "timestamp": float(time.time()),
+            }
+            if include_board:
+                event_payload["board"] = board_for_event(state_now.get("board"))
+                try:
+                    event_payload["board_piece_ids"] = piece_ids_for_event(
+                        env.board_piece_ids(include_active=True)
+                    )
+                except Exception:
+                    pass
+            publish_event(event_payload)
+
         if bool(expert["game_over"]):
             break
+
+    if publish_event is not None:
+        final_state = env.get_state()
+        final_payload: Dict[str, object] = {
+            "type": "episode_done",
+            "mode": "collect_data",
+            "status": "done" if bool(final_state.get("game_over", False)) else "active",
+            "worker_slot": int(worker_slot),
+            "worker_label": str(worker_label),
+            "worker_key": worker_key,
+            "episode_id": int(episode_id),
+            "survival_length": int(episode_steps),
+            "lines_total": int(final_state.get("lines", last_lines_total)),
+            "episode_transitions": int(len(records)),
+            "transitions_collected": int(len(records)),
+            "episodes_completed": 0,
+            "timestamp": float(time.time()),
+        }
+        final_payload["board"] = board_for_event(final_state.get("board"))
+        try:
+            final_payload["board_piece_ids"] = piece_ids_for_event(env.board_piece_ids(include_active=True))
+        except Exception:
+            pass
+        publish_event(final_payload)
 
     return {
         "episode_id": int(episode_id),
@@ -265,12 +412,22 @@ def _worker_init(
     omp_num_threads: int,
     mkl_num_threads: int,
     openblas_num_threads: int,
+    viewer_queue: Any,
+    viewer_publish_every_steps: int,
+    viewer_compact_telemetry: bool,
+    viewer_board_every_steps: int,
 ) -> None:
     global _WORKER_ENV
     global _WORKER_ENCODER_CFG
     global _WORKER_BASE_SEED
     global _WORKER_MAX_STEPS
     global _WORKER_THINK_MS
+    global _WORKER_VIEWER_QUEUE
+    global _WORKER_VIEWER_PUBLISH_EVERY_STEPS
+    global _WORKER_VIEWER_COMPACT_TELEMETRY
+    global _WORKER_VIEWER_BOARD_EVERY_STEPS
+    global _WORKER_SLOT
+    global _WORKER_LABEL
 
     configure_cpu_runtime(
         torch_num_threads=max(0, int(torch_num_threads)),
@@ -283,6 +440,16 @@ def _worker_init(
     _WORKER_BASE_SEED = int(base_seed)
     _WORKER_MAX_STEPS = int(max_steps_per_episode)
     _WORKER_THINK_MS = int(think_ms)
+    _WORKER_VIEWER_QUEUE = viewer_queue
+    _WORKER_VIEWER_PUBLISH_EVERY_STEPS = max(1, int(viewer_publish_every_steps))
+    _WORKER_VIEWER_COMPACT_TELEMETRY = bool(viewer_compact_telemetry)
+    _WORKER_VIEWER_BOARD_EVERY_STEPS = max(1, int(viewer_board_every_steps))
+    process_identity = getattr(mp.current_process(), "_identity", ())
+    if process_identity and len(process_identity) > 0:
+        _WORKER_SLOT = int(process_identity[0])
+    else:
+        _WORKER_SLOT = 1
+    _WORKER_LABEL = f"PID {os.getpid()}"
     _WORKER_ENCODER_CFG = EncoderConfig(
         board_height=int(encoder_cfg_dict["board_height"]),
         board_width=int(encoder_cfg_dict["board_width"]),
@@ -291,6 +458,16 @@ def _worker_init(
     )
     _WORKER_ENV = BCEnvAdapter(lib_path=Path(lib_path_str), seed=_WORKER_BASE_SEED)
     atexit.register(_close_worker_env)
+    _worker_emit_viewer_event(
+        {
+            "type": "worker_started",
+            "mode": "collect_data",
+            "status": "active",
+            "worker_slot": int(_WORKER_SLOT),
+            "worker_label": str(_WORKER_LABEL),
+            "worker_key": f"pid:{os.getpid()}",
+        }
+    )
 
 
 def _collect_episode_worker(episode_id: int) -> Dict[str, object]:
@@ -303,6 +480,12 @@ def _collect_episode_worker(episode_id: int) -> Dict[str, object]:
         max_steps_per_episode=_WORKER_MAX_STEPS,
         think_ms=_WORKER_THINK_MS,
         encoder_cfg=_WORKER_ENCODER_CFG,
+        publish_event=_worker_emit_viewer_event if _WORKER_VIEWER_QUEUE is not None else None,
+        publish_every_steps=int(_WORKER_VIEWER_PUBLISH_EVERY_STEPS),
+        compact_telemetry=bool(_WORKER_VIEWER_COMPACT_TELEMETRY),
+        board_every_steps=int(_WORKER_VIEWER_BOARD_EVERY_STEPS),
+        worker_slot=int(_WORKER_SLOT),
+        worker_label=str(_WORKER_LABEL),
     )
     result["records_packed"] = _pack_records_for_ipc(result.pop("records"))
     return result
@@ -349,6 +532,18 @@ def main() -> int:
     ):
         if int(getattr(args, name)) < 0:
             raise ValueError(f"--{name} must be >= 0, got {getattr(args, name)}.")
+    if int(args.viewer_fps) <= 0:
+        raise ValueError(f"--viewer_fps must be > 0, got {args.viewer_fps}.")
+    if int(args.viewer_publish_every_steps) <= 0:
+        raise ValueError(
+            f"--viewer_publish_every_steps must be >= 1, got {args.viewer_publish_every_steps}."
+        )
+    if int(args.viewer_board_every_steps) <= 0:
+        raise ValueError(
+            f"--viewer_board_every_steps must be >= 1, got {args.viewer_board_every_steps}."
+        )
+    if int(args.viewer_max_queue) <= 0:
+        raise ValueError(f"--viewer_max_queue must be >= 1, got {args.viewer_max_queue}.")
 
     configure_cpu_runtime(
         torch_num_threads=max(0, int(args.torch_num_threads)),
@@ -387,6 +582,111 @@ def main() -> int:
         raise RuntimeError(
             f"Stop file already exists at {stop_file}. Remove it before starting collection."
         )
+
+    viewer_enabled = bool(args.viewer)
+    viewer: Any = None
+    viewer_queue: Any = None
+    viewer_manager: Any = None
+    live_viewer_cls: Any = None
+    viewer_max_events = max(1, int(args.viewer_max_queue))
+    viewer_event_buffer: deque[Dict[str, object]] = deque(maxlen=viewer_max_events)
+    viewer_reopen_file = (
+        Path(args.viewer_reopen_file)
+        if args.viewer_reopen_file is not None
+        else (progress_path.parent / "VIEWER_OPEN")
+    )
+
+    def create_viewer_instance() -> Any:
+        if live_viewer_cls is None:
+            return None
+        try:
+            next_viewer = live_viewer_cls(
+                mode="collect_data",
+                total_workers=int(args.collect_workers),
+                total_episodes=int(args.num_episodes),
+                fullscreen=bool(args.viewer_fullscreen),
+                fps=int(args.viewer_fps),
+                grid_padding=int(args.viewer_grid_padding),
+                min_tile_px=int(args.viewer_min_tile_px),
+                initial_selected_worker=int(args.viewer_agent),
+                run_dir=str(out_dir),
+            )
+            if not next_viewer.ready:
+                return None
+            return next_viewer
+        except Exception:
+            return None
+
+    if viewer_enabled:
+        try:
+            from .viewer_live import LiveCollectionViewer
+
+            live_viewer_cls = LiveCollectionViewer
+            viewer = create_viewer_instance()
+            if viewer is None:
+                print(
+                    "[collect_data] warning: viewer init failed; starting headless. "
+                    f"Create '{viewer_reopen_file}' to retry open."
+                )
+            if int(args.collect_workers) > 1:
+                viewer_manager = mp.Manager()
+                viewer_queue = viewer_manager.Queue(max(1, int(args.viewer_max_queue)))
+        except Exception as exc:
+            print(f"[collect_data] warning: viewer unavailable ({exc}); continuing headless.")
+            viewer_enabled = False
+            viewer = None
+
+    def emit_viewer_event(event: Dict[str, object]) -> None:
+        if not viewer_enabled:
+            return
+        event_payload = dict(event)
+        event_payload.setdefault("mode", "collect_data")
+        event_payload.setdefault("timestamp", float(time.time()))
+        if viewer_queue is not None:
+            if not queue_put_best_effort(viewer_queue, event_payload):
+                viewer_event_buffer.append(event_payload)
+            return
+        viewer_event_buffer.append(event_payload)
+        if viewer is not None and not viewer.closed:
+            viewer.process_event(event_payload)
+
+    def pump_viewer() -> None:
+        nonlocal viewer
+        if not viewer_enabled:
+            return
+        if viewer_queue is not None:
+            for _ in range(2048):
+                try:
+                    ev = viewer_queue.get_nowait()
+                except queue_mod.Empty:
+                    break
+                except Exception:
+                    break
+                viewer_event_buffer.append(ev)
+                if viewer is not None and not viewer.closed:
+                    viewer.process_event(ev)
+
+        if viewer is not None and viewer.closed:
+            viewer = None
+
+        if viewer is None and live_viewer_cls is not None and viewer_reopen_file.exists():
+            try:
+                viewer_reopen_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+            viewer = create_viewer_instance()
+            if viewer is not None:
+                for ev in viewer_event_buffer:
+                    viewer.process_event(ev)
+                print(f"[collect_data] viewer reopened via trigger: {viewer_reopen_file}")
+            else:
+                print(
+                    "[collect_data] warning: viewer reopen failed. "
+                    f"Create '{viewer_reopen_file}' again to retry."
+                )
+
+        if viewer is not None and not viewer.closed:
+            viewer.tick()
 
     episode_records: Dict[int, List[Dict[str, object]]] = {}
     skipped_no_legal = 0
@@ -444,6 +744,7 @@ def main() -> int:
         nonlocal last_progress_emit
         now = time.time()
         if not force and (now - last_progress_emit) < float(args.progress_every_sec):
+            pump_viewer()
             return
         payload = make_progress_payload(status=status, final_vocab=final_vocab)
         if progress_console:
@@ -463,7 +764,16 @@ def main() -> int:
             )
         if progress_json:
             _write_progress_json(progress_path, payload)
+        emit_viewer_event(
+            {
+                "type": "run_progress",
+                "mode": "collect_data",
+                **payload,
+                "run_dir": str(out_dir),
+            }
+        )
         last_progress_emit = now
+        pump_viewer()
 
     def ingest_episode_result(result: Dict[str, object]) -> None:
         nonlocal episodes_completed
@@ -500,11 +810,41 @@ def main() -> int:
         by_episode = episodes_completed % max(1, int(args.log_every)) == 0
         emit_progress(status="running", force=by_episode)
 
+    emit_viewer_event(
+        {
+            "type": "run_started",
+            "mode": "collect_data",
+            "status": "running",
+            "episodes_total": int(args.num_episodes),
+            "episodes_completed": 0,
+            "episodes_with_data": 0,
+            "transitions_collected": 0,
+            "collect_workers": int(args.collect_workers),
+            "progress_path": str(progress_path).replace("\\", "/"),
+            "run_dir": str(out_dir),
+        }
+    )
+    if int(args.collect_workers) == 1:
+        main_pid_label = f"PID {os.getpid()}"
+        emit_viewer_event(
+            {
+                "type": "worker_started",
+                "mode": "collect_data",
+                "status": "active",
+                "worker_slot": 1,
+                "worker_label": main_pid_label,
+                "worker_key": f"pid:{os.getpid()}",
+            }
+        )
     emit_progress(status="running", force=True)
 
     try:
         if int(args.collect_workers) == 1:
             with BCEnvAdapter(lib_path=lib_path, seed=args.seed) as env:
+                def publish_and_pump(event: Dict[str, object]) -> None:
+                    emit_viewer_event(event)
+                    pump_viewer()
+
                 for episode_id in range(int(args.num_episodes)):
                     if stop_requested():
                         stopped_early = True
@@ -518,8 +858,15 @@ def main() -> int:
                         max_steps_per_episode=int(args.max_steps_per_episode),
                         think_ms=int(args.think_ms),
                         encoder_cfg=encoder_cfg,
+                        publish_event=publish_and_pump if viewer_enabled else None,
+                        publish_every_steps=int(args.viewer_publish_every_steps),
+                        compact_telemetry=bool(args.viewer_compact_telemetry),
+                        board_every_steps=int(args.viewer_board_every_steps),
+                        worker_slot=1,
+                        worker_label=main_pid_label,
                     )
                     ingest_episode_result(result)
+                    pump_viewer()
         else:
             ctx = mp.get_context("spawn")
             pool = ctx.Pool(
@@ -536,6 +883,10 @@ def main() -> int:
                     int(args.omp_num_threads),
                     int(args.mkl_num_threads),
                     int(args.openblas_num_threads),
+                    viewer_queue if viewer_enabled else None,
+                    int(args.viewer_publish_every_steps),
+                    bool(args.viewer_compact_telemetry),
+                    int(args.viewer_board_every_steps),
                 ),
                 maxtasksperchild=(
                     int(args.worker_maxtasksperchild)
@@ -549,13 +900,31 @@ def main() -> int:
                     range(int(args.num_episodes)),
                     chunksize=int(args.worker_chunksize),
                 )
-                for result in iterator:
-                    ingest_episode_result(result)
+                expected_results = int(args.num_episodes)
+                received_results = 0
+                while received_results < expected_results:
                     if stop_requested():
                         stopped_early = True
                         stop_reason = f"manual stop file detected: {stop_file}"
                         emit_progress(status="stopping", force=True)
                         break
+                    try:
+                        result = iterator.next(
+                            timeout=max(0.01, 1.0 / float(max(5, int(args.viewer_fps))))
+                        )
+                    except mp.TimeoutError:
+                        pump_viewer()
+                        continue
+                    except StopIteration:
+                        break
+                    ingest_episode_result(result)
+                    received_results += 1
+                    if stop_requested():
+                        stopped_early = True
+                        stop_reason = f"manual stop file detected: {stop_file}"
+                        emit_progress(status="stopping", force=True)
+                        break
+                    pump_viewer()
             finally:
                 if stopped_early:
                     pool.terminate()
@@ -563,6 +932,26 @@ def main() -> int:
                     pool.close()
                 pool.join()
     except Exception as exc:
+        emit_viewer_event(
+            {
+                "type": "run_done",
+                "mode": "collect_data",
+                "status": "failed",
+                "episodes_total": int(args.num_episodes),
+                "episodes_completed": int(episodes_completed),
+                "episodes_with_data": int(episodes_with_data),
+                "transitions_collected": int(transitions_collected),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        pump_viewer()
+        if viewer is not None:
+            viewer.close()
+        if viewer_manager is not None:
+            try:
+                viewer_manager.shutdown()
+            except Exception:
+                pass
         if progress_json:
             payload = make_progress_payload(status="failed")
             payload["error"] = f"{type(exc).__name__}: {exc}"
@@ -571,6 +960,26 @@ def main() -> int:
 
     episodes_with_data_ids = [ep for ep, rows in episode_records.items() if rows]
     if not episodes_with_data_ids:
+        emit_viewer_event(
+            {
+                "type": "run_done",
+                "mode": "collect_data",
+                "status": "failed",
+                "episodes_total": int(args.num_episodes),
+                "episodes_completed": int(episodes_completed),
+                "episodes_with_data": int(episodes_with_data),
+                "transitions_collected": int(transitions_collected),
+                "error": "No transitions were collected. Check build/library configuration.",
+            }
+        )
+        pump_viewer()
+        if viewer is not None:
+            viewer.close()
+        if viewer_manager is not None:
+            try:
+                viewer_manager.shutdown()
+            except Exception:
+                pass
         if progress_json:
             payload = make_progress_payload(status="failed")
             payload["error"] = "No transitions were collected. Check build/library configuration."
@@ -646,6 +1055,17 @@ def main() -> int:
             "progress_every_sec": float(args.progress_every_sec),
             "progress_path": str(progress_path).replace("\\", "/"),
             "stop_file": str(stop_file).replace("\\", "/"),
+            "viewer": bool(viewer_enabled),
+            "viewer_fullscreen": bool(args.viewer_fullscreen),
+            "viewer_fps": int(args.viewer_fps),
+            "viewer_publish_every_steps": int(args.viewer_publish_every_steps),
+            "viewer_compact_telemetry": bool(args.viewer_compact_telemetry),
+            "viewer_board_every_steps": int(args.viewer_board_every_steps),
+            "viewer_max_queue": int(args.viewer_max_queue),
+            "viewer_grid_padding": int(args.viewer_grid_padding),
+            "viewer_min_tile_px": int(args.viewer_min_tile_px),
+            "viewer_agent": int(args.viewer_agent),
+            "viewer_reopen_file": str(viewer_reopen_file).replace("\\", "/"),
         },
         "split_config": dataclass_to_dict(split_cfg),
         "splits": split_meta,
@@ -677,6 +1097,27 @@ def main() -> int:
 
     final_status = "stopped" if stopped_early else "done"
     emit_progress(status=final_status, force=True, final_vocab=int(len(codec)))
+    emit_viewer_event(
+        {
+            "type": "run_done",
+            "mode": "collect_data",
+            "status": final_status,
+            "episodes_total": int(args.num_episodes),
+            "episodes_completed": int(episodes_completed),
+            "episodes_with_data": int(episodes_with_data),
+            "transitions_collected": int(transitions_collected),
+            "collect_workers": int(args.collect_workers),
+            "run_dir": str(out_dir),
+        }
+    )
+    pump_viewer()
+    if viewer is not None:
+        viewer.close()
+    if viewer_manager is not None:
+        try:
+            viewer_manager.shutdown()
+        except Exception:
+            pass
 
     return 0
 

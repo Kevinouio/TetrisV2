@@ -102,6 +102,46 @@ Live progress:
 - `--progress_every_sec` (default `2.0`)
 - `--progress_path` (default `<out_dir>/progress.json`)
 
+Live pygame viewer (disabled by default):
+
+- `--viewer`
+- `--viewer_fullscreen` / `--no-viewer_fullscreen`
+- `--viewer_fps`
+- `--viewer_publish_every_steps` (auto defaults to `1` when `--viewer` is enabled and flag is unset)
+- `--viewer_compact_telemetry` / `--no-viewer_compact_telemetry`
+- `--viewer_board_every_steps` (auto defaults to `1` when `--viewer` is enabled and flag is unset)
+- `--viewer_max_queue`
+- `--viewer_grid_padding`
+- `--viewer_min_tile_px`
+- `--viewer_agent`
+- `--viewer_reopen_file` (default sibling `VIEWER_OPEN` near progress output)
+
+Viewer controls:
+- `Click`/`Arrow keys`/`Tab` to select worker card
+- `PageUp`/`PageDown` or `[`/`]` to change pages when workers overflow one screen
+- `F11` fullscreen toggle, `R` reset focus, `Q` close viewer
+
+Worker identity:
+- Worker cards are PID-based (`PID <pid>`).
+- If a worker respawns, it appears as a new PID card.
+- Stale PID cards are pruned after inactivity.
+
+Example:
+
+```bash
+python -m bc.collect_data \
+  --lib build-wsl-rel/TetrisVersionTwo/libtetris_v2_c_api.so \
+  --num_episodes 2000 \
+  --collect_workers 4 \
+  --viewer
+```
+
+Viewer overhead note:
+- With `--viewer` enabled, the default is per-step publishing for full live playback.
+- For lower overhead, explicitly increase `--viewer_publish_every_steps` and `--viewer_board_every_steps`.
+- Keep `--viewer_compact_telemetry` enabled when tuning for throughput.
+- `--viewer_max_queue` bounds IPC memory; overflow drops telemetry events (collection continues).
+
 Manual early stop while running:
 
 - `--stop_file` (default `<out_dir>/STOP`)
@@ -116,6 +156,21 @@ Outputs:
 - `data/bc_top1/shards/*.pt`
 - `data/bc_top1/metadata.json`
 - `data/bc_top1/progress.json`
+
+## DAgger Collection Viewer
+
+`bc.dagger` supports the same live viewer flags during each round collection step:
+
+```bash
+python -m bc.dagger \
+  --base_data_dir data/bc_top1 \
+  --run_dir runs/bc_dagger \
+  --lib build-wsl-rel/TetrisVersionTwo/libtetris_v2_c_api.so \
+  --collect_workers 4 \
+  --viewer
+```
+
+The DAgger viewer additionally surfaces round telemetry (`round_id`, `beta`, expert/learner step split, learner fallback counters).
 
 ## BC Autoplay in Pygame Viewer
 
