@@ -101,11 +101,18 @@ Live progress:
 - `--progress_mode {console,json,both}` (default `both`)
 - `--progress_every_sec` (default `2.0`)
 - `--progress_path` (default `<out_dir>/progress.json`)
+- `--rss_warn_mb` (warn once on main-process RSS threshold, default disabled)
+- `--worker_rss_warn_mb` (warn once on max worker RSS threshold, default disabled)
+- When `--viewer` is enabled, progress payloads also include additive viewer health fields:
+  - `viewer_events_processed`
+  - `viewer_frames_rendered`
+  - `viewer_restart_count`
+  - `viewer_last_frame_age_sec`
 
 Live pygame viewer (disabled by default):
 
 - `--viewer`
-- `--viewer_fullscreen` / `--no-viewer_fullscreen`
+- `--viewer_fullscreen` / `--no-viewer_fullscreen` (default: windowed / no-fullscreen)
 - `--viewer_fps`
 - `--viewer_publish_every_steps` (auto defaults to `1` when `--viewer` is enabled and flag is unset)
 - `--viewer_compact_telemetry` / `--no-viewer_compact_telemetry`
@@ -141,6 +148,8 @@ Viewer overhead note:
 - For lower overhead, explicitly increase `--viewer_publish_every_steps` and `--viewer_board_every_steps`.
 - Keep `--viewer_compact_telemetry` enabled when tuning for throughput.
 - `--viewer_max_queue` bounds IPC memory; overflow drops telemetry events (collection continues).
+- With `--viewer` off, collection no longer imports `pygame`, reducing headless startup/memory overhead.
+- Collection now spools episode records to temporary files and streams shard builds to avoid unbounded in-memory growth on long runs.
 
 Manual early stop while running:
 

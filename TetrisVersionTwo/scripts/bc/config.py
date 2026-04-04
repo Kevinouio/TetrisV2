@@ -39,7 +39,7 @@ class SplitConfig:
 class CollectionConfig:
     num_episodes: int = 5_000
     max_steps_per_episode: int = 2_000
-    think_ms: int = 20
+    think_ms: int = 1000
     seed: int = 1234
     episodes_per_shard: int = 200
 

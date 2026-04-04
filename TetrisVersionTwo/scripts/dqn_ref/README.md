@@ -99,12 +99,31 @@ python -m dqn_ref.train \
   --smoke
 ```
 
+## TensorBoard Logging (Default On)
+TensorBoard event files are written by default to a timestamped session directory under:
+- `<run_dir>/tensorboard/<YYYYMMDD-HHMMSS>/events.out.tfevents.*`
+
+New controls:
+- `--tensorboard` / `--no-tensorboard` (default on)
+- `--tensorboard_dir <path>` (default `<run_dir>/tensorboard`)
+- `--tensorboard_backfill` / `--no-tensorboard_backfill` (default on)
+
+Backfill behavior:
+- With backfill enabled, existing `episode_metrics.csv` and `generation_metrics.csv` are read at startup and
+  re-emitted to the current TensorBoard session before CSV files are overwritten.
+
+Launch TensorBoard:
+```bash
+tensorboard --logdir runs/dqn_ref/tensorboard
+```
+
 ## Key Outputs
 - `runs/dqn_ref/config.json`
 - `runs/dqn_ref/episode_metrics.csv`
 - `runs/dqn_ref/generation_metrics.csv`
 - `runs/dqn_ref/summary.json`
 - `runs/dqn_ref/model/best_model.pt`
+- `runs/dqn_ref/tensorboard/<session>/events.out.tfevents.*`
 
 ## Performance Benchmarks
 ```bash

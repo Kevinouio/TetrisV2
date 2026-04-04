@@ -20,7 +20,10 @@ coverage*
 
 # C/C++ builds
 build/
+build-*/
 build-wsl/
+build-wsl-asan-only/
+build-wsl-asan/
 Tetris-A.I/
 cmake-build-*/
 CMakeCache.txt

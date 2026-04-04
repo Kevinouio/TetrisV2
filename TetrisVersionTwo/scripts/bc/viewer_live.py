@@ -6,15 +6,19 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from .viewer_telemetry import (
+    BOARD_COLS,
+    BOARD_ROWS,
+    board_for_event,
+    piece_ids_for_event,
+    queue_put_best_effort,
+)
 
 try:
     import pygame
 except Exception:  # pragma: no cover - optional dependency at runtime
     pygame = None  # type: ignore[assignment]
 
-
-BOARD_ROWS = 20
-BOARD_COLS = 10
 
 BG = (10, 14, 20)
 PANEL = (18, 24, 34)
@@ -39,77 +43,6 @@ PIECE_COLORS = {
     5: (80, 220, 100),  # S
     6: (240, 90, 90),  # Z
 }
-
-
-def _event_type_name(payload: object) -> str:
-    if not isinstance(payload, dict):
-        return ""
-    return str(payload.get("type", "")).strip()
-
-
-def queue_put_best_effort(event_queue: Any, event: Dict[str, object]) -> bool:
-    if event_queue is None:
-        return False
-    try:
-        event_queue.put_nowait(event)
-        return True
-    except Exception:
-        pass
-
-    event_type = _event_type_name(event)
-    if event_type == "step_snapshot":
-        return False
-
-    # If queue is full, preferentially evict stale step snapshots so terminal
-    # and run-level events can still get through.
-    drained: List[object] = []
-    removed_step = False
-    for _ in range(64):
-        try:
-            existing = event_queue.get_nowait()
-        except Exception:
-            break
-        existing_type = _event_type_name(existing)
-        if (not removed_step) and existing_type == "step_snapshot":
-            removed_step = True
-            continue
-        drained.append(existing)
-
-    if not removed_step:
-        for existing in drained:
-            try:
-                event_queue.put_nowait(existing)
-            except Exception:
-                break
-        return False
-
-    pushed = False
-    try:
-        event_queue.put_nowait(event)
-        pushed = True
-    except Exception:
-        pushed = False
-
-    for existing in drained:
-        try:
-            event_queue.put_nowait(existing)
-        except Exception:
-            break
-    return pushed
-
-
-def board_for_event(board: object) -> List[int]:
-    arr = np.asarray(board, dtype=np.uint8)
-    if arr.size != BOARD_ROWS * BOARD_COLS:
-        return [0] * (BOARD_ROWS * BOARD_COLS)
-    return arr.reshape(-1).astype(np.uint8, copy=False).tolist()
-
-
-def piece_ids_for_event(piece_ids: object) -> List[int]:
-    arr = np.asarray(piece_ids, dtype=np.uint8)
-    if arr.size != BOARD_ROWS * BOARD_COLS:
-        return [255] * (BOARD_ROWS * BOARD_COLS)
-    return arr.reshape(-1).astype(np.uint8, copy=False).tolist()
 
 
 @dataclass
@@ -176,6 +109,8 @@ class LiveCollectionViewer:
         self._small = None
         self._mono = None
         self._last_frame_ts = 0.0
+        self._last_render_ts = 0.0
+        self._rendered_frames = 0
         self._start_ts = time.time()
         self._windowed_size = (1600, 900)
         self._worker_rects: Dict[int, Tuple[int, int, int, int]] = {}
@@ -221,10 +156,20 @@ class LiveCollectionViewer:
             self._small = pygame.font.SysFont("Segoe UI", 16)
             self._mono = pygame.font.SysFont("Consolas", 16)
             self.ready = True
-            self._last_frame_ts = time.time()
+            self._last_frame_ts = 0.0
+            self._last_render_ts = 0.0
+            self._rendered_frames = 0
         except Exception:
             self.ready = False
             self.closed = True
+
+    @property
+    def rendered_frames(self) -> int:
+        return int(self._rendered_frames)
+
+    @property
+    def last_render_timestamp(self) -> float:
+        return float(self._last_render_ts)
 
     def close(self) -> None:
         if not self.ready:
@@ -299,7 +244,17 @@ class LiveCollectionViewer:
         if key and key in self._key_to_slot:
             slot = self._key_to_slot[key]
         else:
-            slot = self._allocate_slot(slot_hint)
+            adopted_slot = 0
+            if key and slot_hint > 0 and slot_hint in self.workers:
+                candidate = self.workers[slot_hint]
+                candidate_key = str(candidate.worker_key or "").strip()
+                if int(candidate.worker_pid) <= 0 and (
+                    candidate_key == "" or candidate_key.startswith("slot:")
+                ):
+                    adopted_slot = int(slot_hint)
+                    if candidate_key:
+                        self._key_to_slot.pop(candidate_key, None)
+            slot = int(adopted_slot if adopted_slot > 0 else self._allocate_slot(slot_hint))
             if key:
                 self._key_to_slot[key] = slot
 
@@ -614,14 +569,15 @@ class LiveCollectionViewer:
                         self._set_selected_slot(int(slot), snap_page=True)
                         break
 
-    def tick(self) -> None:
+    def tick(self, force: bool = False) -> None:
         if not self.ready or self.closed:
             return
 
         now = time.time()
-        min_dt = 1.0 / float(max(5, self.fps))
-        if now - self._last_frame_ts < min_dt:
-            return
+        if not bool(force):
+            min_dt = 1.0 / float(max(5, self.fps))
+            if now - self._last_frame_ts < min_dt:
+                return
         self._last_frame_ts = now
         self._handle_input()
         if self.closed:
@@ -788,4 +744,6 @@ class LiveCollectionViewer:
             screen.blit(small.render(f"run: {self.run_dir}", True, TEXT_DIM), (left_x, dy + dh - 24))
 
         pygame.display.flip()
+        self._rendered_frames += 1
+        self._last_render_ts = time.time()
         self._clock.tick(self.fps)

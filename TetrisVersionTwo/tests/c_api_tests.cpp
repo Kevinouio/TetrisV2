@@ -391,6 +391,51 @@ void test_cc_bot_null_safety() {
             nullptr) == 0);
 }
 
+void test_cc_bot_sparse_board_loop_stability() {
+    auto* env = tetris_cc_env_create(314159u);
+    auto* bot = tetris_cc_bot_create_default();
+    assert(env != nullptr);
+    assert(bot != nullptr);
+
+    std::array<std::uint8_t, 200> empty_board{};
+    empty_board.fill(0);
+    assert(
+        tetris_cc_env_set_visible_board_mask(
+            env, empty_board.data(), empty_board.size(), 1) == 1);
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
+
+    for (int i = 0; i < 16; ++i) {
+        int used_hold = 0;
+        std::size_t placement_index = 0;
+        float score = 0.0f;
+        std::uint64_t nodes = 0;
+        double think_ms = 0.0;
+        double nps = 0.0;
+        int budget_miss = 0;
+
+        int ok = tetris_cc_bot_choose_ex(
+            bot,
+            5,
+            &used_hold,
+            &placement_index,
+            &score,
+            &nodes,
+            &think_ms,
+            &nps,
+            &budget_miss);
+        assert(ok == 1);
+        assert(used_hold == 0 || used_hold == 1);
+        assert(std::isfinite(score));
+        assert(nodes > 0);
+        assert(think_ms >= 0.0);
+        assert(nps >= 0.0);
+        assert(budget_miss == 0 || budget_miss == 1);
+    }
+
+    tetris_cc_bot_destroy(bot);
+    tetris_cc_env_destroy(env);
+}
+
 void test_cc_bot_loop_and_budget_scaling() {
     auto* env = tetris_cc_env_create(24680);
     auto* bot = tetris_cc_bot_create_default();
@@ -496,6 +541,7 @@ int main() {
     test_cc_candidate_batch_api_matches_placement_api();
     test_cc_rotation_trace_disables_rotate180();
     test_cc_bot_null_safety();
+    test_cc_bot_sparse_board_loop_stability();
     test_cc_bot_loop_and_budget_scaling();
     return 0;
 }

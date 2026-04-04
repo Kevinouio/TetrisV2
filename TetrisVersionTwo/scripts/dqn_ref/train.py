@@ -23,6 +23,7 @@ from .agent import DQNRefAgent
 from .config import DQNRefConfig, GAConfig, RuntimeConfig, TrainingConfig
 from .env_bridge import DQNRefEnvBridge
 from .genetic import GeneticPopulation, PopulationEntry
+from .tensorboard_logger import DQNTensorBoardLogger
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,8 +90,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--viewer_fullscreen",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Start viewer in fullscreen mode (default: true).",
+        default=False,
+        help="Start viewer in fullscreen mode (default: false).",
     )
     parser.add_argument("--viewer_fps", type=int, default=20, help="Viewer redraw FPS.")
     parser.add_argument(
@@ -125,6 +126,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional file trigger path. Creating this file reopens the live viewer.",
+    )
+    parser.add_argument(
+        "--tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write TensorBoard event logs (default: true).",
+    )
+    parser.add_argument(
+        "--tensorboard_dir",
+        type=Path,
+        default=None,
+        help="TensorBoard root directory (default: <run_dir>/tensorboard).",
+    )
+    parser.add_argument(
+        "--tensorboard_backfill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Backfill TensorBoard from prior CSV logs before they are overwritten (default: true).",
     )
 
     parser.add_argument("--smoke", action="store_true", help="Run a tiny smoke config (pop=4, gen=1, games=2).")
@@ -575,10 +594,21 @@ def main() -> int:
     model_dir.mkdir(parents=True, exist_ok=True)
     model_checkpoint = model_dir / "best_model.pt"
     hiscore_path = run_dir / "hiscore.txt"
+    episode_csv = run_dir / "episode_metrics.csv"
+    generation_csv = run_dir / "generation_metrics.csv"
+    summary_json = run_dir / "summary.json"
     viewer_max_events = max(1, int(args.viewer_max_queue))
     viewer_event_buffer: deque[Dict[str, object]] = deque(maxlen=viewer_max_events)
     viewer_reopen_file = (
         Path(args.viewer_reopen_file) if args.viewer_reopen_file is not None else (run_dir / "VIEWER_OPEN")
+    )
+    tensorboard_dir = (
+        Path(args.tensorboard_dir) if args.tensorboard_dir is not None else (run_dir / "tensorboard")
+    )
+    tb_logger = DQNTensorBoardLogger(
+        enabled=bool(args.tensorboard),
+        log_root_dir=tensorboard_dir,
+        backfill_enabled=bool(args.tensorboard_backfill),
     )
 
     hiscore = 0.0
@@ -587,6 +617,24 @@ def main() -> int:
             hiscore = float(hiscore_path.read_text(encoding="utf-8").strip())
         except Exception:
             hiscore = 0.0
+
+    backfilled_episode_rows = 0
+    backfilled_generation_rows = 0
+    if bool(args.tensorboard) and bool(args.tensorboard_backfill):
+        backfilled_episode_rows, backfilled_generation_rows = tb_logger.backfill_from_csv(
+            episode_csv_path=episode_csv,
+            generation_csv_path=generation_csv,
+        )
+        print(
+            "[dqn_ref] tensorboard backfill "
+            f"episode_rows={backfilled_episode_rows} "
+            f"generation_rows={backfilled_generation_rows}"
+        )
+    if bool(args.tensorboard) and (not tb_logger.ready) and tb_logger.unavailable_reason:
+        print(
+            "[dqn_ref] warning: tensorboard unavailable "
+            f"({tb_logger.unavailable_reason}); continuing without TensorBoard events."
+        )
 
     def create_viewer_instance() -> Any:
         if live_viewer_cls is None:
@@ -649,6 +697,14 @@ def main() -> int:
             "initial_agent": int(args.viewer_agent),
             "reopen_file": str(viewer_reopen_file),
         },
+        "tensorboard": {
+            "enabled": bool(args.tensorboard),
+            "dir": str(tensorboard_dir),
+            "backfill": bool(args.tensorboard_backfill),
+            "session_dir": str(tb_logger.session_dir) if tb_logger.session_dir is not None else "",
+            "backfilled_episode_rows": int(backfilled_episode_rows),
+            "backfilled_generation_rows": int(backfilled_generation_rows),
+        },
         "lib_path": str(lib_path),
     }
     write_json(run_dir / "config.json", cfg_payload)
@@ -703,9 +759,6 @@ def main() -> int:
         if viewer is not None and not viewer.closed:
             viewer.tick()
 
-    episode_csv = run_dir / "episode_metrics.csv"
-    generation_csv = run_dir / "generation_metrics.csv"
-    summary_json = run_dir / "summary.json"
     generation_history: List[Dict[str, object]] = []
 
     episode_fields = [
@@ -741,202 +794,206 @@ def main() -> int:
         "checkpoint_path",
     ]
 
-    with episode_csv.open("w", newline="", encoding="utf-8") as ep_fp, generation_csv.open(
-        "w", newline="", encoding="utf-8"
-    ) as gen_fp:
-        episode_writer = csv.DictWriter(ep_fp, fieldnames=episode_fields)
-        generation_writer = csv.DictWriter(gen_fp, fieldnames=generation_fields)
-        episode_writer.writeheader()
-        generation_writer.writeheader()
+    try:
+        with episode_csv.open("w", newline="", encoding="utf-8") as ep_fp, generation_csv.open(
+            "w", newline="", encoding="utf-8"
+        ) as gen_fp:
+            episode_writer = csv.DictWriter(ep_fp, fieldnames=episode_fields)
+            generation_writer = csv.DictWriter(gen_fp, fieldnames=generation_fields)
+            episode_writer.writeheader()
+            generation_writer.writeheader()
 
-        gp = GeneticPopulation(
-            config=cfg,
-            device=device,
-            seed=int(args.seed),
-            model_checkpoint=model_checkpoint,
-        )
-        pop = gp.create_population(cfg.ga.population_size)
-
-        for generation in range(1, int(cfg.ga.generations) + 1):
-            print(f"[dqn_ref] generation {generation}/{cfg.ga.generations}")
-            emit_viewer_event(
-                {
-                    "type": "generation_started",
-                    "generation": int(generation),
-                    "population_size": int(len(pop)),
-                    "games_per_agent": int(cfg.ga.total_games_per_agent),
-                    "timestamp": float(time.time()),
-                }
+            gp = GeneticPopulation(
+                config=cfg,
+                device=device,
+                seed=int(args.seed),
+                model_checkpoint=model_checkpoint,
             )
-            fitness_values: List[float] = []
-            worker_results: Dict[int, Dict[str, Any]] = {}
+            pop = gp.create_population(cfg.ga.population_size)
 
-            if agent_workers <= 1:
-                for agent_index, entry in enumerate(pop, start=1):
-                    total_lines = 0.0
-                    total_return = 0.0
-                    total_survival = 0.0
-                    last_metrics: Dict[str, float] = {}
-                    emit_viewer_event(
-                        {
-                            "type": "agent_started",
-                            "generation": int(generation),
-                            "agent_index": int(agent_index),
-                            "games_per_agent": int(cfg.ga.total_games_per_agent),
-                            "status": "active",
-                            "timestamp": float(time.time()),
-                        }
-                    )
-
-                    with DQNRefEnvBridge(
-                        lib_path=lib_path,
-                        seed=episode_seed(args.seed, generation, agent_index, 0),
-                    ) as env:
-                        def publish_and_pump(event: Dict[str, object]) -> None:
-                            emit_viewer_event(event)
-                            pump_viewer()
-
-                        for episode_index in range(1, int(cfg.ga.total_games_per_agent) + 1):
-                            metrics = run_episode(
-                                env=env,
-                                agent=entry.agent,
-                                seed=episode_seed(args.seed, generation, agent_index, episode_index),
-                                max_steps_per_episode=int(cfg.training.max_steps_per_episode),
-                                generation=int(generation),
-                                agent_index=int(agent_index),
-                                episode_index=int(episode_index),
-                                games_per_agent=int(cfg.ga.total_games_per_agent),
-                                total_lines_before_episode=float(total_lines),
-                                publish_every_steps=int(args.viewer_publish_every_steps),
-                                compact_telemetry=bool(args.viewer_compact_telemetry),
-                                board_every_steps=int(args.viewer_board_every_steps),
-                                publish_event=publish_and_pump if viewer is not None else None,
-                            )
-                            total_lines += float(metrics["lines_cleared"])
-                            total_return += float(metrics["episode_return"])
-                            total_survival += float(metrics["survival_length"])
-                            last_metrics = metrics
-
-                            row = {
-                                "generation": generation,
-                                "agent_index": agent_index,
-                                "episode_index": episode_index,
-                            }
-                            row.update(metrics)
-                            episode_writer.writerow(row)
-
-                            if episode_index % int(cfg.runtime.log_every_episodes) == 0:
-                                print(
-                                    "[dqn_ref] "
-                                    f"gen={generation} agent={agent_index}/{len(pop)} "
-                                    f"ep={episode_index}/{cfg.ga.total_games_per_agent} "
-                                    f"lines={metrics['lines_cleared']:.1f} "
-                                    f"ret={metrics['episode_return']:.2f} "
-                                    f"eps={metrics['epsilon']:.5f} "
-                                    f"loss={metrics['loss']:.4f}"
-                                )
-                            pump_viewer()
-
-                    entry.fitness = float(total_lines / float(cfg.ga.total_games_per_agent))
-                    fitness_values.append(entry.fitness)
-                    worker_results[int(agent_index)] = {
-                        "agent_index": int(agent_index),
-                        "fitness": float(entry.fitness),
-                        "avg_return": float(total_return / cfg.ga.total_games_per_agent),
-                        "avg_survival": float(total_survival / cfg.ga.total_games_per_agent),
-                        "last_metrics": dict(last_metrics),
-                        "checkpoint_payload": _agent_checkpoint_payload(entry.agent),
+            for generation in range(1, int(cfg.ga.generations) + 1):
+                print(f"[dqn_ref] generation {generation}/{cfg.ga.generations}")
+                emit_viewer_event(
+                    {
+                        "type": "generation_started",
+                        "generation": int(generation),
+                        "population_size": int(len(pop)),
+                        "games_per_agent": int(cfg.ga.total_games_per_agent),
+                        "timestamp": float(time.time()),
                     }
-                    print(
-                        "[dqn_ref] "
-                        f"gen={generation} agent={agent_index} fitness={entry.fitness:.4f} "
-                        f"avg_return={total_return / cfg.ga.total_games_per_agent:.2f} "
-                        f"avg_survival={total_survival / cfg.ga.total_games_per_agent:.1f}"
-                    )
-                    emit_viewer_event(
-                        {
-                            "type": "agent_done",
-                            "generation": int(generation),
+                )
+                fitness_values: List[float] = []
+                worker_results: Dict[int, Dict[str, Any]] = {}
+
+                if agent_workers <= 1:
+                    for agent_index, entry in enumerate(pop, start=1):
+                        total_lines = 0.0
+                        total_return = 0.0
+                        total_survival = 0.0
+                        last_metrics: Dict[str, float] = {}
+                        emit_viewer_event(
+                            {
+                                "type": "agent_started",
+                                "generation": int(generation),
+                                "agent_index": int(agent_index),
+                                "games_per_agent": int(cfg.ga.total_games_per_agent),
+                                "status": "active",
+                                "timestamp": float(time.time()),
+                            }
+                        )
+
+                        with DQNRefEnvBridge(
+                            lib_path=lib_path,
+                            seed=episode_seed(args.seed, generation, agent_index, 0),
+                        ) as env:
+
+                            def publish_and_pump(event: Dict[str, object]) -> None:
+                                emit_viewer_event(event)
+                                pump_viewer()
+
+                            for episode_index in range(1, int(cfg.ga.total_games_per_agent) + 1):
+                                metrics = run_episode(
+                                    env=env,
+                                    agent=entry.agent,
+                                    seed=episode_seed(args.seed, generation, agent_index, episode_index),
+                                    max_steps_per_episode=int(cfg.training.max_steps_per_episode),
+                                    generation=int(generation),
+                                    agent_index=int(agent_index),
+                                    episode_index=int(episode_index),
+                                    games_per_agent=int(cfg.ga.total_games_per_agent),
+                                    total_lines_before_episode=float(total_lines),
+                                    publish_every_steps=int(args.viewer_publish_every_steps),
+                                    compact_telemetry=bool(args.viewer_compact_telemetry),
+                                    board_every_steps=int(args.viewer_board_every_steps),
+                                    publish_event=publish_and_pump if viewer is not None else None,
+                                )
+                                total_lines += float(metrics["lines_cleared"])
+                                total_return += float(metrics["episode_return"])
+                                total_survival += float(metrics["survival_length"])
+                                last_metrics = metrics
+
+                                row = {
+                                    "generation": generation,
+                                    "agent_index": agent_index,
+                                    "episode_index": episode_index,
+                                }
+                                row.update(metrics)
+                                episode_writer.writerow(row)
+                                tb_logger.log_episode_row(row)
+
+                                if episode_index % int(cfg.runtime.log_every_episodes) == 0:
+                                    print(
+                                        "[dqn_ref] "
+                                        f"gen={generation} agent={agent_index}/{len(pop)} "
+                                        f"ep={episode_index}/{cfg.ga.total_games_per_agent} "
+                                        f"lines={metrics['lines_cleared']:.1f} "
+                                        f"ret={metrics['episode_return']:.2f} "
+                                        f"eps={metrics['epsilon']:.5f} "
+                                        f"loss={metrics['loss']:.4f}"
+                                    )
+                                pump_viewer()
+
+                        entry.fitness = float(total_lines / float(cfg.ga.total_games_per_agent))
+                        fitness_values.append(entry.fitness)
+                        worker_results[int(agent_index)] = {
                             "agent_index": int(agent_index),
-                            "episodes_completed": int(cfg.ga.total_games_per_agent),
                             "fitness": float(entry.fitness),
                             "avg_return": float(total_return / cfg.ga.total_games_per_agent),
                             "avg_survival": float(total_survival / cfg.ga.total_games_per_agent),
-                            "status": "done",
-                            "timestamp": float(time.time()),
+                            "last_metrics": dict(last_metrics),
+                            "checkpoint_payload": _agent_checkpoint_payload(entry.agent),
                         }
-                    )
-                    pump_viewer()
-            else:
-                print(
-                    "[dqn_ref] "
-                    f"parallel agent evaluation enabled (workers={agent_workers}, "
-                    f"population={len(pop)}, games_per_agent={cfg.ga.total_games_per_agent})"
-                )
-                futures: List[concurrent.futures.Future] = []
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=agent_workers,
-                    mp_context=mp.get_context("spawn"),
-                ) as executor:
-                    for agent_index, entry in enumerate(pop, start=1):
-                        futures.append(
-                            executor.submit(
-                                _evaluate_agent_worker,
-                                lib_path=str(lib_path),
-                                config=cfg,
-                                genome=dict(entry.genome),
-                                generation=int(generation),
-                                agent_index=int(agent_index),
-                                base_seed=int(args.seed),
-                                device_str=str(device),
-                                checkpoint_path=(
-                                    str(model_checkpoint) if model_checkpoint.exists() else None
-                                ),
-                                viewer_queue=viewer_queue,
-                                viewer_publish_every_steps=int(args.viewer_publish_every_steps),
-                                viewer_compact_telemetry=bool(args.viewer_compact_telemetry),
-                                viewer_board_every_steps=int(args.viewer_board_every_steps),
-                            )
+                        print(
+                            "[dqn_ref] "
+                            f"gen={generation} agent={agent_index} fitness={entry.fitness:.4f} "
+                            f"avg_return={total_return / cfg.ga.total_games_per_agent:.2f} "
+                            f"avg_survival={total_survival / cfg.ga.total_games_per_agent:.1f}"
                         )
-                    done_agents = 0
-                    pending = set(futures)
-                    while pending:
-                        done, pending = concurrent.futures.wait(
-                            pending,
-                            timeout=max(0.01, 1.0 / float(max(5, int(args.viewer_fps)))),
-                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        emit_viewer_event(
+                            {
+                                "type": "agent_done",
+                                "generation": int(generation),
+                                "agent_index": int(agent_index),
+                                "episodes_completed": int(cfg.ga.total_games_per_agent),
+                                "fitness": float(entry.fitness),
+                                "avg_return": float(total_return / cfg.ga.total_games_per_agent),
+                                "avg_survival": float(total_survival / cfg.ga.total_games_per_agent),
+                                "status": "done",
+                                "timestamp": float(time.time()),
+                            }
                         )
                         pump_viewer()
-                        for future in done:
-                            result = future.result()
-                            agent_index = int(result["agent_index"])
-                            worker_results[agent_index] = result
-                            done_agents += 1
-                            last_metrics = result.get("last_metrics", {})
-                            print(
-                                "[dqn_ref] "
-                                f"gen={generation} agent={agent_index}/{len(pop)} completed "
-                                f"({done_agents}/{len(pop)}) "
-                                f"fitness={float(result['fitness']):.4f} "
-                                f"last_eps={float(last_metrics.get('epsilon', 0.0)):.5f} "
-                                f"last_loss={float(last_metrics.get('loss', 0.0)):.4f}"
-                            )
-
-                for agent_index, entry in enumerate(pop, start=1):
-                    result = worker_results.get(agent_index)
-                    if result is None:
-                        raise RuntimeError(f"Missing worker result for agent_index={agent_index}.")
-                    rows = result.get("episode_rows", [])
-                    for row in rows:
-                        episode_writer.writerow(row)
-                    entry.fitness = float(result["fitness"])
-                    fitness_values.append(entry.fitness)
+                else:
                     print(
                         "[dqn_ref] "
-                        f"gen={generation} agent={agent_index} fitness={entry.fitness:.4f} "
-                        f"avg_return={float(result['avg_return']):.2f} "
-                        f"avg_survival={float(result['avg_survival']):.1f}"
+                        f"parallel agent evaluation enabled (workers={agent_workers}, "
+                        f"population={len(pop)}, games_per_agent={cfg.ga.total_games_per_agent})"
                     )
+                    futures: List[concurrent.futures.Future] = []
+                    with concurrent.futures.ProcessPoolExecutor(
+                        max_workers=agent_workers,
+                        mp_context=mp.get_context("spawn"),
+                    ) as executor:
+                        for agent_index, entry in enumerate(pop, start=1):
+                            futures.append(
+                                executor.submit(
+                                    _evaluate_agent_worker,
+                                    lib_path=str(lib_path),
+                                    config=cfg,
+                                    genome=dict(entry.genome),
+                                    generation=int(generation),
+                                    agent_index=int(agent_index),
+                                    base_seed=int(args.seed),
+                                    device_str=str(device),
+                                    checkpoint_path=(
+                                        str(model_checkpoint) if model_checkpoint.exists() else None
+                                    ),
+                                    viewer_queue=viewer_queue,
+                                    viewer_publish_every_steps=int(args.viewer_publish_every_steps),
+                                    viewer_compact_telemetry=bool(args.viewer_compact_telemetry),
+                                    viewer_board_every_steps=int(args.viewer_board_every_steps),
+                                )
+                            )
+                        done_agents = 0
+                        pending = set(futures)
+                        while pending:
+                            done, pending = concurrent.futures.wait(
+                                pending,
+                                timeout=max(0.01, 1.0 / float(max(5, int(args.viewer_fps)))),
+                                return_when=concurrent.futures.FIRST_COMPLETED,
+                            )
+                            pump_viewer()
+                            for future in done:
+                                result = future.result()
+                                agent_index = int(result["agent_index"])
+                                worker_results[agent_index] = result
+                                done_agents += 1
+                                last_metrics = result.get("last_metrics", {})
+                                print(
+                                    "[dqn_ref] "
+                                    f"gen={generation} agent={agent_index}/{len(pop)} completed "
+                                    f"({done_agents}/{len(pop)}) "
+                                    f"fitness={float(result['fitness']):.4f} "
+                                    f"last_eps={float(last_metrics.get('epsilon', 0.0)):.5f} "
+                                    f"last_loss={float(last_metrics.get('loss', 0.0)):.4f}"
+                                )
+
+                    for agent_index, entry in enumerate(pop, start=1):
+                        result = worker_results.get(agent_index)
+                        if result is None:
+                            raise RuntimeError(f"Missing worker result for agent_index={agent_index}.")
+                        rows = result.get("episode_rows", [])
+                        for row in rows:
+                            episode_writer.writerow(row)
+                            tb_logger.log_episode_row(row)
+                        entry.fitness = float(result["fitness"])
+                        fitness_values.append(entry.fitness)
+                        print(
+                            "[dqn_ref] "
+                            f"gen={generation} agent={agent_index} fitness={entry.fitness:.4f} "
+                            f"avg_return={float(result['avg_return']):.2f} "
+                            f"avg_survival={float(result['avg_survival']):.1f}"
+                        )
 
             best_entry_index = max(range(len(pop)), key=lambda idx: float(pop[idx].fitness))
             best_entry = pop[best_entry_index]
@@ -974,6 +1031,7 @@ def main() -> int:
                 "checkpoint_path": str(model_checkpoint if checkpoint_saved else ""),
             }
             generation_writer.writerow(gen_row)
+            tb_logger.log_generation_row(gen_row)
             generation_history.append(
                 {
                     **gen_row,
@@ -1007,10 +1065,13 @@ def main() -> int:
                 }
             )
             pump_viewer()
+            tb_logger.flush()
 
             if generation < int(cfg.ga.generations):
                 elites = gp.best_elites(pop)
                 pop = gp.next_population(elites, generation_number=generation)
+    finally:
+        tb_logger.close()
 
     print(f"[dqn_ref] done. artifacts: {run_dir}")
     if viewer is not None:

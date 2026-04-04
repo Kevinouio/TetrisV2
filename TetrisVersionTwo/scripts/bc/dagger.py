@@ -5,11 +5,10 @@ import argparse
 import json
 import multiprocessing as mp
 import os
-import queue as queue_mod
+import shutil
 import subprocess
 import sys
 import time
-from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -32,7 +31,8 @@ from .utils import (
     save_json,
     set_global_seeds,
 )
-from .viewer_live import board_for_event, piece_ids_for_event, queue_put_best_effort
+from .viewer_telemetry import board_for_event, piece_ids_for_event, queue_put_best_effort
+from .viewer_runtime import LiveViewerRuntime
 
 _WORKER_ENV: Optional[BCEnvAdapter] = None
 _WORKER_AGENT: Optional[BCAgent] = None
@@ -57,6 +57,14 @@ _WORKER_LABEL: str = "PID"
 
 def _argv_has_flag(argv: Sequence[str], flag: str) -> bool:
     return any(token == flag or token.startswith(f"{flag}=") for token in argv)
+
+
+def _iterator_next_with_timeout(iterator: Any, *, timeout: float) -> Any:
+    """Return next pool result while handling both IMapIterator and generator paths."""
+    next_with_timeout = getattr(iterator, "next", None)
+    if callable(next_with_timeout):
+        return next_with_timeout(timeout=float(timeout))
+    return next(iterator)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -163,12 +171,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=None,
         help="If this file appears during collection, stop current round early and keep partial data.",
     )
+    parser.add_argument(
+        "--rss_warn_mb",
+        type=float,
+        default=0.0,
+        help="Warn once when main-process RSS exceeds this threshold in MiB (0 disables).",
+    )
+    parser.add_argument(
+        "--worker_rss_warn_mb",
+        type=float,
+        default=0.0,
+        help="Warn once when any worker RSS exceeds this threshold in MiB (0 disables).",
+    )
     parser.add_argument("--viewer", action="store_true", help="Enable live pygame collection viewer.")
     parser.add_argument(
         "--viewer_fullscreen",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Start viewer in fullscreen mode (default: true).",
+        default=False,
+        help="Start viewer in fullscreen mode (default: false).",
     )
     parser.add_argument("--viewer_fps", type=int, default=20, help="Viewer redraw FPS.")
     parser.add_argument(
@@ -256,6 +276,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--viewer_board_every_steps must be >= 1.")
     if int(args.viewer_max_queue) <= 0:
         raise ValueError("--viewer_max_queue must be >= 1.")
+    if float(args.rss_warn_mb) < 0.0:
+        raise ValueError("--rss_warn_mb must be >= 0.")
+    if float(args.worker_rss_warn_mb) < 0.0:
+        raise ValueError("--worker_rss_warn_mb must be >= 0.")
 
 
 def _resolve_shard_paths(data_dir: Path, shard_values: Iterable[object]) -> List[str]:
@@ -400,6 +424,43 @@ def _unpack_dagger_rows_from_ipc(payload: Dict[str, object]) -> List[Dict[str, o
             }
         )
     return out
+
+
+def _current_rss_mb() -> float:
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        with open("/proc/self/statm", "r", encoding="utf-8") as handle:
+            parts = handle.read().strip().split()
+        if len(parts) >= 2:
+            return float(int(parts[1]) * int(page_size) / (1024.0 * 1024.0))
+    except Exception:
+        pass
+    return 0.0
+
+
+def _torch_load_cpu(path: Path) -> Dict[str, object]:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)  # type: ignore[call-arg]
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _spool_path_for_episode(spool_dir: Path, episode_id: int) -> Path:
+    return spool_dir / f"episode_{int(episode_id):010d}.pt"
+
+
+def _write_episode_rows_to_spool(spool_dir: Path, episode_id: int, rows: List[Dict[str, object]]) -> Path:
+    path = _spool_path_for_episode(spool_dir, int(episode_id))
+    payload = _pack_dagger_rows_for_ipc(rows)
+    torch.save(payload, path)
+    return path
+
+
+def _load_episode_rows_from_spool(path: Path) -> List[Dict[str, object]]:
+    payload = _torch_load_cpu(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unexpected spool payload type at {path}: {type(payload)}")
+    return _unpack_dagger_rows_from_ipc(payload)
 
 
 def _write_progress_json(path: Path, payload: Dict[str, object]) -> None:
@@ -913,6 +974,8 @@ def _collect_episode_worker(episode_id: int) -> Dict[str, object]:
         worker_label=str(_WORKER_LABEL),
     )
     result["records_packed"] = _pack_dagger_rows_for_ipc(result.pop("records"))
+    result["worker_pid"] = int(os.getpid())
+    result["worker_rss_mb"] = float(_current_rss_mb())
     return result
 
 
@@ -1057,6 +1120,8 @@ def _collect_dagger_round(
     worker_maxtasksperchild: int,
     progress_mode: str,
     progress_every_sec: float,
+    rss_warn_mb: float,
+    worker_rss_warn_mb: float,
     progress_path: Path,
     stop_file: Path,
     state_source: str,
@@ -1075,7 +1140,7 @@ def _collect_dagger_round(
     viewer_min_tile_px: int,
     viewer_agent: int,
     viewer_reopen_file: Optional[Path],
-) -> Tuple[Dict[int, List[Dict[str, object]]], Dict[str, object]]:
+) -> Tuple[Dict[int, Path], Dict[str, object], Path]:
     if stop_file.exists():
         raise RuntimeError(
             f"Stop file already exists at {stop_file}. Remove it before starting round collection."
@@ -1094,115 +1159,53 @@ def _collect_dagger_round(
         )
         collect_device = "cpu"
 
-    viewer: Any = None
-    viewer_queue: Any = None
-    viewer_manager: Any = None
-    live_viewer_cls: Any = None
-    viewer_enabled_local = bool(viewer_enabled)
-    viewer_max_events = max(1, int(viewer_max_queue))
-    viewer_event_buffer: deque[Dict[str, object]] = deque(maxlen=viewer_max_events)
     viewer_reopen_path = (
         Path(viewer_reopen_file)
         if viewer_reopen_file is not None
         else (progress_path.parent / "VIEWER_OPEN")
     )
-
-    def create_viewer_instance() -> Any:
-        if live_viewer_cls is None:
-            return None
-        try:
-            next_viewer = live_viewer_cls(
-                mode="dagger",
-                total_workers=int(collect_workers),
-                total_episodes=int(episodes_per_round),
-                fullscreen=bool(viewer_fullscreen),
-                fps=int(viewer_fps),
-                grid_padding=int(viewer_grid_padding),
-                min_tile_px=int(viewer_min_tile_px),
-                initial_selected_worker=int(viewer_agent),
-                run_dir=str(progress_path.parent),
-                round_id=int(round_id),
-                beta=float(beta),
-            )
-            if not next_viewer.ready:
-                return None
-            return next_viewer
-        except Exception:
-            return None
-
-    if viewer_enabled_local:
-        try:
-            from .viewer_live import LiveCollectionViewer
-
-            live_viewer_cls = LiveCollectionViewer
-            viewer = create_viewer_instance()
-            if viewer is None:
-                print(
-                    "[dagger] warning: viewer init failed; collecting headless. "
-                    f"Create '{viewer_reopen_path}' to retry open."
-                )
-            if int(collect_workers) > 1:
-                viewer_manager = mp.Manager()
-                viewer_queue = viewer_manager.Queue(max(1, int(viewer_max_queue)))
-        except Exception as exc:
-            print(f"[dagger] warning: viewer unavailable ({exc}); continuing headless.")
-            viewer_enabled_local = False
-            viewer = None
+    viewer_runtime = LiveViewerRuntime(
+        log_prefix="dagger",
+        enabled=bool(viewer_enabled),
+        mode="dagger",
+        total_workers=int(collect_workers),
+        total_episodes=int(episodes_per_round),
+        fullscreen=bool(viewer_fullscreen),
+        fps=int(viewer_fps),
+        grid_padding=int(viewer_grid_padding),
+        min_tile_px=int(viewer_min_tile_px),
+        initial_selected_worker=int(viewer_agent),
+        run_dir=str(progress_path.parent),
+        viewer_max_queue=int(viewer_max_queue),
+        reopen_file=viewer_reopen_path,
+        round_id=int(round_id),
+        beta=float(beta),
+    )
+    viewer_enabled_local = bool(viewer_runtime.enabled)
+    effective_worker_chunksize = int(worker_chunksize)
+    if viewer_enabled_local and effective_worker_chunksize > 1:
+        print(
+            "[dagger] info: viewer is enabled; forcing worker_chunksize=1 "
+            "to keep live pumping responsive."
+        )
+        effective_worker_chunksize = 1
 
     def emit_viewer_event(event: Dict[str, object]) -> None:
-        if not viewer_enabled_local:
-            return
-        event_payload = dict(event)
-        event_payload.setdefault("mode", "dagger")
-        event_payload.setdefault("timestamp", float(time.time()))
-        if viewer_queue is not None:
-            if not queue_put_best_effort(viewer_queue, event_payload):
-                viewer_event_buffer.append(event_payload)
-            return
-        viewer_event_buffer.append(event_payload)
-        if viewer is not None and not viewer.closed:
-            viewer.process_event(event_payload)
+        viewer_runtime.emit(event)
 
-    def pump_viewer() -> None:
-        nonlocal viewer
-        if not viewer_enabled_local:
-            return
-        if viewer_queue is not None:
-            for _ in range(2048):
-                try:
-                    ev = viewer_queue.get_nowait()
-                except queue_mod.Empty:
-                    break
-                except Exception:
-                    break
-                viewer_event_buffer.append(ev)
-                if viewer is not None and not viewer.closed:
-                    viewer.process_event(ev)
-
-        if viewer is not None and viewer.closed:
-            viewer = None
-
-        if viewer is None and live_viewer_cls is not None and viewer_reopen_path.exists():
-            try:
-                viewer_reopen_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            viewer = create_viewer_instance()
-            if viewer is not None:
-                for ev in viewer_event_buffer:
-                    viewer.process_event(ev)
-                print(f"[dagger] viewer reopened via trigger: {viewer_reopen_path}")
-            else:
-                print(
-                    "[dagger] warning: viewer reopen failed. "
-                    f"Create '{viewer_reopen_path}' again to retry."
-                )
-
-        if viewer is not None and not viewer.closed:
-            viewer.tick()
+    def pump_viewer(force_draw: bool = False) -> None:
+        viewer_runtime.pump(force_draw=bool(force_draw))
 
     episode_ids = [int(round_id * 1_000_000 + ep) for ep in range(int(episodes_per_round))]
-    episode_records: Dict[int, List[Dict[str, object]]] = {}
+    spool_dir = (
+        progress_path.parent
+        / f".tmp_dagger_collect_spool_round_{int(round_id):02d}_{int(time.time())}_{os.getpid()}"
+    )
+    ensure_dir(spool_dir)
+    atexit.register(lambda: shutil.rmtree(spool_dir, ignore_errors=True))
+
+    episode_spool_paths: Dict[int, Path] = {}
+    worker_rss_by_pid: Dict[int, float] = {}
 
     episodes_completed = 0
     episodes_with_data = 0
@@ -1228,6 +1231,8 @@ def _collect_dagger_round(
     stop_reason = ""
     started = time.time()
     last_progress_emit = 0.0
+    rss_warned_main = False
+    rss_warned_worker = False
 
     def stop_requested() -> bool:
         return stop_file.exists()
@@ -1246,7 +1251,13 @@ def _collect_dagger_round(
             if final_vocab is not None
             else int(len(codec) + len(potential_new_vocab))
         )
-        return {
+        rss_main_mb = float(_current_rss_mb())
+        rss_worker_max_mb = (
+            float(max(worker_rss_by_pid.values()))
+            if worker_rss_by_pid
+            else (rss_main_mb if int(collect_workers) == 1 else 0.0)
+        )
+        payload: Dict[str, object] = {
             "status": status,
             "round_id": int(round_id),
             "beta": float(beta),
@@ -1275,18 +1286,26 @@ def _collect_dagger_round(
             "episodes_max_steps_before_clear": int(episodes_max_steps_before_clear),
             "episodes_no_data_after_resamples": int(episodes_no_data_after_resamples),
             "collect_workers": int(collect_workers),
-            "worker_chunksize": int(worker_chunksize),
+            "worker_chunksize": int(effective_worker_chunksize),
             "worker_maxtasksperchild": int(worker_maxtasksperchild),
             "collect_device": str(collect_device),
             "progress_mode": progress_mode,
             "progress_path": str(progress_path).replace("\\", "/"),
             "stop_file": str(stop_file).replace("\\", "/"),
+            "rss_main_mb": rss_main_mb,
+            "rss_worker_max_mb": rss_worker_max_mb,
             "stopped_early": bool(stopped_early),
             "stop_reason": str(stop_reason),
         }
+        if viewer_enabled_local:
+            payload.update(viewer_runtime.health_snapshot())
+        return payload
 
     def emit_progress(status: str, force: bool = False, final_vocab: Optional[int] = None) -> None:
         nonlocal last_progress_emit
+        nonlocal rss_warned_main
+        nonlocal rss_warned_worker
+
         now = time.time()
         if not force and (now - last_progress_emit) < float(progress_every_sec):
             pump_viewer()
@@ -1302,11 +1321,27 @@ def _collect_dagger_round(
                 f"with_data={payload['episodes_with_data']} transitions={payload['transitions_collected']} "
                 f"vocab~={payload['estimated_vocab_size']} eps_per_sec={payload['episodes_per_sec']:.2f} "
                 f"eta={eta_text} expert_rate={payload['empirical_expert_action_rate']:.3f} "
+                f"rss(main={float(payload['rss_main_mb']):.1f}MiB, "
+                f"worker_max={float(payload['rss_worker_max_mb']):.1f}MiB) "
                 f"gen_attempts={payload['generation_attempts']} resampled={payload['resampled_samples']} "
                 f"clear={payload['episodes_cleared_garbage']} topout={payload['episodes_topout_before_clear']} "
                 f"max={payload['episodes_max_steps_before_clear']} no_data={payload['episodes_no_data_after_resamples']} "
                 f"skips(no_legal={payload['skipped_no_legal']},invalid_expert={payload['skipped_invalid_expert']},missing={payload['skipped_missing_tuple']})"
             )
+            if float(rss_warn_mb) > 0.0 and not rss_warned_main:
+                if float(payload["rss_main_mb"]) >= float(rss_warn_mb):
+                    print(
+                        f"[dagger][warning] main RSS reached {float(payload['rss_main_mb']):.1f} MiB "
+                        f"(threshold {float(rss_warn_mb):.1f} MiB)."
+                    )
+                    rss_warned_main = True
+            if float(worker_rss_warn_mb) > 0.0 and not rss_warned_worker:
+                if float(payload["rss_worker_max_mb"]) >= float(worker_rss_warn_mb):
+                    print(
+                        f"[dagger][warning] worker RSS reached {float(payload['rss_worker_max_mb']):.1f} MiB "
+                        f"(threshold {float(worker_rss_warn_mb):.1f} MiB)."
+                    )
+                    rss_warned_worker = True
         if progress_json:
             _write_progress_json(progress_path, payload)
         emit_viewer_event(
@@ -1350,13 +1385,15 @@ def _collect_dagger_round(
             raise ValueError(f"Expected list records or packed records for episode {episode_id}.")
         if not isinstance(records, list):
             raise ValueError(f"Expected list of records for episode {episode_id}.")
-        episode_records[episode_id] = records
 
         episodes_completed += 1
         episode_transitions = int(result.get("num_transitions", len(records)))
         transitions_collected += episode_transitions
         if records:
             episodes_with_data += 1
+            episode_spool_paths[episode_id] = _write_episode_rows_to_spool(
+                spool_dir, episode_id, records
+            )
 
         expert_steps += int(result.get("expert_steps", 0))
         learner_steps += int(result.get("learner_steps", 0))
@@ -1374,6 +1411,11 @@ def _collect_dagger_round(
         episodes_max_steps_before_clear += int(result.get("episodes_max_steps_before_clear", 0))
         episodes_no_data_after_resamples += int(result.get("episodes_no_data_after_resamples", 0))
 
+        worker_pid = int(result.get("worker_pid", 0))
+        worker_rss = float(result.get("worker_rss_mb", 0.0))
+        if worker_pid > 0 and worker_rss > 0.0:
+            worker_rss_by_pid[worker_pid] = worker_rss
+
         for row in records:
             expert_tup = _normalize_tuple(row["expert_action_tuple"])  # type: ignore[arg-type]
             if expert_tup not in codec.action_to_id:
@@ -1382,330 +1424,326 @@ def _collect_dagger_round(
         by_episode = episodes_completed % max(1, int(log_every)) == 0
         emit_progress(status="running", force=by_episode)
 
-    emit_viewer_event(
-        {
-            "type": "run_started",
-            "mode": "dagger",
-            "status": "running",
-            "round_id": int(round_id),
-            "beta": float(beta),
-            "episodes_total": int(episodes_per_round),
-            "episodes_completed": 0,
-            "episodes_with_data": 0,
-            "transitions_collected": 0,
-            "collect_workers": int(collect_workers),
-            "run_dir": str(progress_path.parent),
-            "progress_path": str(progress_path).replace("\\", "/"),
-        }
-    )
-    if int(collect_workers) == 1:
-        main_pid_label = f"PID {os.getpid()}"
-        emit_viewer_event(
-            {
-                "type": "worker_started",
-                "mode": "dagger",
-                "status": "active",
-                "worker_slot": 1,
-                "worker_label": main_pid_label,
-                "worker_key": f"pid:{os.getpid()}",
-                "round_id": int(round_id),
-                "beta": float(beta),
-            }
-        )
-    emit_progress(status="running", force=True)
+    keep_spool = False
     try:
+        emit_viewer_event(
+            {
+                "type": "run_started",
+                "mode": "dagger",
+                "status": "running",
+                "round_id": int(round_id),
+                "beta": float(beta),
+                "episodes_total": int(episodes_per_round),
+                "episodes_completed": 0,
+                "episodes_with_data": 0,
+                "transitions_collected": 0,
+                "collect_workers": int(collect_workers),
+                "run_dir": str(progress_path.parent),
+                "progress_path": str(progress_path).replace("\\", "/"),
+            }
+        )
+        if int(collect_workers) > 1:
+            viewer_runtime.emit_starting_workers(
+                extra_fields={"round_id": int(round_id), "beta": float(beta)}
+            )
         if int(collect_workers) == 1:
-            configure_cpu_runtime(
-                torch_num_threads=1,
-                torch_num_interop_threads=1,
-                omp_num_threads=1,
-                mkl_num_threads=1,
-                openblas_num_threads=1,
+            main_pid_label = f"PID {os.getpid()}"
+            emit_viewer_event(
+                {
+                    "type": "worker_started",
+                    "mode": "dagger",
+                    "status": "active",
+                    "worker_slot": 1,
+                    "worker_label": main_pid_label,
+                    "worker_key": f"pid:{os.getpid()}",
+                    "round_id": int(round_id),
+                    "beta": float(beta),
+                }
             )
-            with BCEnvAdapter(lib_path=lib_path, seed=seed + round_id) as env:
-                learner = BCAgent(
-                    checkpoint_path=learner_checkpoint,
-                    device=collect_device,
-                    env_adapter=env,
+        emit_progress(status="running", force=True)
+        pump_viewer(force_draw=True)
+        try:
+            if int(collect_workers) == 1:
+                configure_cpu_runtime(
+                    torch_num_threads=1,
+                    torch_num_interop_threads=1,
+                    omp_num_threads=1,
+                    mkl_num_threads=1,
+                    openblas_num_threads=1,
                 )
-                def publish_and_pump(event: Dict[str, object]) -> None:
-                    emit_viewer_event(event)
-                    pump_viewer()
-
-                for episode_id in episode_ids:
-                    if stop_requested():
-                        stopped_early = True
-                        stop_reason = f"manual stop file detected: {stop_file}"
-                        emit_progress(status="stopping", force=True)
-                        break
-                    result = _collect_episode_with_env(
-                        env=env,
-                        learner=learner,
-                        encoder_config=encoder_config,
-                        round_id=int(round_id),
-                        beta=float(beta),
-                        max_steps_per_episode=int(max_steps_per_episode),
-                        think_ms=int(think_ms),
-                        base_seed=int(seed),
-                        episode_id=int(episode_id),
-                        state_source=str(state_source),
-                        random_fill_y_max_exclusive=int(random_fill_y_max_exclusive),
-                        random_fill_prob=float(random_fill_prob),
-                        random_max_resamples_per_sample=int(random_max_resamples_per_sample),
-                        random_post_clear_steps=int(random_post_clear_steps),
-                        publish_event=publish_and_pump if viewer_enabled_local else None,
-                        publish_every_steps=int(viewer_publish_every_steps),
-                        compact_telemetry=bool(viewer_compact_telemetry),
-                        board_every_steps=int(viewer_board_every_steps),
-                        worker_slot=1,
-                        worker_label=main_pid_label,
+                with BCEnvAdapter(lib_path=lib_path, seed=seed + round_id) as env:
+                    learner = BCAgent(
+                        checkpoint_path=learner_checkpoint,
+                        device=collect_device,
+                        env_adapter=env,
                     )
-                    ingest_episode_result(result)
-                    pump_viewer()
-        else:
-            ctx = mp.get_context("spawn")
-            pool = ctx.Pool(
-                processes=int(collect_workers),
-                initializer=_worker_init,
-                initargs=(
-                    str(lib_path),
-                    str(learner_checkpoint),
-                    collect_device,
-                    {
-                        "board_height": int(encoder_config.board_height),
-                        "board_width": int(encoder_config.board_width),
-                        "queue_length": int(encoder_config.queue_length),
-                        "include_scalars": bool(encoder_config.include_scalars),
-                    },
-                    int(round_id),
-                    float(beta),
-                    int(max_steps_per_episode),
-                    int(think_ms),
-                    int(seed),
-                    str(state_source),
-                    int(random_fill_y_max_exclusive),
-                    float(random_fill_prob),
-                    int(random_max_resamples_per_sample),
-                    int(random_post_clear_steps),
-                    viewer_queue if viewer_enabled_local else None,
-                    int(viewer_publish_every_steps),
-                    bool(viewer_compact_telemetry),
-                    int(viewer_board_every_steps),
-                ),
-                maxtasksperchild=(
-                    int(worker_maxtasksperchild)
-                    if int(worker_maxtasksperchild) > 0
-                    else None
-                ),
-            )
-            try:
-                iterator = pool.imap_unordered(
-                    _collect_episode_worker,
-                    episode_ids,
-                    chunksize=int(worker_chunksize),
-                )
-                expected_results = len(episode_ids)
-                received_results = 0
-                while received_results < expected_results:
-                    if stop_requested():
-                        stopped_early = True
-                        stop_reason = f"manual stop file detected: {stop_file}"
-                        emit_progress(status="stopping", force=True)
-                        break
-                    try:
-                        result = iterator.next(
-                            timeout=max(0.01, 1.0 / float(max(5, int(viewer_fps))))
-                        )
-                    except mp.TimeoutError:
+
+                    def publish_and_pump(event: Dict[str, object]) -> None:
+                        emit_viewer_event(event)
                         pump_viewer()
-                        continue
-                    except StopIteration:
-                        break
-                    ingest_episode_result(result)
-                    received_results += 1
-                    if stop_requested():
-                        stopped_early = True
-                        stop_reason = f"manual stop file detected: {stop_file}"
-                        emit_progress(status="stopping", force=True)
-                        break
-                    pump_viewer()
-            finally:
-                if stopped_early:
-                    pool.terminate()
-                else:
-                    pool.close()
-                pool.join()
-    except Exception as exc:
-        emit_viewer_event(
-            {
-                "type": "run_done",
-                "mode": "dagger",
-                "status": "failed",
-                "round_id": int(round_id),
-                "beta": float(beta),
-                "episodes_total": int(episodes_per_round),
-                "episodes_completed": int(episodes_completed),
-                "episodes_with_data": int(episodes_with_data),
-                "transitions_collected": int(transitions_collected),
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        )
-        pump_viewer()
-        if viewer is not None:
-            viewer.close()
-        if viewer_manager is not None:
-            try:
-                viewer_manager.shutdown()
-            except Exception:
-                pass
-        if progress_json:
-            payload = make_progress_payload(status="failed")
-            payload["error"] = f"{type(exc).__name__}: {exc}"
-            _write_progress_json(progress_path, payload)
-        raise
 
-    if transitions_collected <= 0:
-        emit_viewer_event(
-            {
-                "type": "run_done",
-                "mode": "dagger",
-                "status": "failed",
-                "round_id": int(round_id),
-                "beta": float(beta),
-                "episodes_total": int(episodes_per_round),
-                "episodes_completed": int(episodes_completed),
-                "episodes_with_data": int(episodes_with_data),
-                "transitions_collected": int(transitions_collected),
-                "error": "No DAgger transitions were collected in this round.",
-            }
-        )
-        pump_viewer()
-        if viewer is not None:
-            viewer.close()
-        if viewer_manager is not None:
-            try:
-                viewer_manager.shutdown()
-            except Exception:
-                pass
-        if progress_json:
-            payload = make_progress_payload(status="failed")
-            payload["error"] = "No DAgger transitions were collected in this round."
-            _write_progress_json(progress_path, payload)
-        raise RuntimeError("No DAgger transitions were collected in this round.")
+                    for episode_id in episode_ids:
+                        if stop_requested():
+                            stopped_early = True
+                            stop_reason = f"manual stop file detected: {stop_file}"
+                            emit_progress(status="stopping", force=True)
+                            break
+                        result = _collect_episode_with_env(
+                            env=env,
+                            learner=learner,
+                            encoder_config=encoder_config,
+                            round_id=int(round_id),
+                            beta=float(beta),
+                            max_steps_per_episode=int(max_steps_per_episode),
+                            think_ms=int(think_ms),
+                            base_seed=int(seed),
+                            episode_id=int(episode_id),
+                            state_source=str(state_source),
+                            random_fill_y_max_exclusive=int(random_fill_y_max_exclusive),
+                            random_fill_prob=float(random_fill_prob),
+                            random_max_resamples_per_sample=int(random_max_resamples_per_sample),
+                            random_post_clear_steps=int(random_post_clear_steps),
+                            publish_event=publish_and_pump if viewer_enabled_local else None,
+                            publish_every_steps=int(viewer_publish_every_steps),
+                            compact_telemetry=bool(viewer_compact_telemetry),
+                            board_every_steps=int(viewer_board_every_steps),
+                            worker_slot=1,
+                            worker_label=main_pid_label,
+                        )
+                        result["worker_pid"] = int(os.getpid())
+                        result["worker_rss_mb"] = float(_current_rss_mb())
+                        ingest_episode_result(result)
+                        pump_viewer()
+            else:
+                ctx = mp.get_context("spawn")
+                pump_viewer(force_draw=True)
+                pool = ctx.Pool(
+                    processes=int(collect_workers),
+                    initializer=_worker_init,
+                    initargs=(
+                        str(lib_path),
+                        str(learner_checkpoint),
+                        collect_device,
+                        {
+                            "board_height": int(encoder_config.board_height),
+                            "board_width": int(encoder_config.board_width),
+                            "queue_length": int(encoder_config.queue_length),
+                            "include_scalars": bool(encoder_config.include_scalars),
+                        },
+                        int(round_id),
+                        float(beta),
+                        int(max_steps_per_episode),
+                        int(think_ms),
+                        int(seed),
+                        str(state_source),
+                        int(random_fill_y_max_exclusive),
+                        float(random_fill_prob),
+                        int(random_max_resamples_per_sample),
+                        int(random_post_clear_steps),
+                        viewer_runtime.worker_queue if viewer_enabled_local else None,
+                        int(viewer_publish_every_steps),
+                        bool(viewer_compact_telemetry),
+                        int(viewer_board_every_steps),
+                    ),
+                    maxtasksperchild=(
+                        int(worker_maxtasksperchild)
+                        if int(worker_maxtasksperchild) > 0
+                        else None
+                    ),
+                )
+                pump_viewer(force_draw=True)
+                try:
+                    iterator = pool.imap_unordered(
+                        _collect_episode_worker,
+                        episode_ids,
+                        chunksize=int(effective_worker_chunksize),
+                    )
+                    expected_results = len(episode_ids)
+                    received_results = 0
+                    while received_results < expected_results:
+                        if stop_requested():
+                            stopped_early = True
+                            stop_reason = f"manual stop file detected: {stop_file}"
+                            emit_progress(status="stopping", force=True)
+                            break
+                        try:
+                            result = _iterator_next_with_timeout(
+                                iterator,
+                                timeout=max(0.01, 1.0 / float(max(5, int(viewer_fps)))),
+                            )
+                        except mp.TimeoutError:
+                            pump_viewer()
+                            continue
+                        except StopIteration:
+                            break
+                        ingest_episode_result(result)
+                        received_results += 1
+                        if stop_requested():
+                            stopped_early = True
+                            stop_reason = f"manual stop file detected: {stop_file}"
+                            emit_progress(status="stopping", force=True)
+                            break
+                        pump_viewer()
+                finally:
+                    if stopped_early:
+                        pool.terminate()
+                    else:
+                        pool.close()
+                    pool.join()
+        except Exception as exc:
+            emit_viewer_event(
+                {
+                    "type": "run_done",
+                    "mode": "dagger",
+                    "status": "failed",
+                    "round_id": int(round_id),
+                    "beta": float(beta),
+                    "episodes_total": int(episodes_per_round),
+                    "episodes_completed": int(episodes_completed),
+                    "episodes_with_data": int(episodes_with_data),
+                    "transitions_collected": int(transitions_collected),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            pump_viewer()
+            viewer_runtime.close()
+            if progress_json:
+                payload = make_progress_payload(status="failed")
+                payload["error"] = f"{type(exc).__name__}: {exc}"
+                _write_progress_json(progress_path, payload)
+            raise
 
-    vocab_start = len(codec)
-    for episode_id in sorted(episode_records):
-        rows = episode_records[episode_id]
-        rows.sort(key=lambda row: int(row["step_idx"]))
-        for row in rows:
-            expert_tuple = _normalize_tuple(row["expert_action_tuple"])  # type: ignore[arg-type]
-            codec.encode_tuple(expert_tuple, add_if_missing=True)
+        if transitions_collected <= 0:
+            emit_viewer_event(
+                {
+                    "type": "run_done",
+                    "mode": "dagger",
+                    "status": "failed",
+                    "round_id": int(round_id),
+                    "beta": float(beta),
+                    "episodes_total": int(episodes_per_round),
+                    "episodes_completed": int(episodes_completed),
+                    "episodes_with_data": int(episodes_with_data),
+                    "transitions_collected": int(transitions_collected),
+                    "error": "No DAgger transitions were collected in this round.",
+                }
+            )
+            pump_viewer()
+            viewer_runtime.close()
+            if progress_json:
+                payload = make_progress_payload(status="failed")
+                payload["error"] = "No DAgger transitions were collected in this round."
+                _write_progress_json(progress_path, payload)
+            raise RuntimeError("No DAgger transitions were collected in this round.")
 
-    for episode_id in sorted(episode_records):
-        rows = episode_records[episode_id]
-        for row in rows:
-            expert_tuple = _normalize_tuple(row["expert_action_tuple"])  # type: ignore[arg-type]
-            learner_tuple = _normalize_tuple(row["learner_action_tuple"])  # type: ignore[arg-type]
-            expert_action_id = int(codec.action_to_id[expert_tuple])
-            learner_action_id = int(codec.action_to_id[learner_tuple]) if learner_tuple in codec.action_to_id else -1
+        vocab_start = len(codec)
+        for episode_id in sorted(episode_spool_paths):
+            rows = _load_episode_rows_from_spool(episode_spool_paths[episode_id])
+            rows.sort(key=lambda row: int(row["step_idx"]))
+            for row in rows:
+                expert_tuple = _normalize_tuple(row["expert_action_tuple"])  # type: ignore[arg-type]
+                codec.encode_tuple(expert_tuple, add_if_missing=True)
 
-            row["action_id"] = expert_action_id
-            row["action_tuple"] = np.asarray(expert_tuple, dtype=np.int64)
-            row["learner_action_id"] = learner_action_id
-            row["learner_action_tuple"] = np.asarray(learner_tuple, dtype=np.int64)
-            row.pop("expert_action_tuple", None)
-
-    elapsed = max(0.0, time.time() - started)
-    total_actions = expert_steps + learner_steps
-    empirical = float(expert_steps / total_actions) if total_actions > 0 else 0.0
-    vocab_end = len(codec)
-    stats = {
-        "round_id": int(round_id),
-        "beta": float(beta),
-        "episodes_requested": int(episodes_per_round),
-        "episodes_completed": int(episodes_completed),
-        "episodes_with_data": int(episodes_with_data),
-        "transitions": int(transitions_collected),
-        "elapsed_sec": float(elapsed),
-        "episodes_per_sec": float(episodes_completed / elapsed) if elapsed > 0 else 0.0,
-        "expert_steps": int(expert_steps),
-        "learner_steps": int(learner_steps),
-        "empirical_expert_action_rate": float(empirical),
-        "skipped_no_legal": int(skipped_no_legal),
-        "skipped_invalid_expert": int(skipped_invalid_expert),
-        "skipped_missing_tuple": int(skipped_missing_tuple),
-        "failed_steps": int(failed_steps),
-        "invalid_learner_raw_argmax": int(invalid_learner_raw),
-        "unseen_learner_fallback": int(unseen_learner_fallback),
-        "label_illegal_count": int(label_illegal_count),
-        "generation_attempts": int(generation_attempts),
-        "resampled_samples": int(resampled_samples),
-        "episodes_cleared_garbage": int(episodes_cleared_garbage),
-        "episodes_topout_before_clear": int(episodes_topout_before_clear),
-        "episodes_max_steps_before_clear": int(episodes_max_steps_before_clear),
-        "episodes_no_data_after_resamples": int(episodes_no_data_after_resamples),
-        "vocab_start": int(vocab_start),
-        "vocab_end": int(vocab_end),
-        "vocab_delta": int(vocab_end - vocab_start),
-        "vocab_new_labels_seen": int(vocab_end - vocab_start),
-        "collect_workers": int(collect_workers),
-        "worker_chunksize": int(worker_chunksize),
-        "worker_maxtasksperchild": int(worker_maxtasksperchild),
-        "collect_device": str(collect_device),
-        "progress_mode": progress_mode,
-        "progress_path": str(progress_path).replace("\\", "/"),
-        "stop_file": str(stop_file).replace("\\", "/"),
-        "stopped_early": bool(stopped_early),
-        "stop_reason": str(stop_reason),
-        "viewer": bool(viewer_enabled_local),
-        "viewer_fullscreen": bool(viewer_fullscreen),
-        "viewer_fps": int(viewer_fps),
-        "viewer_publish_every_steps": int(viewer_publish_every_steps),
-        "viewer_compact_telemetry": bool(viewer_compact_telemetry),
-        "viewer_board_every_steps": int(viewer_board_every_steps),
-        "viewer_max_queue": int(viewer_max_queue),
-        "viewer_grid_padding": int(viewer_grid_padding),
-        "viewer_min_tile_px": int(viewer_min_tile_px),
-        "viewer_agent": int(viewer_agent),
-        "viewer_reopen_file": str(viewer_reopen_path).replace("\\", "/"),
-        "state_source": str(state_source),
-        "random_fill_y_max_exclusive": int(random_fill_y_max_exclusive),
-        "random_fill_prob": float(random_fill_prob),
-        "random_max_resamples_per_sample": int(random_max_resamples_per_sample),
-        "random_post_clear_steps": int(random_post_clear_steps),
-    }
-
-    final_status = "stopped" if stopped_early else "done"
-    emit_progress(status=final_status, force=True, final_vocab=vocab_end)
-    emit_viewer_event(
-        {
-            "type": "run_done",
-            "mode": "dagger",
-            "status": final_status,
+        elapsed = max(0.0, time.time() - started)
+        total_actions = expert_steps + learner_steps
+        empirical = float(expert_steps / total_actions) if total_actions > 0 else 0.0
+        vocab_end = len(codec)
+        stats = {
             "round_id": int(round_id),
             "beta": float(beta),
-            "episodes_total": int(episodes_per_round),
+            "episodes_requested": int(episodes_per_round),
             "episodes_completed": int(episodes_completed),
             "episodes_with_data": int(episodes_with_data),
-            "transitions_collected": int(transitions_collected),
+            "transitions": int(transitions_collected),
+            "elapsed_sec": float(elapsed),
+            "episodes_per_sec": float(episodes_completed / elapsed) if elapsed > 0 else 0.0,
+            "expert_steps": int(expert_steps),
+            "learner_steps": int(learner_steps),
+            "empirical_expert_action_rate": float(empirical),
+            "skipped_no_legal": int(skipped_no_legal),
+            "skipped_invalid_expert": int(skipped_invalid_expert),
+            "skipped_missing_tuple": int(skipped_missing_tuple),
+            "failed_steps": int(failed_steps),
+            "invalid_learner_raw_argmax": int(invalid_learner_raw),
+            "unseen_learner_fallback": int(unseen_learner_fallback),
+            "label_illegal_count": int(label_illegal_count),
+            "generation_attempts": int(generation_attempts),
+            "resampled_samples": int(resampled_samples),
+            "episodes_cleared_garbage": int(episodes_cleared_garbage),
+            "episodes_topout_before_clear": int(episodes_topout_before_clear),
+            "episodes_max_steps_before_clear": int(episodes_max_steps_before_clear),
+            "episodes_no_data_after_resamples": int(episodes_no_data_after_resamples),
+            "vocab_start": int(vocab_start),
+            "vocab_end": int(vocab_end),
+            "vocab_delta": int(vocab_end - vocab_start),
+            "vocab_new_labels_seen": int(vocab_end - vocab_start),
             "collect_workers": int(collect_workers),
-            "run_dir": str(progress_path.parent),
+            "worker_chunksize": int(effective_worker_chunksize),
+            "worker_maxtasksperchild": int(worker_maxtasksperchild),
+            "collect_device": str(collect_device),
+            "progress_mode": progress_mode,
+            "progress_path": str(progress_path).replace("\\", "/"),
+            "stop_file": str(stop_file).replace("\\", "/"),
+            "rss_warn_mb": float(rss_warn_mb),
+            "worker_rss_warn_mb": float(worker_rss_warn_mb),
+            "rss_main_final_mb": float(_current_rss_mb()),
+            "rss_worker_max_mb": (
+                float(max(worker_rss_by_pid.values()))
+                if worker_rss_by_pid
+                else float(_current_rss_mb())
+            ),
+            "stopped_early": bool(stopped_early),
+            "stop_reason": str(stop_reason),
+            "viewer": bool(viewer_enabled_local),
+            "viewer_fullscreen": bool(viewer_fullscreen),
+            "viewer_fps": int(viewer_fps),
+            "viewer_publish_every_steps": int(viewer_publish_every_steps),
+            "viewer_compact_telemetry": bool(viewer_compact_telemetry),
+            "viewer_board_every_steps": int(viewer_board_every_steps),
+            "viewer_max_queue": int(viewer_max_queue),
+            "viewer_grid_padding": int(viewer_grid_padding),
+            "viewer_min_tile_px": int(viewer_min_tile_px),
+            "viewer_agent": int(viewer_agent),
+            "viewer_reopen_file": str(viewer_reopen_path).replace("\\", "/"),
+            "state_source": str(state_source),
+            "random_fill_y_max_exclusive": int(random_fill_y_max_exclusive),
+            "random_fill_prob": float(random_fill_prob),
+            "random_max_resamples_per_sample": int(random_max_resamples_per_sample),
+            "random_post_clear_steps": int(random_post_clear_steps),
         }
-    )
-    pump_viewer()
-    if viewer is not None:
-        viewer.close()
-    if viewer_manager is not None:
-        try:
-            viewer_manager.shutdown()
-        except Exception:
-            pass
-    return episode_records, stats
+
+        final_status = "stopped" if stopped_early else "done"
+        emit_progress(status=final_status, force=True, final_vocab=vocab_end)
+        emit_viewer_event(
+            {
+                "type": "run_done",
+                "mode": "dagger",
+                "status": final_status,
+                "round_id": int(round_id),
+                "beta": float(beta),
+                "episodes_total": int(episodes_per_round),
+                "episodes_completed": int(episodes_completed),
+                "episodes_with_data": int(episodes_with_data),
+                "transitions_collected": int(transitions_collected),
+                "collect_workers": int(collect_workers),
+                "run_dir": str(progress_path.parent),
+            }
+        )
+        pump_viewer()
+        viewer_runtime.close()
+
+        keep_spool = True
+        return episode_spool_paths, stats, spool_dir
+    finally:
+        viewer_runtime.close()
+        if not keep_spool:
+            shutil.rmtree(spool_dir, ignore_errors=True)
 
 
 def _write_round_train_shards(
     out_dir: Path,
-    episode_records: Dict[int, List[Dict[str, object]]],
+    episode_spool_paths: Dict[int, Path],
+    codec: ActionCodec,
     episodes_per_shard: int,
 ) -> Tuple[List[str], int, List[int]]:
     shard_dir = out_dir / "shards"
@@ -1713,14 +1751,46 @@ def _write_round_train_shards(
 
     shard_paths: List[str] = []
     transitions = 0
-    episode_ids_with_data = [ep for ep, rows in episode_records.items() if rows]
+    episode_ids_with_data = sorted(int(ep) for ep in episode_spool_paths.keys())
     episode_ids_with_data.sort()
 
     for shard_idx, begin in enumerate(range(0, len(episode_ids_with_data), int(episodes_per_shard))):
         chunk_ids = episode_ids_with_data[begin : begin + int(episodes_per_shard)]
         rows: List[Dict[str, object]] = []
         for ep_id in chunk_ids:
-            rows.extend(episode_records[ep_id])
+            spool_path = episode_spool_paths.get(int(ep_id))
+            if spool_path is None:
+                continue
+            raw_rows = _load_episode_rows_from_spool(spool_path)
+            raw_rows.sort(key=lambda row: int(row["step_idx"]))
+            for row in raw_rows:
+                expert_tuple = _normalize_tuple(row["expert_action_tuple"])  # type: ignore[arg-type]
+                learner_tuple = _normalize_tuple(row["learner_action_tuple"])  # type: ignore[arg-type]
+                expert_action_id = int(codec.action_to_id[expert_tuple])
+                learner_action_id = (
+                    int(codec.action_to_id[learner_tuple])
+                    if learner_tuple in codec.action_to_id
+                    else -1
+                )
+                rows.append(
+                    {
+                        "board": row["board"],
+                        "piece": row["piece"],
+                        "hold": row["hold"],
+                        "queue": row["queue"],
+                        "scalars": row["scalars"],
+                        "action_id": expert_action_id,
+                        "action_tuple": np.asarray(expert_tuple, dtype=np.int64),
+                        "episode_id": int(row["episode_id"]),
+                        "step_idx": int(row["step_idx"]),
+                        "round_id": int(row["round_id"]),
+                        "learner_action_id": learner_action_id,
+                        "learner_action_tuple": np.asarray(learner_tuple, dtype=np.int64),
+                        "acted_by_expert": int(row["acted_by_expert"]),
+                        "learner_raw_invalid": int(row["learner_raw_invalid"]),
+                        "learner_used_fallback": int(row["learner_used_fallback"]),
+                    }
+                )
         if not rows:
             continue
         transitions += len(rows)
@@ -1924,6 +1994,8 @@ def main() -> int:
             "progress_every_sec": float(args.progress_every_sec),
             "progress_path": str(args.progress_path) if args.progress_path is not None else None,
             "stop_file": str(args.stop_file) if args.stop_file is not None else None,
+            "rss_warn_mb": float(args.rss_warn_mb),
+            "worker_rss_warn_mb": float(args.worker_rss_warn_mb),
             "viewer": bool(args.viewer),
             "viewer_fullscreen": bool(args.viewer_fullscreen),
             "viewer_fps": int(args.viewer_fps),
@@ -1975,7 +2047,7 @@ def main() -> int:
             else (round_dir / "STOP").resolve()
         )
 
-        round_records, collect_stats = _collect_dagger_round(
+        round_spool_paths, collect_stats, round_spool_dir = _collect_dagger_round(
             round_id=round_id,
             beta=beta,
             codec=codec,
@@ -1993,6 +2065,8 @@ def main() -> int:
             worker_maxtasksperchild=int(args.worker_maxtasksperchild),
             progress_mode=str(args.progress_mode),
             progress_every_sec=float(args.progress_every_sec),
+            rss_warn_mb=float(args.rss_warn_mb),
+            worker_rss_warn_mb=float(args.worker_rss_warn_mb),
             progress_path=round_progress_path,
             stop_file=round_stop_file,
             state_source=str(args.state_source),
@@ -2016,13 +2090,16 @@ def main() -> int:
                 else None
             ),
         )
-
-        train_shard_root = round_dir / "dagger_train"
-        round_train_shards, round_train_transitions, round_episode_ids = _write_round_train_shards(
-            out_dir=train_shard_root,
-            episode_records=round_records,
-            episodes_per_shard=int(args.episodes_per_shard),
-        )
+        try:
+            train_shard_root = round_dir / "dagger_train"
+            round_train_shards, round_train_transitions, round_episode_ids = _write_round_train_shards(
+                out_dir=train_shard_root,
+                episode_spool_paths=round_spool_paths,
+                codec=codec,
+                episodes_per_shard=int(args.episodes_per_shard),
+            )
+        finally:
+            shutil.rmtree(round_spool_dir, ignore_errors=True)
         if round_train_transitions <= 0:
             raise RuntimeError(
                 f"Round {round_id} collected no transitions; aborting DAgger run."

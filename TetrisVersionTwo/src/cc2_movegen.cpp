@@ -12,6 +12,13 @@ namespace tetris_v2::cc2 {
 
 namespace {
 
+int leading_zeros_u64(std::uint64_t value) {
+    if (value == 0ull) {
+        return 64;
+    }
+    return __builtin_clzll(value);
+}
+
 struct PlacementHash {
     std::size_t operator()(const Placement& p) const noexcept {
         std::size_t h = 1469598103934665603ull;
@@ -241,7 +248,7 @@ std::vector<std::pair<Placement, std::uint32_t>> find_moves(const Board& board, 
 
     const CollisionMaps collision_map(board, piece);
     const bool fast_mode = std::all_of(board.cols.begin(), board.cols.end(), [](std::uint64_t c) {
-        return __builtin_clzll(c) > (64 - 16);
+        return leading_zeros_u64(c) > (64 - 16);
     });
 
     auto update_position = [&](const Placement& target, std::uint32_t soft_drops) {
