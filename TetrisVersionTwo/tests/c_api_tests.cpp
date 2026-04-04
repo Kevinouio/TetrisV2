@@ -102,6 +102,65 @@ std::array<float, 6> features_from_visible_board(
     };
 }
 
+struct BeamTraceRow {
+    int used_hold{0};
+    std::size_t placement_index{0};
+    float score{0.0f};
+};
+
+std::vector<BeamTraceRow> collect_beam_trace(std::uint32_t seed, int steps) {
+    std::vector<BeamTraceRow> trace{};
+    trace.reserve(static_cast<std::size_t>(std::max(0, steps)));
+
+    auto* env = tetris_cc_env_create(seed);
+    auto* bot = tetris_cc_bot_create_default();
+    assert(env != nullptr);
+    assert(bot != nullptr);
+
+    tetris_cc_env_reset(env, seed);
+    assert(tetris_cc_bot_set_backend(bot, TETRIS_CC_BOT_BACKEND_BEAM) == 1);
+    assert(tetris_cc_bot_set_beam_config(bot, 2, 8, 1.0, 1, 0, 1, 0) == 1);
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
+
+    for (int i = 0; i < steps; ++i) {
+        float reward = 0.0f;
+        int lines_cleared = 0;
+        int game_over = 0;
+        int used_hold = 0;
+        std::size_t placement_index = 0;
+        float score = 0.0f;
+        std::uint64_t nodes = 0;
+        double think_ms = 0.0;
+        double nps = 0.0;
+        int budget_miss = 0;
+
+        const int ok = tetris_cc_bot_choose_and_apply_ex(
+            bot,
+            env,
+            20,
+            &reward,
+            &lines_cleared,
+            &game_over,
+            &used_hold,
+            &placement_index,
+            &score,
+            &nodes,
+            &think_ms,
+            &nps,
+            &budget_miss);
+        assert(ok == 1);
+
+        trace.push_back(BeamTraceRow{used_hold, placement_index, score});
+        if (game_over) {
+            break;
+        }
+    }
+
+    tetris_cc_bot_destroy(bot);
+    tetris_cc_env_destroy(env);
+    return trace;
+}
+
 void test_cc_smoke_and_state_exports() {
     auto* env = tetris_cc_env_create(1337);
     assert(env != nullptr);
@@ -363,8 +422,10 @@ void test_cc_rotation_trace_disables_rotate180() {
 
 void test_cc_bot_null_safety() {
     assert(tetris_cc_bot_set_backend(nullptr, TETRIS_CC_BOT_BACKEND_DEPTH) == 0);
+    assert(tetris_cc_bot_set_backend(nullptr, TETRIS_CC_BOT_BACKEND_BEAM) == 0);
     assert(tetris_cc_bot_get_backend(nullptr, nullptr) == 0);
     assert(tetris_cc_bot_set_depth_config(nullptr, 1, 1.0, 1, 0, 1, 0) == 0);
+    assert(tetris_cc_bot_set_beam_config(nullptr, 2, 8, 1.0, 1, 0, 1, 0) == 0);
     assert(tetris_cc_bot_sync_from_env(nullptr, nullptr) == 0);
     assert(
         tetris_cc_bot_choose_ex(
@@ -569,12 +630,101 @@ void test_cc_bot_loop_and_backend_switching() {
     assert(placement_repeat == placement_d2);
     assert(std::fabs(score_repeat - score_d2) <= 1e-6f);
 
+    assert(tetris_cc_bot_set_backend(bot, TETRIS_CC_BOT_BACKEND_BEAM) == 1);
+    assert(tetris_cc_bot_get_backend(bot, &backend) == 1);
+    assert(backend == TETRIS_CC_BOT_BACKEND_BEAM);
+    assert(tetris_cc_bot_set_beam_config(bot, 1, 8, 1.0, 1, 0, 1, 0) == 1);
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
+
+    int use_hold_b1 = 0;
+    std::size_t placement_b1 = 0;
+    float score_b1 = 0.0f;
+    std::uint64_t nodes_b1 = 0;
+    double think_b1 = 0.0;
+    double nps_b1 = 0.0;
+    int budget_b1 = 0;
+    assert(
+        tetris_cc_bot_choose_ex(
+            bot,
+            1,
+            &use_hold_b1,
+            &placement_b1,
+            &score_b1,
+            &nodes_b1,
+            &think_b1,
+            &nps_b1,
+            &budget_b1) == 1);
+    assert(nodes_b1 > 0);
+    assert(std::isfinite(score_b1));
+
+    assert(tetris_cc_bot_set_beam_config(bot, 2, 8, 1.0, 1, 1, 1, 0) == 1);
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
+    int use_hold_b2 = 0;
+    std::size_t placement_b2 = 0;
+    float score_b2 = 0.0f;
+    std::uint64_t nodes_b2 = 0;
+    double think_b2 = 0.0;
+    double nps_b2 = 0.0;
+    int budget_b2 = 0;
+    assert(
+        tetris_cc_bot_choose_ex(
+            bot,
+            999,
+            &use_hold_b2,
+            &placement_b2,
+            &score_b2,
+            &nodes_b2,
+            &think_b2,
+            &nps_b2,
+            &budget_b2) == 1);
+    assert(nodes_b2 >= nodes_b1);
+    assert(std::isfinite(score_b2));
+
+    int use_hold_beam_repeat = 0;
+    std::size_t placement_beam_repeat = 0;
+    float score_beam_repeat = 0.0f;
+    std::uint64_t nodes_beam_repeat = 0;
+    double think_beam_repeat = 0.0;
+    double nps_beam_repeat = 0.0;
+    int budget_beam_repeat = 0;
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
+    assert(
+        tetris_cc_bot_choose_ex(
+            bot,
+            42,
+            &use_hold_beam_repeat,
+            &placement_beam_repeat,
+            &score_beam_repeat,
+            &nodes_beam_repeat,
+            &think_beam_repeat,
+            &nps_beam_repeat,
+            &budget_beam_repeat) == 1);
+    assert(use_hold_beam_repeat == use_hold_b2);
+    assert(placement_beam_repeat == placement_b2);
+    assert(std::fabs(score_beam_repeat - score_b2) <= 1e-6f);
+
     assert(tetris_cc_bot_set_backend(bot, TETRIS_CC_BOT_BACKEND_COLD_CLEAR) == 1);
     assert(tetris_cc_bot_get_backend(bot, &backend) == 1);
     assert(backend == TETRIS_CC_BOT_BACKEND_COLD_CLEAR);
     assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
     tetris_cc_bot_destroy(bot);
     tetris_cc_env_destroy(env);
+}
+
+void test_beam_multistep_trace_determinism() {
+    constexpr int kTraceSteps = 8;
+    const std::array<std::uint32_t, 3> seeds{1234u, 5678u, 9012u};
+
+    for (const auto seed : seeds) {
+        const auto trace_a = collect_beam_trace(seed, kTraceSteps);
+        const auto trace_b = collect_beam_trace(seed, kTraceSteps);
+        assert(trace_a.size() == trace_b.size());
+        for (std::size_t i = 0; i < trace_a.size(); ++i) {
+            assert(trace_a[i].used_hold == trace_b[i].used_hold);
+            assert(trace_a[i].placement_index == trace_b[i].placement_index);
+            assert(std::fabs(trace_a[i].score - trace_b[i].score) <= 1e-6f);
+        }
+    }
 }
 
 }  // namespace
@@ -588,5 +738,6 @@ int main() {
     test_cc_bot_null_safety();
     test_cc_bot_sparse_board_loop_stability();
     test_cc_bot_loop_and_backend_switching();
+    test_beam_multistep_trace_determinism();
     return 0;
 }

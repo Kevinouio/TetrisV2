@@ -41,6 +41,7 @@ add_library(
     src/cc_env.cpp
     src/cold_clear_bot.cpp
     src/depth.cpp
+    src/beam.cpp
     src/piece_defs.cpp
     src/randomizer.cpp
     src/env.cpp
@@ -98,6 +99,9 @@ target_link_libraries(tetris_twist_dataset_tests PRIVATE tetris_v2)
 
 add_executable(tetris_c_api_tests tests/c_api_tests.cpp)
 target_link_libraries(tetris_c_api_tests PRIVATE tetris_v2 tetris_v2_c_api_static)
+
+add_executable(tetris_beam_bench tests/beam_bench.cpp)
+target_link_libraries(tetris_beam_bench PRIVATE tetris_v2 tetris_v2_c_api_static)
 
 if(BUILD_TESTING)
     add_test(NAME tetris_smoke COMMAND tetris_smoke)

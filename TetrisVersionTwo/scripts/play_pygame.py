@@ -81,7 +81,7 @@ def parse_args():
     parser.add_argument(
         "--native-backend",
         type=str,
-        choices=("cold_clear", "depth"),
+        choices=("cold_clear", "depth", "beam"),
         default="cold_clear",
         help="Native bot backend to use when no learned checkpoint is provided.",
     )
@@ -96,6 +96,24 @@ def parse_args():
         type=float,
         default=1.0,
         help="Depth backend discount factor.",
+    )
+    parser.add_argument(
+        "--beam-search-depth",
+        type=int,
+        default=2,
+        help="Beam backend placement horizon (depth=1 means 1-ply).",
+    )
+    parser.add_argument(
+        "--beam-width",
+        type=int,
+        default=8,
+        help="Beam backend width (survivors per layer).",
+    )
+    parser.add_argument(
+        "--beam-gamma",
+        type=float,
+        default=1.0,
+        help="Beam backend discount factor.",
     )
     parser.add_argument(
         "--state-source",
@@ -165,6 +183,8 @@ def parse_args():
         raise SystemExit("--random-fill-prob must be in [0,1].")
     if int(args.random_max_resamples_per_sample) <= 0:
         raise SystemExit("--random-max-resamples-per-sample must be > 0.")
+    if int(args.beam_width) <= 0:
+        raise SystemExit("--beam-width must be > 0.")
     return args
 
 
@@ -173,6 +193,19 @@ _DEPTH_BACKEND_C_API_SYMBOLS = (
     "tetris_cc_bot_get_backend",
     "tetris_cc_bot_set_depth_config",
 )
+_BEAM_BACKEND_C_API_SYMBOLS = (
+    "tetris_cc_bot_set_backend",
+    "tetris_cc_bot_get_backend",
+    "tetris_cc_bot_set_beam_config",
+)
+
+
+def _symbols_for_native_backend(backend_name: Optional[str]):
+    if backend_name == "depth":
+        return _DEPTH_BACKEND_C_API_SYMBOLS
+    if backend_name == "beam":
+        return _BEAM_BACKEND_C_API_SYMBOLS
+    return ()
 
 
 def _has_c_api_symbols(path: Path, symbols) -> bool:
@@ -186,8 +219,8 @@ def _has_c_api_symbols(path: Path, symbols) -> bool:
 def find_library(
     explicit_path: Optional[Path],
     *,
-    require_depth_backend: bool = False,
-    prefer_depth_backend: bool = False,
+    require_native_backend: Optional[str] = None,
+    prefer_native_backend: Optional[str] = None,
 ) -> Path:
     shared_find_library = None
     try:
@@ -208,69 +241,83 @@ def find_library(
         Path("TetrisVersionTwo/build/libtetris_v2_c_api.dylib"),
     ]
 
-    def pick_candidate_from_search_paths(*, require_depth: bool, prefer_depth: bool) -> Optional[Path]:
+    require_symbols = _symbols_for_native_backend(require_native_backend)
+    prefer_symbols = _symbols_for_native_backend(prefer_native_backend)
+    required_backend_name = str(require_native_backend) if require_native_backend else None
+
+    def has_required_symbols(candidate: Path, symbols) -> bool:
+        if not symbols:
+            return True
+        return _has_c_api_symbols(candidate, symbols)
+
+    def pick_candidate_from_search_paths(*, require_symbols, prefer_symbols) -> Optional[Path]:
         existing = [candidate for candidate in candidates if candidate.exists()]
         if not existing:
             return None
-        if require_depth or prefer_depth:
+        if require_symbols or prefer_symbols:
             for candidate in existing:
-                if _has_c_api_symbols(candidate, _DEPTH_BACKEND_C_API_SYMBOLS):
+                if has_required_symbols(candidate, require_symbols if require_symbols else prefer_symbols):
                     return candidate
-        if require_depth:
+        if require_symbols:
             return None
         return existing[0]
 
     if shared_find_library is not None:
         candidate = shared_find_library(explicit_path)
-        has_depth_symbols = _has_c_api_symbols(candidate, _DEPTH_BACKEND_C_API_SYMBOLS)
-        if has_depth_symbols:
+        has_required = has_required_symbols(candidate, require_symbols)
+        if has_required:
             return candidate
-        if require_depth_backend:
+        if require_symbols:
             if explicit_path is not None:
                 raise RuntimeError(
-                    f"Library '{candidate}' is missing required depth backend symbols: "
-                    f"{', '.join(_DEPTH_BACKEND_C_API_SYMBOLS)}"
+                    f"Library '{candidate}' is missing required {required_backend_name} backend symbols: "
+                    f"{', '.join(require_symbols)}"
                 )
-            fallback = pick_candidate_from_search_paths(require_depth=True, prefer_depth=True)
+            fallback = pick_candidate_from_search_paths(
+                require_symbols=require_symbols, prefer_symbols=require_symbols
+            )
             if fallback is not None:
                 return fallback
             raise RuntimeError(
-                "Found tetris_v2_c_api shared libraries, but none export required depth backend symbols."
+                "Found tetris_v2_c_api shared libraries, but none export required "
+                f"{required_backend_name} backend symbols."
             )
-        if prefer_depth_backend and explicit_path is None:
-            fallback = pick_candidate_from_search_paths(require_depth=False, prefer_depth=True)
+        if prefer_symbols and explicit_path is None:
+            fallback = pick_candidate_from_search_paths(
+                require_symbols=(), prefer_symbols=prefer_symbols
+            )
             if fallback is not None:
                 return fallback
         return candidate
 
     if explicit_path is not None:
         if explicit_path.exists():
-            if require_depth_backend and not _has_c_api_symbols(explicit_path, _DEPTH_BACKEND_C_API_SYMBOLS):
+            if require_symbols and not has_required_symbols(explicit_path, require_symbols):
                 raise RuntimeError(
-                    f"Library '{explicit_path}' is missing required depth backend symbols: "
-                    f"{', '.join(_DEPTH_BACKEND_C_API_SYMBOLS)}"
+                    f"Library '{explicit_path}' is missing required {required_backend_name} backend symbols: "
+                    f"{', '.join(require_symbols)}"
                 )
             return explicit_path
         raise FileNotFoundError(f"Library not found: {explicit_path}")
 
-    depth_symbol_failures = []
+    symbol_failures = []
     for candidate in candidates:
         if candidate.exists():
-            if require_depth_backend and not _has_c_api_symbols(candidate, _DEPTH_BACKEND_C_API_SYMBOLS):
-                depth_symbol_failures.append(str(candidate))
+            if require_symbols and not has_required_symbols(candidate, require_symbols):
+                symbol_failures.append(str(candidate))
                 continue
-            if prefer_depth_backend and not _has_c_api_symbols(candidate, _DEPTH_BACKEND_C_API_SYMBOLS):
-                depth_symbol_failures.append(str(candidate))
+            if prefer_symbols and not has_required_symbols(candidate, prefer_symbols):
+                symbol_failures.append(str(candidate))
                 continue
             return candidate
-    if prefer_depth_backend and not require_depth_backend:
+    if prefer_symbols and not require_symbols:
         for candidate in candidates:
             if candidate.exists():
                 return candidate
-    if require_depth_backend and depth_symbol_failures:
+    if require_symbols and symbol_failures:
         raise RuntimeError(
-            "Found tetris_v2_c_api shared libraries, but none export required depth backend symbols. "
-            f"Tried: {', '.join(depth_symbol_failures)}"
+            "Found tetris_v2_c_api shared libraries, but none export required "
+            f"{required_backend_name} backend symbols. Tried: {', '.join(symbol_failures)}"
         )
     raise FileNotFoundError("Could not locate tetris_v2_c_api shared library. Build it first.")
 
@@ -323,8 +370,13 @@ class EnvCtypes:
             for name in (
                 "tetris_cc_bot_set_backend",
                 "tetris_cc_bot_get_backend",
-                "tetris_cc_bot_set_depth_config",
             )
+        )
+        self._has_depth_backend_config_api = self._has_bot_api and hasattr(
+            self.lib, "tetris_cc_bot_set_depth_config"
+        )
+        self._has_beam_backend_config_api = self._has_bot_api and hasattr(
+            self.lib, "tetris_cc_bot_set_beam_config"
         )
         self._has_candidate_batch_api = all(
             hasattr(self.lib, name)
@@ -567,6 +619,7 @@ class EnvCtypes:
                 self.lib.tetris_cc_bot_set_backend.restype = ctypes.c_int
                 self.lib.tetris_cc_bot_get_backend.argtypes = [void_p, c_int_p]
                 self.lib.tetris_cc_bot_get_backend.restype = ctypes.c_int
+            if self._has_depth_backend_config_api:
                 self.lib.tetris_cc_bot_set_depth_config.argtypes = [
                     void_p,
                     ctypes.c_int,
@@ -577,6 +630,18 @@ class EnvCtypes:
                     ctypes.c_uint64,
                 ]
                 self.lib.tetris_cc_bot_set_depth_config.restype = ctypes.c_int
+            if self._has_beam_backend_config_api:
+                self.lib.tetris_cc_bot_set_beam_config.argtypes = [
+                    void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_double,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                self.lib.tetris_cc_bot_set_beam_config.restype = ctypes.c_int
 
     def close(self):
         if self.bot_handle and self._has_bot_api:
@@ -650,17 +715,34 @@ class EnvCtypes:
             backend_id = 0
         elif backend_name == "depth":
             backend_id = 1
+        elif backend_name == "beam":
+            backend_id = 2
         else:
             return False
         ok = self.lib.tetris_cc_bot_set_backend(self.bot_handle, ctypes.c_int(backend_id))
         return bool(ok)
 
     def bot_set_depth_config(self, depth: int, gamma: float) -> bool:
-        if not self.has_bot() or not self._has_bot_backend_api:
+        if not self.has_bot() or not self._has_depth_backend_config_api:
             return False
         ok = self.lib.tetris_cc_bot_set_depth_config(
             self.bot_handle,
             ctypes.c_int(max(1, int(depth))),
+            ctypes.c_double(float(gamma)),
+            ctypes.c_int(1),  # deduplicate_successors
+            ctypes.c_int(0),  # use_transposition_table
+            ctypes.c_int(1),  # collect_debug_info
+            ctypes.c_uint64(0),  # max_nodes (unlimited)
+        )
+        return bool(ok)
+
+    def bot_set_beam_config(self, depth: int, beam_width: int, gamma: float) -> bool:
+        if not self.has_bot() or not self._has_beam_backend_config_api:
+            return False
+        ok = self.lib.tetris_cc_bot_set_beam_config(
+            self.bot_handle,
+            ctypes.c_int(max(1, int(depth))),
+            ctypes.c_int(max(1, int(beam_width))),
             ctypes.c_double(float(gamma)),
             ctypes.c_int(1),  # deduplicate_successors
             ctypes.c_int(0),  # use_transposition_table
@@ -1303,17 +1385,26 @@ def main():
             file=sys.stderr,
         )
         raise SystemExit(2)
-    native_depth_requested = (
-        args.bc_checkpoint is None
-        and args.dqn_checkpoint is None
-        and str(args.native_backend) == "depth"
+    native_backend_requested = (
+        str(args.native_backend)
+        if args.bc_checkpoint is None and args.dqn_checkpoint is None
+        else None
     )
-    require_depth_backend = bool(native_depth_requested and args.ai)
+    require_native_backend = (
+        str(native_backend_requested)
+        if native_backend_requested in ("depth", "beam") and args.ai
+        else None
+    )
+    prefer_native_backend = (
+        str(native_backend_requested)
+        if native_backend_requested in ("depth", "beam")
+        else None
+    )
     try:
         lib_path = find_library(
             args.lib,
-            require_depth_backend=require_depth_backend,
-            prefer_depth_backend=native_depth_requested,
+            require_native_backend=require_native_backend,
+            prefer_native_backend=prefer_native_backend,
         )
     except (FileNotFoundError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
@@ -1378,7 +1469,10 @@ def main():
 
     else:
         ai_backend = str(args.native_backend)
-        ai_backend_label = "Depth" if ai_backend == "depth" else "ColdClear"
+        ai_backend_label = {
+            "depth": "Depth",
+            "beam": "Beam",
+        }.get(ai_backend, "ColdClear")
 
     state_source = str(args.state_source).strip().lower()
     random_board_mode = state_source == "random_board"
@@ -1387,13 +1481,15 @@ def main():
     last_reset_summary = f"state_source={state_source} (pending)"
 
     def configure_native_backend() -> Optional[str]:
-        if ai_backend not in ("cold_clear", "depth"):
+        if ai_backend not in ("cold_clear", "depth", "beam"):
             return None
         if not env.has_bot():
             return "bot API symbols not exported by shared library."
 
         if ai_backend == "depth":
-            if not getattr(env, "_has_bot_backend_api", False):
+            if not getattr(env, "_has_bot_backend_api", False) or not getattr(
+                env, "_has_depth_backend_config_api", False
+            ):
                 return (
                     "depth backend symbols missing "
                     "(tetris_cc_bot_set_backend/tetris_cc_bot_set_depth_config)."
@@ -1404,6 +1500,24 @@ def main():
                 return (
                     f"failed to set depth config "
                     f"(depth={max(1, int(args.depth_search_depth))}, gamma={float(args.depth_gamma):.3f})."
+                )
+        elif ai_backend == "beam":
+            if not getattr(env, "_has_bot_backend_api", False) or not getattr(
+                env, "_has_beam_backend_config_api", False
+            ):
+                return (
+                    "beam backend symbols missing "
+                    "(tetris_cc_bot_set_backend/tetris_cc_bot_set_beam_config)."
+                )
+            if not env.bot_set_backend("beam"):
+                return "failed to set bot backend to beam."
+            if not env.bot_set_beam_config(
+                args.beam_search_depth, args.beam_width, args.beam_gamma
+            ):
+                return (
+                    "failed to set beam config "
+                    f"(depth={max(1, int(args.beam_search_depth))}, "
+                    f"width={max(1, int(args.beam_width))}, gamma={float(args.beam_gamma):.3f})."
                 )
         else:
             if getattr(env, "_has_bot_backend_api", False):
@@ -1530,11 +1644,17 @@ def main():
                     f"AI[Depth] enabled at startup "
                     f"(depth={max(1, int(args.depth_search_depth))} gamma={float(args.depth_gamma):.3f})"
                 )
+            elif ai_backend == "beam":
+                status = (
+                    f"AI[Beam] enabled at startup "
+                    f"(depth={max(1, int(args.beam_search_depth))} "
+                    f"width={max(1, int(args.beam_width))} gamma={float(args.beam_gamma):.3f})"
+                )
             else:
                 status = f"AI[ColdClear] enabled at startup (think={max(1, int(args.think_ms))}ms)"
     elif random_board_error is not None:
         status = f"AI unavailable: random_board startup failed: {random_board_error}"
-    elif native_config_error and ai_backend in ("cold_clear", "depth"):
+    elif native_config_error and ai_backend in ("cold_clear", "depth", "beam"):
         status = f"AI[{ai_backend_label}] unavailable: {native_config_error}"
 
     info_h = 240
@@ -1582,6 +1702,14 @@ def main():
                                         f"AI[Depth] enabled "
                                         f"(depth={max(1, int(args.depth_search_depth))} "
                                         f"gamma={float(args.depth_gamma):.3f})"
+                                    )
+                                elif ai_backend == "beam":
+                                    env.bot_sync()
+                                    status = (
+                                        f"AI[Beam] enabled "
+                                        f"(depth={max(1, int(args.beam_search_depth))} "
+                                        f"width={max(1, int(args.beam_width))} "
+                                        f"gamma={float(args.beam_gamma):.3f})"
                                     )
                                 elif ai_backend == "dqn":
                                     status = f"AI[DQN] enabled (device={args.dqn_device or 'auto'})"
@@ -1943,7 +2071,7 @@ def main():
                 f"AI pieces={ai_metrics['pieces']} lines={ai_metrics['lines']} topouts={ai_metrics['topouts']}",
                 f"AI PPS={ai_pps:.2f} step_ms(last/avg)={ai_metrics['last_step_ms']:.1f}/{ai_metrics['avg_step_ms']:.1f}",
             ]
-            if ai_backend in ("cold_clear", "depth"):
+            if ai_backend in ("cold_clear", "depth", "beam"):
                 lines.append(
                     f"AI[{ai_backend_label}] nodes={ai_metrics['last_nodes']} "
                     f"nps={ai_metrics['last_nps']:.0f} score={ai_metrics['last_score']:.2f}"

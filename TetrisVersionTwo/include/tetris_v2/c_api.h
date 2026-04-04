@@ -130,6 +130,7 @@ int tetris_cc_env_rotation_trace_meta(
 enum {
     TETRIS_CC_BOT_BACKEND_COLD_CLEAR = 0,
     TETRIS_CC_BOT_BACKEND_DEPTH = 1,
+    TETRIS_CC_BOT_BACKEND_BEAM = 2,
 };
 
 tetris_cc_bot_handle* tetris_cc_bot_create_default(void);
@@ -139,6 +140,15 @@ int tetris_cc_bot_get_backend(const tetris_cc_bot_handle* bot, int* backend_out)
 int tetris_cc_bot_set_depth_config(
     tetris_cc_bot_handle* bot,
     int depth,
+    double gamma,
+    int deduplicate_successors,
+    int use_transposition_table,
+    int collect_debug_info,
+    uint64_t max_nodes);
+int tetris_cc_bot_set_beam_config(
+    tetris_cc_bot_handle* bot,
+    int depth,
+    int beam_width,
     double gamma,
     int deduplicate_successors,
     int use_transposition_table,

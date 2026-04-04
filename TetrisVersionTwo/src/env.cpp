@@ -58,15 +58,6 @@ bool placement_metadata_is_better(const PlacementOption& candidate, const Placem
     return false;
 }
 
-bool kick_passed_with_nonzero_offset(const std::vector<KickTest>& tests) {
-    for (const auto& test : tests) {
-        if (test.passed) {
-            return test.kick_index != 0;
-        }
-    }
-    return false;
-}
-
 int passing_kick_index(const std::vector<KickTest>& tests) {
     for (const auto& test : tests) {
         if (test.passed) {
@@ -332,6 +323,10 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
     return placement_options_cached();
 }
 
+const std::vector<PlacementOption>& ModernTetrisEnv::placement_options_view() const {
+    return placement_options_cached();
+}
+
 std::vector<PlacementOption> ModernTetrisEnv::build_placement_options_uncached() const {
     std::vector<PlacementOption> options;
     if (state_.game_over || state_.active.piece == Piece::None || collides(state_.active)) {
@@ -475,18 +470,16 @@ std::vector<PlacementOption> ModernTetrisEnv::build_placement_options_uncached()
         down.y -= 1;
         try_enqueue(down, PathMetadata{false, false, -1});
 
-        auto [cw, cw_tests] =
-            kicked_rotation_with_tests(current.piece, rotate_cw(current.piece.rotation), 0, 0);
+        auto cw = kicked_rotation_quick(current.piece, rotate_cw(current.piece.rotation));
         if (cw.has_value()) {
-            const int kick_index = passing_kick_index(cw_tests);
-            try_enqueue(*cw, PathMetadata{true, kick_index > 0, kick_index});
+            const int kick_index = cw->second;
+            try_enqueue(cw->first, PathMetadata{true, kick_index > 0, kick_index});
         }
 
-        auto [ccw, ccw_tests] =
-            kicked_rotation_with_tests(current.piece, rotate_ccw(current.piece.rotation), 0, 0);
+        auto ccw = kicked_rotation_quick(current.piece, rotate_ccw(current.piece.rotation));
         if (ccw.has_value()) {
-            const int kick_index = passing_kick_index(ccw_tests);
-            try_enqueue(*ccw, PathMetadata{true, kick_index > 0, kick_index});
+            const int kick_index = ccw->second;
+            try_enqueue(ccw->first, PathMetadata{true, kick_index > 0, kick_index});
         }
 
         if (config_.allow_rotate_180) {
@@ -589,6 +582,30 @@ std::vector<std::uint8_t> ModernTetrisEnv::visible_placement_piece_ids(std::size
     return out;
 }
 
+StepResult ModernTetrisEnv::apply_option_impl(const PlacementOption& option) {
+    StepResult result{};
+    if (state_.game_over) {
+        result.game_over = true;
+        result.top_out = state_.top_out;
+        result.combo = state_.combo;
+        result.back_to_back = state_.back_to_back;
+        return result;
+    }
+
+    invalidate_placement_cache();
+    state_.active = option.placement;
+    state_.spin_eligible = option.spin_eligible_path;
+    state_.last_rotate_used_kick = option.last_rotate_used_kick_path;
+    state_.last_rotate_kick_index = option.last_rotate_kick_index_path;
+    lock_active_piece(result);
+    result.action_succeeded = true;
+    result.combo = state_.combo;
+    result.back_to_back = state_.back_to_back;
+    result.game_over = state_.game_over;
+    result.top_out = state_.top_out;
+    return result;
+}
+
 StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
     StepResult result{};
     if (state_.game_over) {
@@ -612,18 +629,7 @@ StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
         return result;
     }
 
-    invalidate_placement_cache();
-    state_.active = it->placement;
-    state_.spin_eligible = it->spin_eligible_path;
-    state_.last_rotate_used_kick = it->last_rotate_used_kick_path;
-    state_.last_rotate_kick_index = it->last_rotate_kick_index_path;
-    lock_active_piece(result);
-    result.action_succeeded = true;
-    result.combo = state_.combo;
-    result.back_to_back = state_.back_to_back;
-    result.game_over = state_.game_over;
-    result.top_out = state_.top_out;
-    return result;
+    return apply_option_impl(*it);
 }
 
 StepResult ModernTetrisEnv::apply_placement_index(std::size_t index) {
@@ -646,18 +652,11 @@ StepResult ModernTetrisEnv::apply_placement_index(std::size_t index) {
         return result;
     }
 
-    invalidate_placement_cache();
-    state_.active = option->placement;
-    state_.spin_eligible = option->spin_eligible_path;
-    state_.last_rotate_used_kick = option->last_rotate_used_kick_path;
-    state_.last_rotate_kick_index = option->last_rotate_kick_index_path;
-    lock_active_piece(result);
-    result.action_succeeded = true;
-    result.combo = state_.combo;
-    result.back_to_back = state_.back_to_back;
-    result.game_over = state_.game_over;
-    result.top_out = state_.top_out;
-    return result;
+    return apply_option_impl(*option);
+}
+
+StepResult ModernTetrisEnv::apply_placement_option_fast(const PlacementOption& option) {
+    return apply_option_impl(option);
 }
 
 RotationTrace ModernTetrisEnv::rotation_trace(Action rotate_action) const {
@@ -800,11 +799,16 @@ void ModernTetrisEnv::spawn_next_piece(bool reset_hold_availability) {
 }
 
 bool ModernTetrisEnv::collides(const ActivePiece& piece) const {
-    auto cells = piece_cells(piece.piece, piece.rotation);
+    const auto cells = piece_cells(piece.piece, piece.rotation);
+    const auto& rows = state_.board.rows();
     for (const auto& cell : cells) {
-        int x = piece.x + cell.x;
-        int y = piece.y + cell.y;
-        if (state_.board.occupied(x, y)) {
+        const int x = piece.x + cell.x;
+        const int y = piece.y + cell.y;
+        if (x < 0 || x >= Board::kWidth || y < 0 || y >= Board::kRows) {
+            return true;
+        }
+        if ((rows[static_cast<std::size_t>(y)] &
+             (Board::RowMask{1u} << static_cast<unsigned>(x))) != 0) {
             return true;
         }
     }
@@ -884,29 +888,45 @@ std::optional<ActivePiece> ModernTetrisEnv::kicked_rotation(
     return kicked_rotation_with_tests(from, target_rotation, 0, 0).first;
 }
 
+std::optional<std::pair<ActivePiece, int>> ModernTetrisEnv::kicked_rotation_quick(
+    const ActivePiece& from, Rotation target_rotation) const {
+    if (from.piece == Piece::None) {
+        return std::nullopt;
+    }
+
+    const auto kicks = srs_kicks(from.piece, from.rotation, target_rotation);
+    for (std::size_t i = 0; i < kicks.size(); ++i) {
+        ActivePiece candidate = from;
+        candidate.rotation = target_rotation;
+        candidate.x += kicks[i].x;
+        candidate.y += kicks[i].y;
+        if (!collides(candidate)) {
+            return std::make_pair(candidate, static_cast<int>(i));
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<std::pair<ActivePiece, bool>> ModernTetrisEnv::kicked_rotate_180_with_kick(
     const ActivePiece& from) const {
-    auto [cw_first, tests_cw_first] =
-        kicked_rotation_with_tests(from, rotate_cw(from.rotation), 0, 0);
+    auto cw_first = kicked_rotation_quick(from, rotate_cw(from.rotation));
     if (cw_first.has_value()) {
-        bool used_kick = kick_passed_with_nonzero_offset(tests_cw_first);
-        auto [cw_second, tests_cw_second] =
-            kicked_rotation_with_tests(*cw_first, rotate_cw(cw_first->rotation), 1, 0);
+        bool used_kick = cw_first->second > 0;
+        auto cw_second = kicked_rotation_quick(cw_first->first, rotate_cw(cw_first->first.rotation));
         if (cw_second.has_value()) {
-            used_kick = used_kick || kick_passed_with_nonzero_offset(tests_cw_second);
-            return std::make_pair(*cw_second, used_kick);
+            used_kick = used_kick || (cw_second->second > 0);
+            return std::make_pair(cw_second->first, used_kick);
         }
     }
 
-    auto [ccw_first, tests_ccw_first] =
-        kicked_rotation_with_tests(from, rotate_ccw(from.rotation), 2, 0);
+    auto ccw_first = kicked_rotation_quick(from, rotate_ccw(from.rotation));
     if (ccw_first.has_value()) {
-        bool used_kick = kick_passed_with_nonzero_offset(tests_ccw_first);
-        auto [ccw_second, tests_ccw_second] =
-            kicked_rotation_with_tests(*ccw_first, rotate_ccw(ccw_first->rotation), 3, 0);
+        bool used_kick = ccw_first->second > 0;
+        auto ccw_second =
+            kicked_rotation_quick(ccw_first->first, rotate_ccw(ccw_first->first.rotation));
         if (ccw_second.has_value()) {
-            used_kick = used_kick || kick_passed_with_nonzero_offset(tests_ccw_second);
-            return std::make_pair(*ccw_second, used_kick);
+            used_kick = used_kick || (ccw_second->second > 0);
+            return std::make_pair(ccw_second->first, used_kick);
         }
     }
 

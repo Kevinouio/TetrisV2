@@ -99,11 +99,13 @@ public:
     void reset(std::optional<std::uint32_t> seed = std::nullopt);
     StepResult step(Action action);
     std::vector<PlacementOption> enumerate_active_piece_placements() const;
+    const std::vector<PlacementOption>& placement_options_view() const;
     std::optional<PlacementOption> placement_option_at(std::size_t index) const;
     std::vector<std::uint8_t> visible_board_piece_ids(bool include_active) const;
     std::vector<std::uint8_t> visible_placement_piece_ids(std::size_t index) const;
     StepResult apply_placement(const ActivePiece& placement);
     StepResult apply_placement_index(std::size_t index);
+    StepResult apply_placement_option_fast(const PlacementOption& option);
     RotationTrace rotation_trace(Action rotate_action) const;
 
     EnvSnapshot snapshot() const;
@@ -128,11 +130,14 @@ private:
     std::pair<std::optional<ActivePiece>, std::vector<KickTest>> kicked_rotation_with_tests(
         const ActivePiece& from, Rotation target_rotation, int phase, int start_test_index) const;
     std::optional<ActivePiece> kicked_rotation(const ActivePiece& from, Rotation target_rotation) const;
+    std::optional<std::pair<ActivePiece, int>> kicked_rotation_quick(
+        const ActivePiece& from, Rotation target_rotation) const;
     std::optional<std::pair<ActivePiece, bool>> kicked_rotate_180_with_kick(const ActivePiece& from) const;
     std::optional<ActivePiece> kicked_rotate_180(const ActivePiece& from) const;
     bool touching_ground() const;
     bool apply_hold();
     void lock_active_piece(StepResult& result);
+    StepResult apply_option_impl(const PlacementOption& option);
     float line_clear_reward(int lines, bool spin_clear) const;
     float combo_bonus(int combo) const;
 

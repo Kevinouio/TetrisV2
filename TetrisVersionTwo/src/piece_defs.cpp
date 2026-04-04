@@ -1,5 +1,7 @@
 #include "tetris_v2/piece_defs.hpp"
 
+#include <cstddef>
+
 namespace tetris_v2 {
 
 namespace {
@@ -40,14 +42,29 @@ constexpr std::array<Cell, 4> base_cells(Piece piece) {
     return {Cell{0, 0}, Cell{0, 0}, Cell{0, 0}, Cell{0, 0}};
 }
 
+constexpr std::array<std::array<std::array<Cell, 4>, 4>, 8> build_piece_cell_table() {
+    std::array<std::array<std::array<Cell, 4>, 4>, 8> table{};
+    for (std::size_t p = 0; p < table.size(); ++p) {
+        const auto piece = static_cast<Piece>(p);
+        const auto base = base_cells(piece);
+        for (std::size_t r = 0; r < table[p].size(); ++r) {
+            const auto rotation = static_cast<Rotation>(r);
+            auto rotated = base;
+            for (auto& c : rotated) {
+                c = rotate_cell(rotation, c);
+            }
+            table[p][r] = rotated;
+        }
+    }
+    return table;
+}
+
+constexpr auto kPieceCellTable = build_piece_cell_table();
+
 }  // namespace
 
 std::array<Cell, 4> piece_cells(Piece piece, Rotation rotation) {
-    auto base = base_cells(piece);
-    for (auto& c : base) {
-        c = rotate_cell(rotation, c);
-    }
-    return base;
+    return kPieceCellTable[static_cast<std::size_t>(piece)][static_cast<std::size_t>(rotation)];
 }
 
 ActivePiece spawn_piece(Piece piece) {
