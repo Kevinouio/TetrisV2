@@ -41,6 +41,7 @@ PIECE_COLORS = {
     5: (80, 220, 100),
     6: (240, 90, 90),
 }
+GARBAGE_COLOR = (130, 130, 130)
 
 BG_COLOR = (14, 16, 22)
 PANEL_COLOR = (22, 26, 34)
@@ -78,6 +79,50 @@ def parse_args():
     parser.add_argument("--ai", action="store_true", help="Start with AI autoplay enabled.")
     parser.add_argument("--think-ms", type=int, default=20, help="AI think budget per move in milliseconds.")
     parser.add_argument(
+        "--native-backend",
+        type=str,
+        choices=("cold_clear", "depth"),
+        default="cold_clear",
+        help="Native bot backend to use when no learned checkpoint is provided.",
+    )
+    parser.add_argument(
+        "--depth-search-depth",
+        type=int,
+        default=1,
+        help="Depth backend placement horizon (depth=1 means 1-ply).",
+    )
+    parser.add_argument(
+        "--depth-gamma",
+        type=float,
+        default=1.0,
+        help="Depth backend discount factor.",
+    )
+    parser.add_argument(
+        "--state-source",
+        type=str,
+        choices=("rollout", "random_board"),
+        default="rollout",
+        help="Episode start source: normal rollout or DAgger-like random board injection.",
+    )
+    parser.add_argument(
+        "--random-fill-y-max-exclusive",
+        type=int,
+        default=17,
+        help="Bottom rows eligible for random fill in random_board mode.",
+    )
+    parser.add_argument(
+        "--random-fill-prob",
+        type=float,
+        default=0.5,
+        help="Bernoulli fill probability used in random_board mode.",
+    )
+    parser.add_argument(
+        "--random-max-resamples-per-sample",
+        type=int,
+        default=100,
+        help="Max random-board resamples to find a valid non-empty non-terminal start.",
+    )
+    parser.add_argument(
         "--bc-checkpoint",
         type=Path,
         default=None,
@@ -113,24 +158,43 @@ def parse_args():
         dest="auto_reset",
         help="Disable AI auto reset on topout.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if int(args.random_fill_y_max_exclusive) < 0 or int(args.random_fill_y_max_exclusive) > 20:
+        raise SystemExit("--random-fill-y-max-exclusive must be in [0,20].")
+    if not (0.0 <= float(args.random_fill_prob) <= 1.0):
+        raise SystemExit("--random-fill-prob must be in [0,1].")
+    if int(args.random_max_resamples_per_sample) <= 0:
+        raise SystemExit("--random-max-resamples-per-sample must be > 0.")
+    return args
 
 
-def find_library(explicit_path: Optional[Path]) -> Path:
+_DEPTH_BACKEND_C_API_SYMBOLS = (
+    "tetris_cc_bot_set_backend",
+    "tetris_cc_bot_get_backend",
+    "tetris_cc_bot_set_depth_config",
+)
+
+
+def _has_c_api_symbols(path: Path, symbols) -> bool:
+    try:
+        lib = ctypes.CDLL(str(path))
+    except OSError:
+        return False
+    return all(hasattr(lib, name) for name in symbols)
+
+
+def find_library(
+    explicit_path: Optional[Path],
+    *,
+    require_depth_backend: bool = False,
+    prefer_depth_backend: bool = False,
+) -> Path:
     shared_find_library = None
     try:
         from TetrisVersionTwo.scripts.bc.utils import find_library as shared_find_library
     except Exception:
         # Keep this viewer script usable as a standalone fallback if package imports fail.
         shared_find_library = None
-    if shared_find_library is not None:
-        return shared_find_library(explicit_path)
-
-    if explicit_path is not None:
-        if explicit_path.exists():
-            return explicit_path
-        raise FileNotFoundError(f"Library not found: {explicit_path}")
-
     candidates = [
         Path("build/TetrisVersionTwo/tetris_v2_c_api.dll"),
         Path("build/TetrisVersionTwo/Debug/tetris_v2_c_api.dll"),
@@ -144,9 +208,70 @@ def find_library(explicit_path: Optional[Path]) -> Path:
         Path("TetrisVersionTwo/build/libtetris_v2_c_api.dylib"),
     ]
 
+    def pick_candidate_from_search_paths(*, require_depth: bool, prefer_depth: bool) -> Optional[Path]:
+        existing = [candidate for candidate in candidates if candidate.exists()]
+        if not existing:
+            return None
+        if require_depth or prefer_depth:
+            for candidate in existing:
+                if _has_c_api_symbols(candidate, _DEPTH_BACKEND_C_API_SYMBOLS):
+                    return candidate
+        if require_depth:
+            return None
+        return existing[0]
+
+    if shared_find_library is not None:
+        candidate = shared_find_library(explicit_path)
+        has_depth_symbols = _has_c_api_symbols(candidate, _DEPTH_BACKEND_C_API_SYMBOLS)
+        if has_depth_symbols:
+            return candidate
+        if require_depth_backend:
+            if explicit_path is not None:
+                raise RuntimeError(
+                    f"Library '{candidate}' is missing required depth backend symbols: "
+                    f"{', '.join(_DEPTH_BACKEND_C_API_SYMBOLS)}"
+                )
+            fallback = pick_candidate_from_search_paths(require_depth=True, prefer_depth=True)
+            if fallback is not None:
+                return fallback
+            raise RuntimeError(
+                "Found tetris_v2_c_api shared libraries, but none export required depth backend symbols."
+            )
+        if prefer_depth_backend and explicit_path is None:
+            fallback = pick_candidate_from_search_paths(require_depth=False, prefer_depth=True)
+            if fallback is not None:
+                return fallback
+        return candidate
+
+    if explicit_path is not None:
+        if explicit_path.exists():
+            if require_depth_backend and not _has_c_api_symbols(explicit_path, _DEPTH_BACKEND_C_API_SYMBOLS):
+                raise RuntimeError(
+                    f"Library '{explicit_path}' is missing required depth backend symbols: "
+                    f"{', '.join(_DEPTH_BACKEND_C_API_SYMBOLS)}"
+                )
+            return explicit_path
+        raise FileNotFoundError(f"Library not found: {explicit_path}")
+
+    depth_symbol_failures = []
     for candidate in candidates:
         if candidate.exists():
+            if require_depth_backend and not _has_c_api_symbols(candidate, _DEPTH_BACKEND_C_API_SYMBOLS):
+                depth_symbol_failures.append(str(candidate))
+                continue
+            if prefer_depth_backend and not _has_c_api_symbols(candidate, _DEPTH_BACKEND_C_API_SYMBOLS):
+                depth_symbol_failures.append(str(candidate))
+                continue
             return candidate
+    if prefer_depth_backend and not require_depth_backend:
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+    if require_depth_backend and depth_symbol_failures:
+        raise RuntimeError(
+            "Found tetris_v2_c_api shared libraries, but none export required depth backend symbols. "
+            f"Tried: {', '.join(depth_symbol_failures)}"
+        )
     raise FileNotFoundError("Could not locate tetris_v2_c_api shared library. Build it first.")
 
 
@@ -193,6 +318,14 @@ class EnvCtypes:
                 "tetris_cc_bot_choose_and_apply_ex",
             )
         )
+        self._has_bot_backend_api = self._has_bot_api and all(
+            hasattr(self.lib, name)
+            for name in (
+                "tetris_cc_bot_set_backend",
+                "tetris_cc_bot_get_backend",
+                "tetris_cc_bot_set_depth_config",
+            )
+        )
         self._has_candidate_batch_api = all(
             hasattr(self.lib, name)
             for name in (
@@ -201,6 +334,8 @@ class EnvCtypes:
                 "tetris_cc_env_candidate_features_write",
             )
         )
+        self._has_visible_garbage_count = hasattr(self.lib, "tetris_cc_env_visible_garbage_count")
+        self._has_set_visible_board_mask = hasattr(self.lib, "tetris_cc_env_set_visible_board_mask")
 
         self.lib.tetris_cc_env_create.argtypes = [ctypes.c_uint32]
         self.lib.tetris_cc_env_create.restype = void_p
@@ -234,6 +369,18 @@ class EnvCtypes:
             ctypes.c_size_t,
         ]
         self.lib.tetris_cc_env_board_write.restype = ctypes.c_size_t
+
+        if self._has_visible_garbage_count:
+            self.lib.tetris_cc_env_visible_garbage_count.argtypes = [void_p]
+            self.lib.tetris_cc_env_visible_garbage_count.restype = ctypes.c_size_t
+        if self._has_set_visible_board_mask:
+            self.lib.tetris_cc_env_set_visible_board_mask.argtypes = [
+                void_p,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            self.lib.tetris_cc_env_set_visible_board_mask.restype = ctypes.c_int
 
         if self._has_piece_id_api:
             self.lib.tetris_cc_env_board_piece_ids_write.argtypes = [
@@ -415,6 +562,21 @@ class EnvCtypes:
                     c_int_p,
                 ]
                 self.lib.tetris_cc_bot_choose_and_apply_ex.restype = ctypes.c_int
+            if self._has_bot_backend_api:
+                self.lib.tetris_cc_bot_set_backend.argtypes = [void_p, ctypes.c_int]
+                self.lib.tetris_cc_bot_set_backend.restype = ctypes.c_int
+                self.lib.tetris_cc_bot_get_backend.argtypes = [void_p, c_int_p]
+                self.lib.tetris_cc_bot_get_backend.restype = ctypes.c_int
+                self.lib.tetris_cc_bot_set_depth_config.argtypes = [
+                    void_p,
+                    ctypes.c_int,
+                    ctypes.c_double,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint64,
+                ]
+                self.lib.tetris_cc_bot_set_depth_config.restype = ctypes.c_int
 
     def close(self):
         if self.bot_handle and self._has_bot_api:
@@ -436,6 +598,42 @@ class EnvCtypes:
             self.bot_sync()
         return {"success": bool(success), "reward": float(reward.value)}
 
+    def has_random_board_api(self):
+        return bool(self._has_set_visible_board_mask)
+
+    def visible_garbage_count(self) -> int:
+        if self._has_visible_garbage_count:
+            return int(self.lib.tetris_cc_env_visible_garbage_count(self.handle))
+
+        board = self.board()
+        if self._has_piece_id_api:
+            piece_ids = self.board_piece_ids(include_active=False)
+            count = 0
+            for r in range(BOARD_ROWS):
+                for c in range(BOARD_COLS):
+                    if int(board[r][c]) != 0 and int(piece_ids[r][c]) == EMPTY_CELL_ID:
+                        count += 1
+            return int(count)
+        return int(sum(int(cell != 0) for row in board for cell in row))
+
+    def set_visible_board_mask(self, mask: np.ndarray, reset_meta: bool = True) -> bool:
+        if not self._has_set_visible_board_mask:
+            raise RuntimeError("C API does not provide tetris_cc_env_set_visible_board_mask.")
+        arr = np.asarray(mask, dtype=np.uint8)
+        if arr.shape != (BOARD_ROWS, BOARD_COLS):
+            raise ValueError(f"Expected mask shape {(BOARD_ROWS, BOARD_COLS)}, got {arr.shape}")
+        flat = np.ascontiguousarray(arr.reshape(-1), dtype=np.uint8)
+        ptr = flat.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        ok = self.lib.tetris_cc_env_set_visible_board_mask(
+            self.handle,
+            ptr,
+            ctypes.c_size_t(flat.size),
+            ctypes.c_int(1 if bool(reset_meta) else 0),
+        )
+        if ok:
+            self.bot_sync()
+        return bool(ok)
+
     def has_bot(self):
         return bool(self._has_bot_api and self.bot_handle)
 
@@ -443,6 +641,32 @@ class EnvCtypes:
         if not self.has_bot():
             return False
         ok = self.lib.tetris_cc_bot_sync_from_env(self.bot_handle, self.handle)
+        return bool(ok)
+
+    def bot_set_backend(self, backend_name: str) -> bool:
+        if not self.has_bot() or not self._has_bot_backend_api:
+            return False
+        if backend_name == "cold_clear":
+            backend_id = 0
+        elif backend_name == "depth":
+            backend_id = 1
+        else:
+            return False
+        ok = self.lib.tetris_cc_bot_set_backend(self.bot_handle, ctypes.c_int(backend_id))
+        return bool(ok)
+
+    def bot_set_depth_config(self, depth: int, gamma: float) -> bool:
+        if not self.has_bot() or not self._has_bot_backend_api:
+            return False
+        ok = self.lib.tetris_cc_bot_set_depth_config(
+            self.bot_handle,
+            ctypes.c_int(max(1, int(depth))),
+            ctypes.c_double(float(gamma)),
+            ctypes.c_int(1),  # deduplicate_successors
+            ctypes.c_int(0),  # use_transposition_table
+            ctypes.c_int(1),  # collect_debug_info
+            ctypes.c_uint64(0),  # max_nodes (unlimited)
+        )
         return bool(ok)
 
     def bot_choose_and_apply(self, think_ms: int = 20):
@@ -1030,27 +1254,44 @@ def piece_cells(piece: int, rotation: int):
     return [rot(c) for c in base]
 
 
-def draw_board(surface, x0, y0, cell, board_piece_ids):
+def draw_board(surface, x0, y0, cell, board_piece_ids, board_occupancy):
     for r in range(BOARD_ROWS):
         for c in range(BOARD_COLS):
             rect = pygame.Rect(x0 + c * cell, y0 + r * cell, cell, cell)
             piece_id = board_piece_ids[r][c]
-            if piece_id != EMPTY_CELL_ID:
+            occupied = int(board_occupancy[r][c]) != 0
+            if 0 <= int(piece_id) <= 6:
                 pygame.draw.rect(surface, PIECE_COLORS.get(piece_id, BOARD_FILL), rect)
+            elif int(piece_id) == EMPTY_CELL_ID and occupied:
+                pygame.draw.rect(surface, GARBAGE_COLOR, rect)
             pygame.draw.rect(surface, GRID_LINE, rect, width=1)
 
-def draw_small_board(surface, x0, y0, cell, board_piece_ids):
+def draw_small_board(surface, x0, y0, cell, board_piece_ids, board_occupancy):
     for r in range(BOARD_ROWS):
         for c in range(BOARD_COLS):
             rect = pygame.Rect(x0 + c * cell, y0 + r * cell, cell, cell)
             piece_id = board_piece_ids[r][c]
-            if piece_id != EMPTY_CELL_ID:
+            occupied = int(board_occupancy[r][c]) != 0
+            if 0 <= int(piece_id) <= 6:
                 pygame.draw.rect(surface, PIECE_COLORS.get(piece_id, BOARD_FILL), rect)
+            elif int(piece_id) == EMPTY_CELL_ID and occupied:
+                pygame.draw.rect(surface, GARBAGE_COLOR, rect)
             pygame.draw.rect(surface, (55, 60, 72), rect, width=1)
 
 
 def action_name(action: int):
     return {ACTION_CW: "CW", ACTION_CCW: "CCW", ACTION_180: "180"}.get(action, "?")
+
+
+def _mix_seed_with_attempt(base_seed: int, round_id: int, episode_id: int, attempt_idx: int) -> int:
+    mixed = (
+        int(base_seed) * 1_000_000_007
+        + int(round_id) * 1_000_003
+        + int(episode_id) * 97
+        + int(attempt_idx) * 271
+        + 43
+    )
+    return int(mixed & ((1 << 63) - 1))
 
 
 def main():
@@ -1062,9 +1303,19 @@ def main():
             file=sys.stderr,
         )
         raise SystemExit(2)
+    native_depth_requested = (
+        args.bc_checkpoint is None
+        and args.dqn_checkpoint is None
+        and str(args.native_backend) == "depth"
+    )
+    require_depth_backend = bool(native_depth_requested and args.ai)
     try:
-        lib_path = find_library(args.lib)
-    except FileNotFoundError as exc:
+        lib_path = find_library(
+            args.lib,
+            require_depth_backend=require_depth_backend,
+            prefer_depth_backend=native_depth_requested,
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
 
@@ -1125,12 +1376,113 @@ def main():
             bc_agent = None
             status = f"BC init failed: {exc}"
 
+    else:
+        ai_backend = str(args.native_backend)
+        ai_backend_label = "Depth" if ai_backend == "depth" else "ColdClear"
+
+    state_source = str(args.state_source).strip().lower()
+    random_board_mode = state_source == "random_board"
+    native_config_error = None
+    random_board_error = None
+    last_reset_summary = f"state_source={state_source} (pending)"
+
+    def configure_native_backend() -> Optional[str]:
+        if ai_backend not in ("cold_clear", "depth"):
+            return None
+        if not env.has_bot():
+            return "bot API symbols not exported by shared library."
+
+        if ai_backend == "depth":
+            if not getattr(env, "_has_bot_backend_api", False):
+                return (
+                    "depth backend symbols missing "
+                    "(tetris_cc_bot_set_backend/tetris_cc_bot_set_depth_config)."
+                )
+            if not env.bot_set_backend("depth"):
+                return "failed to set bot backend to depth."
+            if not env.bot_set_depth_config(args.depth_search_depth, args.depth_gamma):
+                return (
+                    f"failed to set depth config "
+                    f"(depth={max(1, int(args.depth_search_depth))}, gamma={float(args.depth_gamma):.3f})."
+                )
+        else:
+            if getattr(env, "_has_bot_backend_api", False):
+                if not env.bot_set_backend("cold_clear"):
+                    return "failed to set bot backend to cold_clear."
+
+        if not env.bot_sync():
+            return f"failed to sync {ai_backend} backend from env."
+        return None
+
+    def reset_episode_for_seed(seed_value: int) -> Tuple[bool, str]:
+        nonlocal native_config_error
+        if not random_board_mode:
+            env.reset(seed_value)
+            native_config_error = configure_native_backend()
+            if native_config_error is not None:
+                return False, native_config_error
+            return True, "state_source=rollout"
+
+        if not env.has_random_board_api():
+            return False, "random_board requires tetris_cc_env_set_visible_board_mask."
+
+        attempts_limit = max(1, int(args.random_max_resamples_per_sample))
+        y_lim = max(0, min(BOARD_ROWS, int(args.random_fill_y_max_exclusive)))
+        for attempt_idx in range(attempts_limit):
+            env.reset(seed_value)
+            mask_rng = np.random.default_rng(
+                _mix_seed_with_attempt(int(args.seed), 0, int(seed_value), int(attempt_idx))
+            )
+            mask = np.zeros((BOARD_ROWS, BOARD_COLS), dtype=np.uint8)
+            if y_lim > 0:
+                lower = mask_rng.random((y_lim, BOARD_COLS)) < float(args.random_fill_prob)
+                for y in range(y_lim):
+                    row = BOARD_ROWS - 1 - y
+                    mask[row, :] = lower[y, :].astype(np.uint8)
+            try:
+                ok = env.set_visible_board_mask(mask, reset_meta=True)
+            except Exception as exc:
+                return False, f"failed to inject random board mask: {exc}"
+            if not ok:
+                return False, "failed to inject random board mask via C API."
+            if bool(env.meta()["game_over"]):
+                continue
+            garbage_cells = int(env.visible_garbage_count())
+            if garbage_cells <= 0:
+                continue
+            native_config_error = configure_native_backend()
+            if native_config_error is not None:
+                return False, native_config_error
+            return (
+                True,
+                (
+                    f"state_source=random_board attempts={attempt_idx + 1} "
+                    f"garbage={garbage_cells}"
+                ),
+            )
+        return False, f"failed to sample valid random board after {attempts_limit} attempts."
+
+    startup_reset_ok, startup_reset_message = reset_episode_for_seed(seed)
+    if startup_reset_ok:
+        last_reset_summary = startup_reset_message
+    else:
+        last_reset_summary = startup_reset_message
+        if random_board_mode:
+            random_board_error = startup_reset_message
+            # Keep viewer usable even when random-board startup fails.
+            env.reset(seed)
+            native_config_error = configure_native_backend()
+        else:
+            native_config_error = startup_reset_message
+
     if ai_backend == "bc":
         ai_available = bc_agent is not None
     elif ai_backend == "dqn":
         ai_available = dqn_agent is not None
     else:
-        ai_available = env.has_bot()
+        ai_available = env.has_bot() and native_config_error is None
+    if random_board_error is not None:
+        ai_available = False
     ai_enabled = bool(args.ai and ai_available)
     ai_metrics = {
         "pieces": 0,
@@ -1151,20 +1503,39 @@ def main():
         "last_candidate_count": 0,
         "start_ticks": pygame.time.get_ticks(),
     }
+    if args.ai and random_board_error is not None:
+        print(
+            f"Error: random_board startup failed: {random_board_error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     if args.ai and not ai_available:
         if ai_backend == "bc":
             status = "AI[BC] requested, but BC checkpoint failed to initialize."
         elif ai_backend == "dqn":
             status = "AI[DQN] requested, but DQN checkpoint failed to initialize."
         else:
-            status = "AI requested, but bot API symbols were not found in shared library."
+            if native_config_error:
+                status = f"AI[{ai_backend_label}] requested, but {native_config_error}"
+            else:
+                status = "AI requested, but bot API symbols were not found in shared library."
     elif ai_enabled:
         if ai_backend == "bc":
             status = f"AI[BC] enabled at startup (device={args.bc_device or 'auto'})"
         elif ai_backend == "dqn":
             status = f"AI[DQN] enabled at startup (device={args.dqn_device or 'auto'})"
         else:
-            status = f"AI[ColdClear] enabled at startup (think={max(1, int(args.think_ms))}ms)"
+            if ai_backend == "depth":
+                status = (
+                    f"AI[Depth] enabled at startup "
+                    f"(depth={max(1, int(args.depth_search_depth))} gamma={float(args.depth_gamma):.3f})"
+                )
+            else:
+                status = f"AI[ColdClear] enabled at startup (think={max(1, int(args.think_ms))}ms)"
+    elif random_board_error is not None:
+        status = f"AI unavailable: random_board startup failed: {random_board_error}"
+    elif native_config_error and ai_backend in ("cold_clear", "depth"):
+        status = f"AI[{ai_backend_label}] unavailable: {native_config_error}"
 
     info_h = 240
     list_y = board_y + info_h + 10
@@ -1205,6 +1576,13 @@ def main():
                                     status = (
                                         f"AI[ColdClear] enabled (think={max(1, int(args.think_ms))}ms)"
                                     )
+                                elif ai_backend == "depth":
+                                    env.bot_sync()
+                                    status = (
+                                        f"AI[Depth] enabled "
+                                        f"(depth={max(1, int(args.depth_search_depth))} "
+                                        f"gamma={float(args.depth_gamma):.3f})"
+                                    )
                                 elif ai_backend == "dqn":
                                     status = f"AI[DQN] enabled (device={args.dqn_device or 'auto'})"
                                 else:
@@ -1217,7 +1595,12 @@ def main():
                             elif ai_backend == "dqn":
                                 status = "AI unavailable: DQN checkpoint is not available."
                             else:
-                                status = "AI unavailable: bot symbols not exported by shared library."
+                                if random_board_error:
+                                    status = f"AI unavailable: random_board startup failed: {random_board_error}"
+                                elif native_config_error:
+                                    status = f"AI[{ai_backend_label}] unavailable: {native_config_error}"
+                                else:
+                                    status = "AI unavailable: bot symbols not exported by shared library."
                     elif event.key == pygame.K_UP:
                         selected_index = max(0, selected_index - 1)
                         if selected_index < list_scroll:
@@ -1240,16 +1623,32 @@ def main():
                     elif event.key == pygame.K_RIGHTBRACKET:
                         inspector_idx = (inspector_idx + 1) % len(inspector_actions)
                     elif event.key == pygame.K_r:
-                        env.reset(seed)
+                        reset_ok, reset_message = reset_episode_for_seed(seed)
                         selected_index = 0
                         list_scroll = 0
-                        status = f"Reset seed={seed}"
+                        if reset_ok:
+                            last_reset_summary = reset_message
+                            status = f"Reset seed={seed} ({reset_message})"
+                        else:
+                            last_reset_summary = f"reset_failed: {reset_message}"
+                            random_board_error = reset_message if random_board_mode else random_board_error
+                            ai_enabled = False
+                            ai_available = False
+                            status = f"Reset failed for seed={seed}: {reset_message}"
                     elif event.key == pygame.K_n:
                         seed = random.randint(1, 2**31 - 1)
-                        env.reset(seed)
+                        reset_ok, reset_message = reset_episode_for_seed(seed)
                         selected_index = 0
                         list_scroll = 0
-                        status = f"Reset new seed={seed}"
+                        if reset_ok:
+                            last_reset_summary = reset_message
+                            status = f"Reset new seed={seed} ({reset_message})"
+                        else:
+                            last_reset_summary = f"reset_failed: {reset_message}"
+                            random_board_error = reset_message if random_board_mode else random_board_error
+                            ai_enabled = False
+                            ai_available = False
+                            status = f"Reset failed for seed={seed}: {reset_message}"
                 elif event.type == pygame.MOUSEWHEEL:
                     if list_rect.collidepoint(pygame.mouse.get_pos()):
                         max_start = max(0, len(placements) - max_rows)
@@ -1289,8 +1688,18 @@ def main():
                     ai_metrics["topouts"] += 1
                     if args.auto_reset:
                         seed += 1
-                        env.reset(seed)
-                        status = f"AI[{ai_backend_label}] auto-reset to seed={seed}"
+                        reset_ok, reset_message = reset_episode_for_seed(seed)
+                        selected_index = 0
+                        list_scroll = 0
+                        if reset_ok:
+                            last_reset_summary = reset_message
+                            status = f"AI[{ai_backend_label}] auto-reset to seed={seed} ({reset_message})"
+                        else:
+                            last_reset_summary = f"reset_failed: {reset_message}"
+                            random_board_error = reset_message if random_board_mode else random_board_error
+                            ai_enabled = False
+                            ai_available = False
+                            status = f"AI auto-reset failed at seed={seed}: {reset_message}"
                     else:
                         ai_enabled = False
                         status = "AI paused on topout. Press R/N or toggle AI with A."
@@ -1343,8 +1752,20 @@ def main():
                                         ai_metrics["topouts"] += 1
                                         if args.auto_reset:
                                             seed += 1
-                                            env.reset(seed)
-                                            status = f"AI[BC] topout -> auto-reset seed={seed}"
+                                            reset_ok, reset_message = reset_episode_for_seed(seed)
+                                            selected_index = 0
+                                            list_scroll = 0
+                                            if reset_ok:
+                                                last_reset_summary = reset_message
+                                                status = f"AI[BC] topout -> auto-reset seed={seed} ({reset_message})"
+                                            else:
+                                                last_reset_summary = f"reset_failed: {reset_message}"
+                                                random_board_error = (
+                                                    reset_message if random_board_mode else random_board_error
+                                                )
+                                                ai_enabled = False
+                                                ai_available = False
+                                                status = f"AI[BC] auto-reset failed at seed={seed}: {reset_message}"
                                         else:
                                             ai_enabled = False
                                             status = "AI[BC] topout. Autoplay stopped (auto-reset disabled)."
@@ -1394,8 +1815,20 @@ def main():
                                         ai_metrics["topouts"] += 1
                                         if args.auto_reset:
                                             seed += 1
-                                            env.reset(seed)
-                                            status = f"AI[DQN] topout -> auto-reset seed={seed}"
+                                            reset_ok, reset_message = reset_episode_for_seed(seed)
+                                            selected_index = 0
+                                            list_scroll = 0
+                                            if reset_ok:
+                                                last_reset_summary = reset_message
+                                                status = f"AI[DQN] topout -> auto-reset seed={seed} ({reset_message})"
+                                            else:
+                                                last_reset_summary = f"reset_failed: {reset_message}"
+                                                random_board_error = (
+                                                    reset_message if random_board_mode else random_board_error
+                                                )
+                                                ai_enabled = False
+                                                ai_available = False
+                                                status = f"AI[DQN] auto-reset failed at seed={seed}: {reset_message}"
                                         else:
                                             ai_enabled = False
                                             status = "AI[DQN] topout. Autoplay stopped (auto-reset disabled)."
@@ -1419,7 +1852,7 @@ def main():
                             ai_metrics["last_budget_miss"] = int(ai_result["budget_miss"])
                             ai_metrics["budget_misses"] += int(ai_result["budget_miss"])
                             status = (
-                                f"AI[ColdClear] move idx={ai_result['placement_index']} "
+                                f"AI[{ai_backend_label}] move idx={ai_result['placement_index']} "
                                 f"hold={ai_result['used_hold']} score={ai_result['score']:.2f} "
                                 f"lines+={ai_result['lines']}"
                             )
@@ -1427,8 +1860,24 @@ def main():
                                 ai_metrics["topouts"] += 1
                                 if args.auto_reset:
                                     seed += 1
-                                    env.reset(seed)
-                                    status = f"AI[ColdClear] topout -> auto-reset seed={seed}"
+                                    reset_ok, reset_message = reset_episode_for_seed(seed)
+                                    selected_index = 0
+                                    list_scroll = 0
+                                    if reset_ok:
+                                        last_reset_summary = reset_message
+                                        status = (
+                                            f"AI[{ai_backend_label}] topout -> auto-reset seed={seed} "
+                                            f"({reset_message})"
+                                        )
+                                    else:
+                                        last_reset_summary = f"reset_failed: {reset_message}"
+                                        random_board_error = reset_message if random_board_mode else random_board_error
+                                        ai_enabled = False
+                                        ai_available = False
+                                        status = (
+                                            f"AI[{ai_backend_label}] auto-reset failed at seed={seed}: "
+                                            f"{reset_message}"
+                                        )
                                 else:
                                     ai_enabled = False
                                     status = "AI topout. Autoplay stopped (auto-reset disabled)."
@@ -1436,6 +1885,7 @@ def main():
                             ai_enabled = False
                             status = "AI choose/apply failed. Autoplay disabled."
 
+            board_occ = env.board()
             board_piece_ids = env.board_piece_ids(include_active=True)
             hold = env.hold_info()
             queue = env.queue()
@@ -1446,10 +1896,12 @@ def main():
                 selected_index = max(0, min(selected_index, len(placements) - 1))
                 max_start = max(0, len(placements) - max_rows)
                 list_scroll = max(0, min(max_start, list_scroll))
+                preview_occ = env.placement_board(selected_index)
                 preview_piece_ids = env.placement_piece_ids(selected_index)
             else:
                 selected_index = 0
                 list_scroll = 0
+                preview_occ = [[0 for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
                 preview_piece_ids = [[EMPTY_CELL_ID for _ in range(BOARD_COLS)] for _ in range(BOARD_ROWS)]
 
             inspect_action = inspector_actions[inspector_idx]
@@ -1458,7 +1910,7 @@ def main():
             screen.fill(BG_COLOR)
 
             pygame.draw.rect(screen, PANEL_COLOR, (board_x - 4, board_y - 4, board_w + 8, board_h + 8), border_radius=6)
-            draw_board(screen, board_x, board_y, cell, board_piece_ids)
+            draw_board(screen, board_x, board_y, cell, board_piece_ids, board_occ)
 
             # Top-right info panel
             info_y = board_y
@@ -1478,16 +1930,27 @@ def main():
                 f"GameOver={meta['game_over']} TopOut={meta['top_out']}",
                 f"Combo={meta['combo']} B2B={meta['b2b']} Lines={meta['lines']}",
                 f"LockTimer={meta['lock_timer']} Resets={meta['lock_resets']}",
+                (
+                    "StateSource: random_board "
+                    f"(y_max_excl={int(args.random_fill_y_max_exclusive)} "
+                    f"p={float(args.random_fill_prob):.2f} "
+                    f"resamples={int(args.random_max_resamples_per_sample)})"
+                    if random_board_mode
+                    else "StateSource: rollout"
+                ),
+                f"Last reset: {last_reset_summary}",
                 f"AI: {'ON' if ai_enabled else 'OFF'} backend={ai_backend_info} avail={ai_available}",
                 f"AI pieces={ai_metrics['pieces']} lines={ai_metrics['lines']} topouts={ai_metrics['topouts']}",
                 f"AI PPS={ai_pps:.2f} step_ms(last/avg)={ai_metrics['last_step_ms']:.1f}/{ai_metrics['avg_step_ms']:.1f}",
             ]
-            if ai_backend == "cold_clear":
+            if ai_backend in ("cold_clear", "depth"):
                 lines.append(
-                    f"AI nodes={ai_metrics['last_nodes']} nps={ai_metrics['last_nps']:.0f} score={ai_metrics['last_score']:.2f}"
+                    f"AI[{ai_backend_label}] nodes={ai_metrics['last_nodes']} "
+                    f"nps={ai_metrics['last_nps']:.0f} score={ai_metrics['last_score']:.2f}"
                 )
                 lines.append(
-                    f"AI budget_miss last/total={ai_metrics['last_budget_miss']}/{ai_metrics['budget_misses']}"
+                    f"AI[{ai_backend_label}] budget_miss "
+                    f"last/total={ai_metrics['last_budget_miss']}/{ai_metrics['budget_misses']}"
                 )
             elif ai_backend == "bc":
                 lines.append(
@@ -1553,7 +2016,14 @@ def main():
             preview_h = BOARD_ROWS * preview_cell + 36
             pygame.draw.rect(screen, PANEL_COLOR, (right_x, preview_y, right_w, preview_h), border_radius=8)
             screen.blit(font.render("Selected Placement Board", True, LOCK_TEXT), (right_x + 10, preview_y + 8))
-            draw_small_board(screen, right_x + 10, preview_y + 30, preview_cell, preview_piece_ids)
+            draw_small_board(
+                screen,
+                right_x + 10,
+                preview_y + 30,
+                preview_cell,
+                preview_piece_ids,
+                preview_occ,
+            )
 
             # Kick inspector panel
             kick_y = preview_y + preview_h + 10

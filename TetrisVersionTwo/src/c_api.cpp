@@ -15,6 +15,52 @@
 #include "tetris_v2/observation.hpp"
 #include "tetris_v2/piece_defs.hpp"
 
+namespace tetris_v2::depth {
+
+class Bot;
+Bot* create_default();
+void destroy(Bot* bot);
+bool sync_from_env(Bot* bot, const ModernTetrisEnv& env);
+bool set_config(
+    Bot* bot,
+    int depth,
+    double gamma,
+    bool deduplicate_successors,
+    bool use_transposition_table,
+    bool collect_debug_info,
+    std::uint64_t max_nodes);
+bool choose(
+    Bot* bot,
+    int think_ms,
+    bool* use_hold_out,
+    std::size_t* placement_index_out,
+    float* score_out,
+    std::uint64_t* nodes_out,
+    double* think_ms_out,
+    double* nps_out,
+    int* budget_miss_out);
+bool apply_last_choice(
+    Bot* bot,
+    ModernTetrisEnv& env,
+    StepResult* result_out,
+    int* used_hold_out,
+    std::size_t* placement_index_out);
+bool choose_and_apply(
+    Bot* bot,
+    ModernTetrisEnv& env,
+    int think_ms,
+    StepResult* result_out,
+    bool* use_hold_out,
+    std::size_t* placement_index_out,
+    float* score_out,
+    std::uint64_t* nodes_out,
+    double* think_ms_out,
+    double* nps_out,
+    int* budget_miss_out,
+    int* used_hold_out);
+
+}  // namespace tetris_v2::depth
+
 struct tetris_cc_env_handle {
     explicit tetris_cc_env_handle(std::uint32_t seed) : env(tetris_v2::EnvConfig{seed}) {}
 
@@ -37,7 +83,11 @@ struct tetris_cc_env_handle {
 };
 
 struct tetris_cc_bot_handle {
-    tetris_v2::cc::Bot bot;
+    tetris_v2::cc::Bot cold_clear_bot;
+    tetris_v2::depth::Bot* depth_bot{tetris_v2::depth::create_default()};
+    int backend{TETRIS_CC_BOT_BACKEND_COLD_CLEAR};
+
+    ~tetris_cc_bot_handle() { tetris_v2::depth::destroy(depth_bot); }
 };
 
 struct tetris_cc_snapshot_handle {
@@ -47,6 +97,10 @@ struct tetris_cc_snapshot_handle {
 namespace {
 
 constexpr std::size_t kCandidateFeatureDim = 6;
+
+bool valid_bot_backend(int backend) {
+    return backend == TETRIS_CC_BOT_BACKEND_COLD_CLEAR || backend == TETRIS_CC_BOT_BACKEND_DEPTH;
+}
 
 tetris_v2::Action parse_action(int action) {
     if (action < static_cast<int>(tetris_v2::Action::None) ||
@@ -785,7 +839,12 @@ int tetris_cc_env_rotation_trace_meta(
 
 tetris_cc_bot_handle* tetris_cc_bot_create_default(void) {
     try {
-        return new tetris_cc_bot_handle{};
+        auto* handle = new tetris_cc_bot_handle{};
+        if (!handle->depth_bot) {
+            delete handle;
+            return nullptr;
+        }
+        return handle;
     } catch (...) {
         return nullptr;
     }
@@ -793,11 +852,59 @@ tetris_cc_bot_handle* tetris_cc_bot_create_default(void) {
 
 void tetris_cc_bot_destroy(tetris_cc_bot_handle* handle) { delete handle; }
 
+int tetris_cc_bot_set_backend(tetris_cc_bot_handle* bot, int backend) {
+    if (!bot || !valid_bot_backend(backend)) {
+        return 0;
+    }
+    if (backend == TETRIS_CC_BOT_BACKEND_DEPTH && !bot->depth_bot) {
+        return 0;
+    }
+    bot->backend = backend;
+    return 1;
+}
+
+int tetris_cc_bot_get_backend(const tetris_cc_bot_handle* bot, int* backend_out) {
+    if (!bot || !backend_out) {
+        return 0;
+    }
+    *backend_out = bot->backend;
+    return 1;
+}
+
+int tetris_cc_bot_set_depth_config(
+    tetris_cc_bot_handle* bot,
+    int depth,
+    double gamma,
+    int deduplicate_successors,
+    int use_transposition_table,
+    int collect_debug_info,
+    std::uint64_t max_nodes) {
+    if (!bot || !bot->depth_bot) {
+        return 0;
+    }
+    return tetris_v2::depth::set_config(
+               bot->depth_bot,
+               depth,
+               gamma,
+               deduplicate_successors != 0,
+               use_transposition_table != 0,
+               collect_debug_info != 0,
+               max_nodes)
+        ? 1
+        : 0;
+}
+
 int tetris_cc_bot_sync_from_env(tetris_cc_bot_handle* bot, const tetris_cc_env_handle* env) {
     if (!bot || !env) {
         return 0;
     }
-    return bot->bot.sync_from_env(env->env) ? 1 : 0;
+    if (bot->backend == TETRIS_CC_BOT_BACKEND_DEPTH) {
+        if (!bot->depth_bot) {
+            return 0;
+        }
+        return tetris_v2::depth::sync_from_env(bot->depth_bot, env->env.raw()) ? 1 : 0;
+    }
+    return bot->cold_clear_bot.sync_from_env(env->env) ? 1 : 0;
 }
 
 int tetris_cc_bot_choose(
@@ -813,10 +920,46 @@ int tetris_cc_bot_choose(
     if (!bot) {
         return 0;
     }
+    if (bot->backend == TETRIS_CC_BOT_BACKEND_DEPTH) {
+        if (!bot->depth_bot) {
+            return 0;
+        }
+        bool use_hold = false;
+        std::size_t placement_index = 0;
+        float score = 0.0f;
+        std::uint64_t nodes = 0;
+        double think = 0.0;
+        double nps = 0.0;
+        int budget_miss = 0;
+        if (!tetris_v2::depth::choose(
+                bot->depth_bot,
+                think_ms,
+                &use_hold,
+                &placement_index,
+                &score,
+                &nodes,
+                &think,
+                &nps,
+                &budget_miss)) {
+            return 0;
+        }
+        maybe_set_int(use_hold_out, use_hold ? 1 : 0);
+        if (placement_index_out) {
+            *placement_index_out = placement_index;
+        }
+        if (score_out) {
+            *score_out = score;
+        }
+        maybe_set_u64(nodes_out, nodes);
+        maybe_set_double(think_ms_out, think);
+        maybe_set_double(nps_out, nps);
+        maybe_set_int(budget_miss_out, budget_miss);
+        return 1;
+    }
 
     tetris_v2::cc::BotChoice choice{};
     tetris_v2::cc::BotThinkStats stats{};
-    if (!bot->bot.choose(think_ms, &choice, &stats)) {
+    if (!bot->cold_clear_bot.choose(think_ms, &choice, &stats)) {
         return 0;
     }
 
@@ -871,7 +1014,15 @@ int tetris_cc_bot_apply_choice(
     tetris_v2::StepResult result{};
     int used_hold = 0;
     std::size_t placement_index = 0;
-    if (!bot->bot.apply_last_choice(env->env, &result, &used_hold, &placement_index)) {
+    if (bot->backend == TETRIS_CC_BOT_BACKEND_DEPTH) {
+        if (!bot->depth_bot) {
+            return 0;
+        }
+        if (!tetris_v2::depth::apply_last_choice(
+                bot->depth_bot, env->env.raw(), &result, &used_hold, &placement_index)) {
+            return 0;
+        }
+    } else if (!bot->cold_clear_bot.apply_last_choice(env->env, &result, &used_hold, &placement_index)) {
         return 0;
     }
     mark_env_mutated(env);
@@ -905,13 +1056,58 @@ int tetris_cc_bot_choose_and_apply(
     if (!bot || !env) {
         return 0;
     }
-
     tetris_v2::StepResult result{};
-    tetris_v2::cc::BotChoice choice{};
-    tetris_v2::cc::BotThinkStats stats{};
     int used_hold = 0;
     std::size_t placement_index = 0;
-    if (!bot->bot.choose_and_apply(
+
+    if (bot->backend == TETRIS_CC_BOT_BACKEND_DEPTH) {
+        if (!bot->depth_bot) {
+            return 0;
+        }
+        float score = 0.0f;
+        std::uint64_t nodes = 0;
+        double think = 0.0;
+        double nps = 0.0;
+        int budget_miss = 0;
+        bool use_hold_choice = false;
+        if (!tetris_v2::depth::choose_and_apply(
+                bot->depth_bot,
+                env->env.raw(),
+                think_ms,
+                &result,
+                &use_hold_choice,
+                &placement_index,
+                &score,
+                &nodes,
+                &think,
+                &nps,
+                &budget_miss,
+                &used_hold)) {
+            return 0;
+        }
+        mark_env_mutated(env);
+        if (reward_out) {
+            *reward_out = result.reward;
+        }
+        maybe_set_int(lines_cleared_out, result.lines_cleared);
+        maybe_set_int(game_over_out, result.game_over ? 1 : 0);
+        maybe_set_int(used_hold_out, used_hold);
+        if (placement_index_out) {
+            *placement_index_out = placement_index;
+        }
+        if (score_out) {
+            *score_out = score;
+        }
+        maybe_set_u64(nodes_out, nodes);
+        maybe_set_double(think_ms_out, think);
+        maybe_set_double(nps_out, nps);
+        maybe_set_int(budget_miss_out, budget_miss);
+        return 1;
+    }
+
+    tetris_v2::cc::BotChoice choice{};
+    tetris_v2::cc::BotThinkStats stats{};
+    if (!bot->cold_clear_bot.choose_and_apply(
             env->env,
             think_ms,
             &result,

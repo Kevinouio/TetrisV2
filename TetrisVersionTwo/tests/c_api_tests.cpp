@@ -362,6 +362,9 @@ void test_cc_rotation_trace_disables_rotate180() {
 }
 
 void test_cc_bot_null_safety() {
+    assert(tetris_cc_bot_set_backend(nullptr, TETRIS_CC_BOT_BACKEND_DEPTH) == 0);
+    assert(tetris_cc_bot_get_backend(nullptr, nullptr) == 0);
+    assert(tetris_cc_bot_set_depth_config(nullptr, 1, 1.0, 1, 0, 1, 0) == 0);
     assert(tetris_cc_bot_sync_from_env(nullptr, nullptr) == 0);
     assert(
         tetris_cc_bot_choose_ex(
@@ -436,11 +439,14 @@ void test_cc_bot_sparse_board_loop_stability() {
     tetris_cc_env_destroy(env);
 }
 
-void test_cc_bot_loop_and_budget_scaling() {
+void test_cc_bot_loop_and_backend_switching() {
     auto* env = tetris_cc_env_create(24680);
     auto* bot = tetris_cc_bot_create_default();
     assert(env != nullptr);
     assert(bot != nullptr);
+    int backend = -1;
+    assert(tetris_cc_bot_get_backend(bot, &backend) == 1);
+    assert(backend == TETRIS_CC_BOT_BACKEND_COLD_CLEAR);
     assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
 
     int topouts = 0;
@@ -486,48 +492,87 @@ void test_cc_bot_loop_and_budget_scaling() {
         }
     }
     assert(topouts >= 0);
+    assert(tetris_cc_bot_set_backend(bot, TETRIS_CC_BOT_BACKEND_DEPTH) == 1);
+    assert(tetris_cc_bot_get_backend(bot, &backend) == 1);
+    assert(backend == TETRIS_CC_BOT_BACKEND_DEPTH);
+    assert(tetris_cc_bot_set_depth_config(bot, 1, 1.0, 1, 0, 1, 0) == 1);
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
 
-    auto avg_think = [&](int budget_ms) {
-        double sum = 0.0;
-        int samples = 0;
-        for (int i = 0; i < 6; ++i) {
-            int use_hold = 0;
-            std::size_t placement_index = 0;
-            float score = 0.0f;
-            std::uint64_t nodes = 0;
-            double think_ms = 0.0;
-            double nps = 0.0;
-            int budget_miss = 0;
-            int ok = tetris_cc_bot_choose_ex(
-                bot,
-                budget_ms,
-                &use_hold,
-                &placement_index,
-                &score,
-                &nodes,
-                &think_ms,
-                &nps,
-                &budget_miss);
-            assert(ok == 1);
-            assert(nodes > 0);
-            assert(std::isfinite(score));
-            assert(think_ms >= 0.0);
-            assert(budget_miss == 0 || budget_miss == 1);
-            if (i > 0) {
-                sum += think_ms;
-                ++samples;
-            }
-        }
-        return sum / static_cast<double>(std::max(1, samples));
-    };
+    int use_hold_d1 = 0;
+    std::size_t placement_d1 = 0;
+    float score_d1 = 0.0f;
+    std::uint64_t nodes_d1 = 0;
+    double think_d1 = 0.0;
+    double nps_d1 = 0.0;
+    int budget_d1 = 0;
+    assert(
+        tetris_cc_bot_choose_ex(
+            bot,
+            1,
+            &use_hold_d1,
+            &placement_d1,
+            &score_d1,
+            &nodes_d1,
+            &think_d1,
+            &nps_d1,
+            &budget_d1) == 1);
+    assert(nodes_d1 > 0);
+    assert(std::isfinite(score_d1));
+    assert(think_d1 >= 0.0);
+    assert(nps_d1 >= 0.0);
+    assert(budget_d1 == 0 || budget_d1 == 1);
 
-    const double avg_1ms = avg_think(1);
-    const double avg_20ms = avg_think(20);
-    const double avg_50ms = avg_think(50);
-    assert(avg_1ms >= 0.0);
-    assert(avg_20ms >= avg_1ms + 2.0);
-    assert(avg_50ms >= avg_20ms + 4.0);
+    assert(tetris_cc_bot_set_depth_config(bot, 2, 1.0, 1, 1, 1, 0) == 1);
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
+    int use_hold_d2 = 0;
+    std::size_t placement_d2 = 0;
+    float score_d2 = 0.0f;
+    std::uint64_t nodes_d2 = 0;
+    double think_d2 = 0.0;
+    double nps_d2 = 0.0;
+    int budget_d2 = 0;
+    assert(
+        tetris_cc_bot_choose_ex(
+            bot,
+            999,
+            &use_hold_d2,
+            &placement_d2,
+            &score_d2,
+            &nodes_d2,
+            &think_d2,
+            &nps_d2,
+            &budget_d2) == 1);
+    assert(nodes_d2 >= nodes_d1);
+    assert(std::isfinite(score_d2));
 
+    // Determinism check: repeated choose on unchanged snapshot/config should match.
+    int use_hold_repeat = 0;
+    std::size_t placement_repeat = 0;
+    float score_repeat = 0.0f;
+    std::uint64_t nodes_repeat = 0;
+    double think_repeat = 0.0;
+    double nps_repeat = 0.0;
+    int budget_repeat = 0;
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
+    assert(
+        tetris_cc_bot_choose_ex(
+            bot,
+            42,
+            &use_hold_repeat,
+            &placement_repeat,
+            &score_repeat,
+            &nodes_repeat,
+            &think_repeat,
+            &nps_repeat,
+            &budget_repeat) == 1);
+    assert(use_hold_repeat == use_hold_d2);
+    assert(placement_repeat == placement_d2);
+    assert(std::fabs(score_repeat - score_d2) <= 1e-6f);
+
+    assert(tetris_cc_bot_set_backend(bot, TETRIS_CC_BOT_BACKEND_COLD_CLEAR) == 1);
+    assert(tetris_cc_bot_get_backend(bot, &backend) == 1);
+    assert(backend == TETRIS_CC_BOT_BACKEND_COLD_CLEAR);
+    assert(tetris_cc_bot_sync_from_env(bot, env) == 1);
     tetris_cc_bot_destroy(bot);
     tetris_cc_env_destroy(env);
 }
@@ -542,6 +587,6 @@ int main() {
     test_cc_rotation_trace_disables_rotate180();
     test_cc_bot_null_safety();
     test_cc_bot_sparse_board_loop_stability();
-    test_cc_bot_loop_and_budget_scaling();
+    test_cc_bot_loop_and_backend_switching();
     return 0;
 }

@@ -40,6 +40,7 @@ add_library(
     src/cc2_sync.cpp
     src/cc_env.cpp
     src/cold_clear_bot.cpp
+    src/depth.cpp
     src/piece_defs.cpp
     src/randomizer.cpp
     src/env.cpp
