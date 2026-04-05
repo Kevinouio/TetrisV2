@@ -42,6 +42,18 @@ enum class SpinType : std::uint8_t {
     Full = 2,
 };
 
+enum class GameMode : std::uint8_t {
+    Legacy = 0,
+    Zen = 1,
+    Scoring = 2,
+    Versus = 3,
+};
+
+enum class AttackRoundingMode : std::uint8_t {
+    Down = 0,
+    Rng = 1,
+};
+
 struct Cell {
     int x{0};
     int y{0};
@@ -61,6 +73,8 @@ struct ActivePiece {
 struct StepResult {
     bool game_over{false};
     bool top_out{false};
+    bool timed_out{false};
+    bool blitz_mode{false};
     bool piece_locked{false};
     bool hold_used{false};
     bool action_succeeded{false};
@@ -72,6 +86,24 @@ struct StepResult {
     int combo{-1};
     bool back_to_back{false};
     float reward{0.0f};
+    float legacy_reward{0.0f};
+    bool all_clear{false};
+    bool rotated_before_lock{false};
+    bool immobile_lock{false};
+    int b2b_streak{0};
+    int attack_base{0};
+    float attack_combo_scaled{0.0f};
+    float combo_multiplier{1.0f};
+    int attack_rounded{0};
+    int attack_b2b_bonus{0};
+    int attack_all_clear_bonus{0};
+    int surge_charge{0};
+    int surge_release{0};
+    int attack_total{0};
+    int blitz_score_total{0};
+    int blitz_level{1};
+    int blitz_lines_to_next{0};
+    int blitz_time_remaining_ms{0};
 };
 
 inline constexpr std::array<Piece, 7> kPlayablePieces{

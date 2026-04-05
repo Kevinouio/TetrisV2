@@ -14,10 +14,28 @@ BOARD_ROWS = 20
 BOARD_COLS = 10
 EMPTY_CELL_ID = 255
 
+ACTION_NONE = 0
+ACTION_LEFT = 1
+ACTION_RIGHT = 2
+ACTION_SOFT_DROP = 3
+ACTION_HARD_DROP = 4
 ACTION_CW = 5
 ACTION_CCW = 6
 ACTION_180 = 7
 ACTION_HOLD = 8
+
+MODE_LEGACY = 0
+MODE_ZEN = 1
+MODE_SCORING = 2
+MODE_VERSUS = 3
+
+MODE_NAME_TO_ID = {
+    "legacy": MODE_LEGACY,
+    "zen": MODE_ZEN,
+    "scoring": MODE_SCORING,
+    "blitz": MODE_SCORING,
+    "versus": MODE_VERSUS,
+}
 
 PIECE_NAMES = {
     0: "I",
@@ -75,9 +93,27 @@ def parse_args():
     parser.add_argument("--cell", type=int, default=28, help="Main board cell size.")
     parser.add_argument("--fps", type=int, default=60, help="Render FPS.")
     parser.add_argument("--seed", type=int, default=1234, help="Initial reset seed.")
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=("legacy", "zen", "scoring", "blitz", "versus"),
+        default="legacy",
+        help="Scoring/attack mode to run.",
+    )
+    parser.add_argument(
+        "--ai-vs-ai",
+        action="store_true",
+        help="In --mode versus, control both boards with native AI.",
+    )
     parser.add_argument("--queue-visible", type=int, default=8, help="How many queued pieces to display.")
     parser.add_argument("--ai", action="store_true", help="Start with AI autoplay enabled.")
     parser.add_argument("--think-ms", type=int, default=20, help="AI think budget per move in milliseconds.")
+    parser.add_argument(
+        "--ai-pps",
+        type=float,
+        default=0.0,
+        help="Cap AI move rate in pieces/second. Use 0 for unbounded.",
+    )
     parser.add_argument(
         "--native-backend",
         type=str,
@@ -185,6 +221,8 @@ def parse_args():
         raise SystemExit("--random-max-resamples-per-sample must be > 0.")
     if int(args.beam_width) <= 0:
         raise SystemExit("--beam-width must be > 0.")
+    if float(args.ai_pps) < 0.0:
+        raise SystemExit("--ai-pps must be >= 0.")
     return args
 
 
@@ -388,6 +426,16 @@ class EnvCtypes:
         )
         self._has_visible_garbage_count = hasattr(self.lib, "tetris_cc_env_visible_garbage_count")
         self._has_set_visible_board_mask = hasattr(self.lib, "tetris_cc_env_set_visible_board_mask")
+        self._has_mode_api = all(
+            hasattr(self.lib, name)
+            for name in (
+                "tetris_cc_env_set_mode",
+                "tetris_cc_env_get_mode",
+            )
+        )
+        self._has_last_attack_meta_api = hasattr(self.lib, "tetris_cc_env_last_attack_meta")
+        self._has_blitz_meta_api = hasattr(self.lib, "tetris_cc_env_blitz_meta")
+        self._has_apply_incoming_garbage_api = hasattr(self.lib, "tetris_cc_env_apply_incoming_garbage")
 
         self.lib.tetris_cc_env_create.argtypes = [ctypes.c_uint32]
         self.lib.tetris_cc_env_create.restype = void_p
@@ -397,6 +445,11 @@ class EnvCtypes:
 
         self.lib.tetris_cc_env_reset.argtypes = [void_p, ctypes.c_uint32]
         self.lib.tetris_cc_env_reset.restype = None
+        if self._has_mode_api:
+            self.lib.tetris_cc_env_set_mode.argtypes = [void_p, ctypes.c_int]
+            self.lib.tetris_cc_env_set_mode.restype = ctypes.c_int
+            self.lib.tetris_cc_env_get_mode.argtypes = [void_p, c_int_p]
+            self.lib.tetris_cc_env_get_mode.restype = ctypes.c_int
 
         self.lib.tetris_cc_env_snapshot_create.argtypes = [void_p]
         self.lib.tetris_cc_env_snapshot_create.restype = void_p
@@ -410,6 +463,14 @@ class EnvCtypes:
 
         self.lib.tetris_cc_env_hold.argtypes = [void_p, ctypes.POINTER(ctypes.c_float)]
         self.lib.tetris_cc_env_hold.restype = ctypes.c_int
+        if self._has_apply_incoming_garbage_api:
+            self.lib.tetris_cc_env_apply_incoming_garbage.argtypes = [
+                void_p,
+                ctypes.c_int,
+                c_int_p,
+                c_int_p,
+            ]
+            self.lib.tetris_cc_env_apply_incoming_garbage.restype = ctypes.c_int
 
         self.lib.tetris_cc_env_observation_size.argtypes = [void_p, ctypes.c_int]
         self.lib.tetris_cc_env_observation_size.restype = ctypes.c_size_t
@@ -433,6 +494,31 @@ class EnvCtypes:
                 ctypes.c_int,
             ]
             self.lib.tetris_cc_env_set_visible_board_mask.restype = ctypes.c_int
+        if self._has_last_attack_meta_api:
+            self.lib.tetris_cc_env_last_attack_meta.argtypes = [
+                void_p,
+                c_int_p,
+                ctypes.POINTER(ctypes.c_float),
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+            ]
+            self.lib.tetris_cc_env_last_attack_meta.restype = ctypes.c_int
+        if self._has_blitz_meta_api:
+            self.lib.tetris_cc_env_blitz_meta.argtypes = [
+                void_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+                c_int_p,
+            ]
+            self.lib.tetris_cc_env_blitz_meta.restype = ctypes.c_int
 
         if self._has_piece_id_api:
             self.lib.tetris_cc_env_board_piece_ids_write.argtypes = [
@@ -656,12 +742,161 @@ class EnvCtypes:
         self.lib.tetris_cc_env_reset(self.handle, ctypes.c_uint32(seed))
         self.bot_sync()
 
+    def step(self, action: int):
+        reward = ctypes.c_float(0.0)
+        game_over = self.lib.tetris_cc_env_step(self.handle, int(action), ctypes.byref(reward))
+        self.bot_sync()
+        return {"reward": float(reward.value), "game_over": bool(game_over)}
+
+    def set_mode(self, mode_name: str) -> bool:
+        if not self._has_mode_api:
+            return False
+        mode_id = MODE_NAME_TO_ID.get(str(mode_name).strip().lower())
+        if mode_id is None:
+            return False
+        ok = self.lib.tetris_cc_env_set_mode(self.handle, ctypes.c_int(int(mode_id)))
+        if ok:
+            self.bot_sync()
+        return bool(ok)
+
+    def get_mode(self) -> Optional[str]:
+        if not self._has_mode_api:
+            return None
+        mode = ctypes.c_int(0)
+        ok = self.lib.tetris_cc_env_get_mode(self.handle, ctypes.byref(mode))
+        if not ok:
+            return None
+        for name, mid in MODE_NAME_TO_ID.items():
+            if int(mid) == int(mode.value):
+                return name
+        return None
+
     def hold(self):
         reward = ctypes.c_float(0.0)
         success = self.lib.tetris_cc_env_hold(self.handle, ctypes.byref(reward))
         if success:
             self.bot_sync()
         return {"success": bool(success), "reward": float(reward.value)}
+
+    def apply_incoming_garbage(self, lines: int):
+        if not self._has_apply_incoming_garbage_api:
+            return {"success": False, "lines_applied": 0, "top_out": bool(self.meta()["top_out"])}
+        lines_applied = ctypes.c_int(0)
+        top_out = ctypes.c_int(0)
+        ok = self.lib.tetris_cc_env_apply_incoming_garbage(
+            self.handle,
+            ctypes.c_int(max(0, int(lines))),
+            ctypes.byref(lines_applied),
+            ctypes.byref(top_out),
+        )
+        if ok:
+            self.bot_sync()
+        return {
+            "success": bool(ok),
+            "lines_applied": int(lines_applied.value),
+            "top_out": bool(top_out.value),
+        }
+
+    def last_attack_meta(self):
+        if not self._has_last_attack_meta_api:
+            return {
+                "attack_base": 0,
+                "attack_combo_scaled": 0.0,
+                "attack_rounded": 0,
+                "attack_b2b_bonus": 0,
+                "attack_all_clear_bonus": 0,
+                "attack_total": 0,
+                "all_clear": False,
+                "b2b_streak": 0,
+                "surge_charge": 0,
+                "surge_release": 0,
+            }
+        attack_base = ctypes.c_int(0)
+        attack_combo_scaled = ctypes.c_float(0.0)
+        attack_rounded = ctypes.c_int(0)
+        attack_b2b_bonus = ctypes.c_int(0)
+        attack_all_clear_bonus = ctypes.c_int(0)
+        attack_total = ctypes.c_int(0)
+        all_clear = ctypes.c_int(0)
+        b2b_streak = ctypes.c_int(0)
+        surge_charge = ctypes.c_int(0)
+        surge_release = ctypes.c_int(0)
+        ok = self.lib.tetris_cc_env_last_attack_meta(
+            self.handle,
+            ctypes.byref(attack_base),
+            ctypes.byref(attack_combo_scaled),
+            ctypes.byref(attack_rounded),
+            ctypes.byref(attack_b2b_bonus),
+            ctypes.byref(attack_all_clear_bonus),
+            ctypes.byref(attack_total),
+            ctypes.byref(all_clear),
+            ctypes.byref(b2b_streak),
+            ctypes.byref(surge_charge),
+            ctypes.byref(surge_release),
+        )
+        if not ok:
+            return {
+                "attack_base": 0,
+                "attack_combo_scaled": 0.0,
+                "attack_rounded": 0,
+                "attack_b2b_bonus": 0,
+                "attack_all_clear_bonus": 0,
+                "attack_total": 0,
+                "all_clear": False,
+                "b2b_streak": 0,
+                "surge_charge": 0,
+                "surge_release": 0,
+            }
+        return {
+            "attack_base": int(attack_base.value),
+            "attack_combo_scaled": float(attack_combo_scaled.value),
+            "attack_rounded": int(attack_rounded.value),
+            "attack_b2b_bonus": int(attack_b2b_bonus.value),
+            "attack_all_clear_bonus": int(attack_all_clear_bonus.value),
+            "attack_total": int(attack_total.value),
+            "all_clear": bool(all_clear.value),
+            "b2b_streak": int(b2b_streak.value),
+            "surge_charge": int(surge_charge.value),
+            "surge_release": int(surge_release.value),
+        }
+
+    def blitz_meta(self):
+        if not self._has_blitz_meta_api:
+            return {
+                "score_total": 0,
+                "level": 1,
+                "lines_to_next": 0,
+                "time_remaining_ms": 0,
+                "timed_out": False,
+            }
+        score_total = ctypes.c_int(0)
+        level = ctypes.c_int(1)
+        lines_to_next = ctypes.c_int(0)
+        time_remaining_ms = ctypes.c_int(0)
+        timed_out = ctypes.c_int(0)
+        ok = self.lib.tetris_cc_env_blitz_meta(
+            self.handle,
+            ctypes.byref(score_total),
+            ctypes.byref(level),
+            ctypes.byref(lines_to_next),
+            ctypes.byref(time_remaining_ms),
+            ctypes.byref(timed_out),
+        )
+        if not ok:
+            return {
+                "score_total": 0,
+                "level": 1,
+                "lines_to_next": 0,
+                "time_remaining_ms": 0,
+                "timed_out": False,
+            }
+        return {
+            "score_total": int(score_total.value),
+            "level": int(level.value),
+            "lines_to_next": int(lines_to_next.value),
+            "time_remaining_ms": int(time_remaining_ms.value),
+            "timed_out": bool(timed_out.value),
+        }
 
     def has_random_board_api(self):
         return bool(self._has_set_visible_board_mask)
@@ -1361,6 +1596,106 @@ def draw_small_board(surface, x0, y0, cell, board_piece_ids, board_occupancy):
             pygame.draw.rect(surface, (55, 60, 72), rect, width=1)
 
 
+def draw_garbage_bar(
+    surface,
+    rect: pygame.Rect,
+    incoming_lines: int,
+    *,
+    max_visible: int,
+    small_font,
+):
+    incoming = max(0, int(incoming_lines))
+    shown = min(incoming, int(max_visible))
+    if shown <= int(max_visible * 0.33):
+        fill_color = (110, 170, 235)
+    elif shown <= int(max_visible * 0.66):
+        fill_color = (235, 180, 80)
+    else:
+        fill_color = (235, 100, 100)
+
+    pygame.draw.rect(surface, (26, 30, 40), rect, border_radius=6)
+    inner = rect.inflate(-6, -6)
+    pygame.draw.rect(surface, (44, 50, 66), inner, border_radius=4)
+    if shown > 0:
+        fill_h = int(round(inner.height * (shown / float(max(1, max_visible)))))
+        fill_rect = pygame.Rect(inner.x, inner.bottom - fill_h, inner.width, fill_h)
+        pygame.draw.rect(surface, fill_color, fill_rect, border_radius=4)
+    pygame.draw.rect(surface, (80, 90, 115), rect, width=1, border_radius=6)
+
+    label = f"IN {shown}+" if incoming > max_visible else f"IN {shown}"
+    text = small_font.render(label, True, LOCK_TEXT)
+    tx = rect.centerx - text.get_width() // 2
+    ty = rect.top - text.get_height() - 4
+    surface.blit(text, (tx, ty))
+
+
+def draw_side_stats(
+    surface,
+    panel_rect: pygame.Rect,
+    *,
+    side: str,
+    header: str,
+    meta: Dict[str, object],
+    attack: Dict[str, object],
+    pending_incoming: int,
+    stats: Dict[str, object],
+    font,
+    small_font,
+):
+    pygame.draw.rect(surface, PANEL_COLOR, panel_rect, border_radius=8)
+    pygame.draw.rect(surface, (70, 80, 102), panel_rect, width=1, border_radius=8)
+
+    align_right = side == "right"
+    x_pad = 12
+    header_surface = font.render(header, True, LOCK_TEXT)
+    if align_right:
+        hx = panel_rect.right - x_pad - header_surface.get_width()
+    else:
+        hx = panel_rect.left + x_pad
+    hy = panel_rect.top + 10
+    surface.blit(header_surface, (hx, hy))
+
+    lines = [
+        f"GO={bool(meta.get('game_over', False))} TOP={bool(meta.get('top_out', False))}",
+        f"Combo: {int(meta.get('combo', -1))}",
+        f"B2B: {int(attack.get('b2b_streak', 0))}",
+        (
+            f"Last Attack: {int(attack.get('attack_total', 0))} "
+            f"(Surge {int(attack.get('surge_charge', 0))}/{int(attack.get('surge_release', 0))})"
+        ),
+        f"Incoming: {int(pending_incoming)}",
+        (
+            f"Sent/Cancel/Recv: "
+            f"{int(stats.get('garbage_sent_total', 0))}/"
+            f"{int(stats.get('garbage_canceled_total', 0))}/"
+            f"{int(stats.get('garbage_received_total', 0))}"
+        ),
+        (
+            f"Last S/C/R: "
+            f"{int(stats.get('last_sent', 0))}/"
+            f"{int(stats.get('last_canceled', 0))}/"
+            f"{int(stats.get('last_received', 0))}"
+        ),
+        (
+            f"Pieces: {int(stats.get('pieces_placed', 0))}  "
+            f"Lines: {int(stats.get('lines_cleared', 0))}  "
+            f"PPS: {float(stats.get('pps', 0.0)):.2f}"
+        ),
+        f"Topouts: {int(stats.get('topouts', 0))}",
+    ]
+
+    line_y = hy + header_surface.get_height() + 12
+    line_h = 22
+    for line in lines:
+        surface_line = small_font.render(line, True, LOCK_TEXT)
+        if align_right:
+            lx = panel_rect.right - x_pad - surface_line.get_width()
+        else:
+            lx = panel_rect.left + x_pad
+        surface.blit(surface_line, (lx, line_y))
+        line_y += line_h
+
+
 def action_name(action: int):
     return {ACTION_CW: "CW", ACTION_CCW: "CCW", ACTION_180: "180"}.get(action, "?")
 
@@ -1376,8 +1711,406 @@ def _mix_seed_with_attempt(base_seed: int, round_id: int, episode_id: int, attem
     return int(mixed & ((1 << 63) - 1))
 
 
+def run_versus_mode(args, lib_path: Path):
+    pygame.init()
+    pygame.display.set_caption("Tetris Versus (Human vs AI)")
+    font = pygame.font.SysFont("Consolas", 18)
+    small_font = pygame.font.SysFont("Consolas", 15)
+
+    cell = max(12, args.cell)
+    board_w = BOARD_COLS * cell
+    board_h = BOARD_ROWS * cell
+    outer_pad = 20
+    top_strip_h = 56
+    side_panel_w = max(260, int(cell * 7.8))
+    cluster_gap = max(20, int(cell * 0.75))
+    bar_w = max(16, int(cell * 0.55))
+    bar_gap = max(8, int(cell * 0.35))
+    between_boards = max(28, int(cell * 1.1))
+
+    center_cluster_w = (bar_w + bar_gap + board_w) + between_boards + (board_w + bar_gap + bar_w)
+    screen_w = outer_pad * 2 + side_panel_w * 2 + cluster_gap * 2 + center_cluster_w
+    screen_h = max(outer_pad * 2 + top_strip_h + 14 + board_h + 66, 760)
+
+    screen = pygame.display.set_mode((screen_w, screen_h))
+    clock = pygame.time.Clock()
+
+    top_strip_rect = pygame.Rect(outer_pad, outer_pad, screen_w - outer_pad * 2, top_strip_h)
+    board_y = top_strip_rect.bottom + 14
+    left_panel_rect = pygame.Rect(outer_pad, board_y, side_panel_w, board_h)
+    cluster_x = left_panel_rect.right + cluster_gap
+    left_bar_rect = pygame.Rect(cluster_x, board_y + 4, bar_w, board_h - 8)
+    left_board_x = left_bar_rect.right + bar_gap
+    right_board_x = left_board_x + board_w + between_boards
+    right_bar_rect = pygame.Rect(right_board_x + board_w + bar_gap, board_y + 4, bar_w, board_h - 8)
+    right_panel_rect = pygame.Rect(right_bar_rect.right + cluster_gap, board_y, side_panel_w, board_h)
+
+    human_env = EnvCtypes(lib_path, args.seed)
+    ai_env = EnvCtypes(lib_path, args.seed + 1)
+    status = f"Loaded {lib_path.name}"
+    seed = int(args.seed)
+    ai_seed = int(args.seed + 1)
+    pending_human = 0
+    pending_ai = 0
+
+    def zero_attack_stats():
+        return {"attack_total": 0, "b2b_streak": 0, "surge_charge": 0, "surge_release": 0}
+
+    def make_side_stats():
+        return {
+            "pieces_placed": 0,
+            "lines_cleared": 0,
+            "garbage_sent_total": 0,
+            "garbage_received_total": 0,
+            "garbage_canceled_total": 0,
+            "topouts": 0,
+            "last_attack": 0,
+            "last_sent": 0,
+            "last_canceled": 0,
+            "last_received": 0,
+            "start_ticks": pygame.time.get_ticks(),
+            "pps": 0.0,
+        }
+
+    human_attack = zero_attack_stats()
+    ai_attack = zero_attack_stats()
+    human_side_stats = make_side_stats()
+    ai_side_stats = make_side_stats()
+    last_h_game_over = False
+    last_a_game_over = False
+
+    versus_ai_vs_ai = bool(args.ai_vs_ai)
+
+    if not human_env.set_mode("versus") or not ai_env.set_mode("versus"):
+        human_env.close()
+        ai_env.close()
+        pygame.quit()
+        raise SystemExit("Shared library is missing versus mode C API support.")
+
+    ai_backend = str(args.native_backend)
+    if ai_backend == "cold_clear":
+        ai_backend = "beam"
+    if not ai_env.has_bot() or (versus_ai_vs_ai and not human_env.has_bot()):
+        human_env.close()
+        ai_env.close()
+        pygame.quit()
+        raise SystemExit("Versus mode requires bot API symbols in the shared library.")
+
+    def configure_bot_backend(env_obj: EnvCtypes) -> bool:
+        if ai_backend == "depth":
+            return env_obj.bot_set_backend("depth") and env_obj.bot_set_depth_config(
+                args.depth_search_depth, args.depth_gamma
+            )
+        if ai_backend == "beam":
+            return env_obj.bot_set_backend("beam") and env_obj.bot_set_beam_config(
+                args.beam_search_depth, args.beam_width, args.beam_gamma
+            )
+        return env_obj.bot_set_backend("cold_clear")
+
+    if not configure_bot_backend(ai_env):
+        human_env.close()
+        ai_env.close()
+        pygame.quit()
+        raise SystemExit("Failed to configure opponent backend for versus AI.")
+    if versus_ai_vs_ai and not configure_bot_backend(human_env):
+        human_env.close()
+        ai_env.close()
+        pygame.quit()
+        raise SystemExit("Failed to configure left-board backend for AI-vs-AI.")
+    ai_env.bot_sync()
+    if versus_ai_vs_ai:
+        human_env.bot_sync()
+
+    ai_enabled = True
+    ai_interval_ms = (1000.0 / float(args.ai_pps)) if float(args.ai_pps) > 0.0 else 0.0
+    next_left_ai_tick = pygame.time.get_ticks()
+    next_right_ai_tick = pygame.time.get_ticks()
+
+    def reset_match(h_seed: int, a_seed: int):
+        nonlocal pending_human, pending_ai, human_attack, ai_attack
+        nonlocal human_side_stats, ai_side_stats, last_h_game_over, last_a_game_over
+        nonlocal next_left_ai_tick, next_right_ai_tick
+        human_env.reset(h_seed)
+        ai_env.reset(a_seed)
+        human_env.set_mode("versus")
+        ai_env.set_mode("versus")
+        pending_human = 0
+        pending_ai = 0
+        human_attack = zero_attack_stats()
+        ai_attack = zero_attack_stats()
+        human_side_stats = make_side_stats()
+        ai_side_stats = make_side_stats()
+        last_h_game_over = False
+        last_a_game_over = False
+        configure_bot_backend(ai_env)
+        if versus_ai_vs_ai:
+            configure_bot_backend(human_env)
+        ai_env.bot_sync()
+        if versus_ai_vs_ai:
+            human_env.bot_sync()
+        now_tick = pygame.time.get_ticks()
+        next_left_ai_tick = now_tick
+        next_right_ai_tick = now_tick
+
+    def refresh_pps(side_stats):
+        elapsed_s = max(1e-6, (pygame.time.get_ticks() - int(side_stats["start_ticks"])) / 1000.0)
+        side_stats["pps"] = float(side_stats["pieces_placed"]) / elapsed_s
+
+    def resolve_lock(is_human: bool, lines_cleared: int = 0):
+        nonlocal pending_human, pending_ai, status, human_attack, ai_attack
+        nonlocal human_side_stats, ai_side_stats
+        attacker = human_env if is_human else ai_env
+        attacker_side = human_side_stats if is_human else ai_side_stats
+        attack = attacker.last_attack_meta()
+        outgoing = max(0, int(attack.get("attack_total", 0)))
+        attacker_side["pieces_placed"] += 1
+        attacker_side["lines_cleared"] += max(0, int(lines_cleared))
+        if is_human:
+            human_attack = attack
+            cancel = min(outgoing, pending_human)
+            pending_human -= cancel
+            sent = outgoing - cancel
+            pending_ai += sent
+            to_apply = pending_human
+            pending_human = 0
+        else:
+            ai_attack = attack
+            cancel = min(outgoing, pending_ai)
+            pending_ai -= cancel
+            sent = outgoing - cancel
+            pending_human += sent
+            to_apply = pending_ai
+            pending_ai = 0
+
+        applied = 0
+        top_out = 0
+        if to_apply > 0:
+            apply_result = attacker.apply_incoming_garbage(to_apply)
+            if not apply_result.get("success", False):
+                status = "Incoming garbage apply failed."
+                return
+            applied = int(apply_result.get("lines_applied", 0))
+            top_out = 1 if bool(apply_result.get("top_out", False)) else 0
+
+        attacker_side["garbage_sent_total"] += int(sent)
+        attacker_side["garbage_canceled_total"] += int(cancel)
+        attacker_side["garbage_received_total"] += int(applied)
+        attacker_side["last_attack"] = int(outgoing)
+        attacker_side["last_sent"] = int(sent)
+        attacker_side["last_canceled"] = int(cancel)
+        attacker_side["last_received"] = int(applied)
+        refresh_pps(attacker_side)
+        status = (
+            f"{'Human' if is_human else 'AI'} atk={outgoing} "
+            f"cancel={cancel} sent={sent} recv={applied} pending(H/A)=({pending_human}/{pending_ai})"
+        )
+        if top_out:
+            status += " | TOP OUT"
+
+    def do_human_step(action: int):
+        pre_meta = human_env.meta()
+        pre_queue = tuple(human_env.queue())
+        human_env.step(action)
+        post_meta = human_env.meta()
+        post_queue = tuple(human_env.queue())
+        locked = pre_queue != post_queue
+        if locked:
+            lines_delta = max(0, int(post_meta["lines"]) - int(pre_meta["lines"]))
+            resolve_lock(is_human=True, lines_cleared=lines_delta)
+        return post_meta
+
+    running = True
+    try:
+        while running:
+            human_acted = False
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                        running = False
+                    elif event.key == pygame.K_a:
+                        ai_enabled = not ai_enabled
+                        status = f"AI {'enabled' if ai_enabled else 'disabled'}."
+                        if ai_enabled:
+                            now_tick = pygame.time.get_ticks()
+                            next_left_ai_tick = now_tick
+                            next_right_ai_tick = now_tick
+                    elif event.key == pygame.K_r:
+                        reset_match(seed, ai_seed)
+                        status = f"Reset match seeds=({seed},{ai_seed})"
+                    elif event.key == pygame.K_n:
+                        seed = random.randint(1, 2**31 - 1)
+                        ai_seed = random.randint(1, 2**31 - 1)
+                        reset_match(seed, ai_seed)
+                        status = f"Reset new seeds=({seed},{ai_seed})"
+                    elif not versus_ai_vs_ai:
+                        if event.key == pygame.K_LEFT:
+                            do_human_step(ACTION_LEFT)
+                            human_acted = True
+                        elif event.key == pygame.K_RIGHT:
+                            do_human_step(ACTION_RIGHT)
+                            human_acted = True
+                        elif event.key == pygame.K_DOWN:
+                            do_human_step(ACTION_SOFT_DROP)
+                            human_acted = True
+                        elif event.key in (pygame.K_UP, pygame.K_x):
+                            do_human_step(ACTION_CW)
+                            human_acted = True
+                        elif event.key == pygame.K_z:
+                            do_human_step(ACTION_CCW)
+                            human_acted = True
+                        elif event.key == pygame.K_SPACE:
+                            do_human_step(ACTION_HARD_DROP)
+                            human_acted = True
+                        elif event.key in (pygame.K_c, pygame.K_LSHIFT, pygame.K_RSHIFT):
+                            hold = human_env.hold()
+                            status = "Human hold used." if hold["success"] else "Human hold unavailable."
+                            human_acted = True
+
+            h_meta = human_env.meta()
+            a_meta = ai_env.meta()
+            if not versus_ai_vs_ai and not h_meta["game_over"] and not human_acted:
+                h_meta = do_human_step(ACTION_NONE)
+
+            now_tick = pygame.time.get_ticks()
+            if (
+                ai_enabled
+                and versus_ai_vs_ai
+                and not h_meta["game_over"]
+                and (ai_interval_ms <= 0.0 or now_tick >= next_left_ai_tick)
+            ):
+                human_result = human_env.bot_choose_and_apply(args.think_ms)
+                if human_result["success"]:
+                    resolve_lock(is_human=True, lines_cleared=int(human_result["lines"]))
+                else:
+                    ai_enabled = False
+                    status = "Left AI choose/apply failed."
+                if ai_interval_ms > 0.0:
+                    next_left_ai_tick = now_tick + ai_interval_ms
+
+            h_meta = human_env.meta()
+            a_meta = ai_env.meta()
+
+            now_tick = pygame.time.get_ticks()
+            if (
+                ai_enabled
+                and not a_meta["game_over"]
+                and (ai_interval_ms <= 0.0 or now_tick >= next_right_ai_tick)
+            ):
+                ai_result = ai_env.bot_choose_and_apply(args.think_ms)
+                if ai_result["success"]:
+                    resolve_lock(is_human=False, lines_cleared=int(ai_result["lines"]))
+                else:
+                    ai_enabled = False
+                    status = "AI choose/apply failed."
+                if ai_interval_ms > 0.0:
+                    next_right_ai_tick = now_tick + ai_interval_ms
+
+            h_meta = human_env.meta()
+            a_meta = ai_env.meta()
+
+            if bool(h_meta["game_over"]) and not last_h_game_over:
+                human_side_stats["topouts"] += 1
+            if bool(a_meta["game_over"]) and not last_a_game_over:
+                ai_side_stats["topouts"] += 1
+            last_h_game_over = bool(h_meta["game_over"])
+            last_a_game_over = bool(a_meta["game_over"])
+
+            if h_meta["game_over"] or a_meta["game_over"]:
+                ai_enabled = False
+
+            refresh_pps(human_side_stats)
+            refresh_pps(ai_side_stats)
+
+            h_occ = human_env.board()
+            h_ids = human_env.board_piece_ids(include_active=True)
+            a_occ = ai_env.board()
+            a_ids = ai_env.board_piece_ids(include_active=True)
+
+            screen.fill(BG_COLOR)
+            pygame.draw.rect(screen, PANEL_COLOR, top_strip_rect, border_radius=8)
+            pygame.draw.rect(screen, (70, 80, 102), top_strip_rect, width=1, border_radius=8)
+
+            controls_text = (
+                "A toggle AI | R reset | N new seeds | Q quit"
+                if versus_ai_vs_ai
+                else "Arrows move/drop | Up/X CW | Z CCW | Space hard drop | C/Shift hold | A/R/N/Q"
+            )
+            strip_line_1 = (
+                f"Mode: versus   Seeds H:{seed} A:{ai_seed}   "
+                f"Backend: {ai_backend}   AI:{'ON' if ai_enabled else 'OFF'}   "
+                f"AI-vs-AI:{versus_ai_vs_ai}   target_pps:{float(args.ai_pps):.2f}"
+            )
+            strip_line_2 = f"{controls_text}   |   {status}"
+            t1 = small_font.render(strip_line_1, True, LOCK_TEXT)
+            t2 = small_font.render(strip_line_2, True, (180, 210, 255))
+            screen.blit(t1, (top_strip_rect.centerx - t1.get_width() // 2, top_strip_rect.y + 8))
+            screen.blit(t2, (top_strip_rect.centerx - t2.get_width() // 2, top_strip_rect.y + 30))
+
+            draw_side_stats(
+                screen,
+                left_panel_rect,
+                side="left",
+                header="HUMAN",
+                meta=h_meta,
+                attack=human_attack,
+                pending_incoming=pending_human,
+                stats=human_side_stats,
+                font=font,
+                small_font=small_font,
+            )
+            draw_side_stats(
+                screen,
+                right_panel_rect,
+                side="right",
+                header=f"AI ({ai_backend.upper()})",
+                meta=a_meta,
+                attack=ai_attack,
+                pending_incoming=pending_ai,
+                stats=ai_side_stats,
+                font=font,
+                small_font=small_font,
+            )
+
+            draw_garbage_bar(
+                screen,
+                left_bar_rect,
+                pending_human,
+                max_visible=20,
+                small_font=small_font,
+            )
+            draw_garbage_bar(
+                screen,
+                right_bar_rect,
+                pending_ai,
+                max_visible=20,
+                small_font=small_font,
+            )
+
+            left_frame = pygame.Rect(left_board_x - 4, board_y - 4, board_w + 8, board_h + 8)
+            right_frame = pygame.Rect(right_board_x - 4, board_y - 4, board_w + 8, board_h + 8)
+            pygame.draw.rect(screen, PANEL_COLOR, left_frame, border_radius=6)
+            pygame.draw.rect(screen, PANEL_COLOR, right_frame, border_radius=6)
+            draw_board(screen, left_board_x, board_y, cell, h_ids, h_occ)
+            draw_board(screen, right_board_x, board_y, cell, a_ids, a_occ)
+
+            h_label = font.render("Human", True, LOCK_TEXT)
+            a_label = font.render(f"AI ({ai_backend})", True, LOCK_TEXT)
+            screen.blit(h_label, (left_board_x + board_w // 2 - h_label.get_width() // 2, board_y + board_h + 8))
+            screen.blit(a_label, (right_board_x + board_w // 2 - a_label.get_width() // 2, board_y + board_h + 8))
+
+            pygame.display.flip()
+            clock.tick(max(10, args.fps))
+    finally:
+        human_env.close()
+        ai_env.close()
+        pygame.quit()
+
+
 def main():
     args = parse_args()
+    mode_name = str(args.mode).strip().lower()
     if args.bc_checkpoint is not None and args.dqn_checkpoint is not None:
         print(
             "Error: --bc-checkpoint and --dqn-checkpoint are mutually exclusive. "
@@ -1390,9 +2123,11 @@ def main():
         if args.bc_checkpoint is None and args.dqn_checkpoint is None
         else None
     )
+    if mode_name == "versus" and native_backend_requested == "cold_clear":
+        native_backend_requested = "beam"
     require_native_backend = (
         str(native_backend_requested)
-        if native_backend_requested in ("depth", "beam") and args.ai
+        if native_backend_requested in ("depth", "beam") and (args.ai or mode_name == "versus")
         else None
     )
     prefer_native_backend = (
@@ -1409,6 +2144,10 @@ def main():
     except (FileNotFoundError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)
+
+    if mode_name == "versus":
+        run_versus_mode(args, lib_path)
+        return
 
     pygame.init()
     pygame.display.set_caption("Tetris Placement + Kick Explorer")
@@ -1427,6 +2166,10 @@ def main():
     clock = pygame.time.Clock()
 
     env = EnvCtypes(lib_path, args.seed)
+    if mode_name != "legacy":
+        if not env.set_mode(mode_name):
+            env.close()
+            raise SystemExit(f"Library '{lib_path}' does not support --mode {mode_name}.")
     selected_index = 0
     list_scroll = 0
     inspector_actions = [ACTION_CW, ACTION_CCW]
@@ -1617,6 +2360,8 @@ def main():
         "last_candidate_count": 0,
         "start_ticks": pygame.time.get_ticks(),
     }
+    ai_interval_ms = (1000.0 / float(args.ai_pps)) if float(args.ai_pps) > 0.0 else 0.0
+    next_ai_tick = pygame.time.get_ticks()
     if args.ai and random_board_error is not None:
         print(
             f"Error: random_board startup failed: {random_board_error}",
@@ -1657,7 +2402,7 @@ def main():
     elif native_config_error and ai_backend in ("cold_clear", "depth", "beam"):
         status = f"AI[{ai_backend_label}] unavailable: {native_config_error}"
 
-    info_h = 240
+    info_h = 280
     list_y = board_y + info_h + 10
     list_h = 280
     list_header_h = 30
@@ -1691,6 +2436,7 @@ def main():
                             ai_enabled = not ai_enabled
                             if ai_enabled:
                                 ai_metrics["start_ticks"] = pygame.time.get_ticks()
+                                next_ai_tick = pygame.time.get_ticks()
                                 if ai_backend == "cold_clear":
                                     env.bot_sync()
                                     status = (
@@ -1832,7 +2578,10 @@ def main():
                         ai_enabled = False
                         status = "AI paused on topout. Press R/N or toggle AI with A."
                 else:
-                    if ai_backend == "bc":
+                    now_tick = pygame.time.get_ticks()
+                    if ai_interval_ms > 0.0 and now_tick < next_ai_tick:
+                        pass
+                    elif ai_backend == "bc":
                         if bc_agent is None:
                             ai_enabled = False
                             status = "AI[BC] unavailable: checkpoint did not initialize."
@@ -1900,6 +2649,8 @@ def main():
                                 elif ai_result is not None:
                                     ai_enabled = False
                                     status = "AI[BC] action apply failed. Autoplay disabled."
+                            if ai_interval_ms > 0.0:
+                                next_ai_tick = now_tick + ai_interval_ms
                     elif ai_backend == "dqn":
                         if dqn_agent is None:
                             ai_enabled = False
@@ -1963,6 +2714,8 @@ def main():
                                 elif ai_result is not None:
                                     ai_enabled = False
                                     status = "AI[DQN] action apply failed. Autoplay disabled."
+                            if ai_interval_ms > 0.0:
+                                next_ai_tick = now_tick + ai_interval_ms
                     else:
                         ai_result = env.bot_choose_and_apply(args.think_ms)
                         if ai_result["success"]:
@@ -2012,12 +2765,16 @@ def main():
                         else:
                             ai_enabled = False
                             status = "AI choose/apply failed. Autoplay disabled."
+                        if ai_interval_ms > 0.0:
+                            next_ai_tick = now_tick + ai_interval_ms
 
             board_occ = env.board()
             board_piece_ids = env.board_piece_ids(include_active=True)
             hold = env.hold_info()
             queue = env.queue()
             meta = env.meta()
+            attack = env.last_attack_meta()
+            blitz = env.blitz_meta()
             placements = env.placements()
 
             if placements:
@@ -2052,6 +2809,7 @@ def main():
                 ai_backend_info = f"DQN ({args.dqn_device or 'auto'})"
             lines = [
                 f"Seed: {seed}",
+                f"Mode: {mode_name}",
                 f"Obs size: {env.observation_size()}",
                 f"Hold: {PIECE_NAMES.get(hold['hold_piece'], '?')}  avail={hold['hold_available']}",
                 f"Queue: {' '.join(PIECE_NAMES.get(p, '?') for p in queue[:max(0, args.queue_visible)])}",
@@ -2068,9 +2826,44 @@ def main():
                 ),
                 f"Last reset: {last_reset_summary}",
                 f"AI: {'ON' if ai_enabled else 'OFF'} backend={ai_backend_info} avail={ai_available}",
+                f"AI target PPS={float(args.ai_pps):.2f} (0=unbounded)",
                 f"AI pieces={ai_metrics['pieces']} lines={ai_metrics['lines']} topouts={ai_metrics['topouts']}",
                 f"AI PPS={ai_pps:.2f} step_ms(last/avg)={ai_metrics['last_step_ms']:.1f}/{ai_metrics['avg_step_ms']:.1f}",
             ]
+            if mode_name in ("scoring", "blitz"):
+                rem_ms = max(0, int(blitz.get("time_remaining_ms", 0)))
+                rem_sec = rem_ms // 1000
+                mm = rem_sec // 60
+                ss = rem_sec % 60
+                lines.insert(8, f"BLITZ Score={int(blitz.get('score_total', 0))}")
+                lines.insert(
+                    9,
+                    (
+                        "BLITZ Level="
+                        f"{int(blitz.get('level', 1))} "
+                        f"LinesToNext={int(blitz.get('lines_to_next', 0))} "
+                        f"Time={mm:02d}:{ss:02d}.{(rem_ms % 1000) // 100} "
+                        f"TimedOut={int(bool(blitz.get('timed_out', False)))}"
+                    ),
+                )
+            else:
+                lines.insert(
+                    8,
+                    (
+                        "Attack:"
+                        f" total={attack['attack_total']} base={attack['attack_base']} "
+                        f"scaled={attack['attack_combo_scaled']:.2f} round={attack['attack_rounded']}"
+                    ),
+                )
+                lines.insert(
+                    9,
+                    (
+                        "B2B:"
+                        f" streak={attack['b2b_streak']} bonus={attack['attack_b2b_bonus']} "
+                        f"surge={attack['surge_charge']} release={attack['surge_release']} "
+                        f"all_clear={int(attack['all_clear'])}"
+                    ),
+                )
             if ai_backend in ("cold_clear", "depth", "beam"):
                 lines.append(
                     f"AI[{ai_backend_label}] nodes={ai_metrics['last_nodes']} "

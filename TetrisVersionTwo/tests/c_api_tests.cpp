@@ -727,6 +727,280 @@ void test_beam_multistep_trace_determinism() {
     }
 }
 
+void test_mode_attack_meta_and_garbage_api() {
+    auto* env = tetris_cc_env_create(9876u);
+    assert(env != nullptr);
+
+    assert(tetris_cc_env_set_mode(env, TETRIS_CC_MODE_ZEN) == 1);
+    int mode = -1;
+    assert(tetris_cc_env_get_mode(env, &mode) == 1);
+    assert(mode == TETRIS_CC_MODE_ZEN);
+
+    std::array<std::uint8_t, 200> mask{};
+    mask.fill(0);
+    auto set_cell = [&](int row, int col, std::uint8_t v) {
+        mask[static_cast<std::size_t>(row * 10 + col)] = v;
+    };
+    // Bottom two rows full except two-cell O gap.
+    for (int c = 0; c < 10; ++c) {
+        if (c == 4 || c == 5) {
+            continue;
+        }
+        set_cell(19, c, 1);
+        set_cell(18, c, 1);
+    }
+    assert(tetris_cc_env_set_visible_board_mask(env, mask.data(), mask.size(), 1) == 1);
+
+    std::size_t choice = static_cast<std::size_t>(-1);
+    const auto count = tetris_cc_env_placement_count(env);
+    for (std::size_t i = 0; i < count; ++i) {
+        int x = 0;
+        int y = 0;
+        int rot = 0;
+        int lines = 0;
+        assert(tetris_cc_env_placement_get(env, i, &x, &y, &rot, &lines) == 1);
+        if (lines == 2) {
+            choice = i;
+            break;
+        }
+    }
+    assert(choice != static_cast<std::size_t>(-1));
+
+    float reward = 0.0f;
+    int lines = 0;
+    int game_over = 0;
+    assert(tetris_cc_env_apply_placement_index(env, choice, &reward, &lines, &game_over) == 1);
+    assert(lines == 2);
+    assert(game_over == 0);
+
+    int attack_base = 0;
+    float attack_scaled = 0.0f;
+    int attack_rounded = 0;
+    int attack_b2b_bonus = 0;
+    int attack_all_clear_bonus = 0;
+    int attack_total = 0;
+    int all_clear = 0;
+    int b2b_streak = 0;
+    int surge_charge = 0;
+    int surge_release = 0;
+    assert(
+        tetris_cc_env_last_attack_meta(
+            env,
+            &attack_base,
+            &attack_scaled,
+            &attack_rounded,
+            &attack_b2b_bonus,
+            &attack_all_clear_bonus,
+            &attack_total,
+            &all_clear,
+            &b2b_streak,
+            &surge_charge,
+            &surge_release) == 1);
+    assert(attack_base == 1);
+    assert(std::fabs(attack_scaled - 1.0f) <= 1e-6f);
+    assert(attack_rounded == 1);
+    assert(attack_all_clear_bonus == 5);
+    assert(attack_total == 6);
+    assert(all_clear == 1);
+    assert(b2b_streak == 2);
+
+    int lines_applied = 0;
+    int top_out = 0;
+    assert(tetris_cc_env_apply_incoming_garbage(env, 2, &lines_applied, &top_out) == 1);
+    assert(lines_applied >= 1 && lines_applied <= 2);
+    assert(top_out == 0 || top_out == 1);
+
+    // Large injection should eventually top out.
+    lines_applied = 0;
+    top_out = 0;
+    assert(tetris_cc_env_apply_incoming_garbage(env, 64, &lines_applied, &top_out) == 1);
+    assert(lines_applied >= 1);
+    assert(top_out == 1);
+
+    tetris_cc_env_destroy(env);
+}
+
+void test_versus_guideline_attack_meta() {
+    auto* env = tetris_cc_env_create(9876u);
+    assert(env != nullptr);
+
+    assert(tetris_cc_env_set_mode(env, TETRIS_CC_MODE_VERSUS) == 1);
+    int mode = -1;
+    assert(tetris_cc_env_get_mode(env, &mode) == 1);
+    assert(mode == TETRIS_CC_MODE_VERSUS);
+
+    std::array<std::uint8_t, 200> mask{};
+    mask.fill(0);
+    auto set_cell = [&](int row, int col, std::uint8_t v) {
+        mask[static_cast<std::size_t>(row * 10 + col)] = v;
+    };
+    // Two-row O gap all-clear setup.
+    for (int c = 0; c < 10; ++c) {
+        if (c == 4 || c == 5) {
+            continue;
+        }
+        set_cell(19, c, 1);
+        set_cell(18, c, 1);
+    }
+    assert(tetris_cc_env_set_visible_board_mask(env, mask.data(), mask.size(), 1) == 1);
+
+    std::size_t choice = static_cast<std::size_t>(-1);
+    const auto count = tetris_cc_env_placement_count(env);
+    for (std::size_t i = 0; i < count; ++i) {
+        int x = 0;
+        int y = 0;
+        int rot = 0;
+        int lines = 0;
+        assert(tetris_cc_env_placement_get(env, i, &x, &y, &rot, &lines) == 1);
+        if (lines == 2) {
+            choice = i;
+            break;
+        }
+    }
+    assert(choice != static_cast<std::size_t>(-1));
+
+    float reward = 0.0f;
+    int lines = 0;
+    int game_over = 0;
+    assert(tetris_cc_env_apply_placement_index(env, choice, &reward, &lines, &game_over) == 1);
+    assert(lines == 2);
+    assert(game_over == 0);
+
+    int attack_base = 0;
+    float attack_scaled = 0.0f;
+    int attack_rounded = 0;
+    int attack_b2b_bonus = 0;
+    int attack_all_clear_bonus = 0;
+    int attack_total = 0;
+    int all_clear = 0;
+    int b2b_streak = 0;
+    int surge_charge = 0;
+    int surge_release = 0;
+    assert(
+        tetris_cc_env_last_attack_meta(
+            env,
+            &attack_base,
+            &attack_scaled,
+            &attack_rounded,
+            &attack_b2b_bonus,
+            &attack_all_clear_bonus,
+            &attack_total,
+            &all_clear,
+            &b2b_streak,
+            &surge_charge,
+            &surge_release) == 1);
+    assert(attack_base == 1);
+    assert(std::fabs(attack_scaled - 1.0f) <= 1e-6f);
+    assert(attack_rounded == 1);
+    assert(attack_b2b_bonus == 0);
+    assert(attack_all_clear_bonus == 7);
+    assert(attack_total == 8);
+    assert(all_clear == 1);
+    assert(surge_charge == 0);
+    assert(surge_release == 0);
+
+    tetris_cc_env_destroy(env);
+}
+
+void test_blitz_meta_api() {
+    auto* env = tetris_cc_env_create(4242u);
+    assert(env != nullptr);
+    assert(tetris_cc_env_set_mode(env, TETRIS_CC_MODE_SCORING) == 1);
+
+    int score_total = -1;
+    int level = -1;
+    int lines_to_next = -1;
+    int time_remaining_ms = -1;
+    int timed_out = -1;
+    assert(
+        tetris_cc_env_blitz_meta(
+            env,
+            &score_total,
+            &level,
+            &lines_to_next,
+            &time_remaining_ms,
+            &timed_out) == 1);
+    assert(score_total == 0);
+    assert(level == 1);
+    assert(lines_to_next == 3);
+    assert(time_remaining_ms > 0 && time_remaining_ms <= 120000);
+    assert(timed_out == 0);
+
+    std::array<std::uint8_t, 200> mask{};
+    mask.fill(0);
+    auto set_cell = [&](int row, int col, std::uint8_t v) {
+        mask[static_cast<std::size_t>(row * 10 + col)] = v;
+    };
+    for (int c = 0; c < 10; ++c) {
+        if (c == 4 || c == 5) {
+            continue;
+        }
+        set_cell(19, c, 1);
+        set_cell(18, c, 1);
+    }
+    assert(tetris_cc_env_set_visible_board_mask(env, mask.data(), mask.size(), 1) == 1);
+
+    std::size_t choice = static_cast<std::size_t>(-1);
+    const auto count = tetris_cc_env_placement_count(env);
+    for (std::size_t i = 0; i < count; ++i) {
+        int x = 0;
+        int y = 0;
+        int rot = 0;
+        int lines = 0;
+        assert(tetris_cc_env_placement_get(env, i, &x, &y, &rot, &lines) == 1);
+        if (lines == 2) {
+            choice = i;
+            break;
+        }
+    }
+    assert(choice != static_cast<std::size_t>(-1));
+
+    float reward = 0.0f;
+    int lines = 0;
+    int game_over = 0;
+    assert(tetris_cc_env_apply_placement_index(env, choice, &reward, &lines, &game_over) == 1);
+    assert(lines == 2);
+    assert(game_over == 0);
+    assert(std::fabs(reward - 3800.0f) <= 1e-3f);
+
+    score_total = -1;
+    level = -1;
+    lines_to_next = -1;
+    time_remaining_ms = -1;
+    timed_out = -1;
+    assert(
+        tetris_cc_env_blitz_meta(
+            env,
+            &score_total,
+            &level,
+            &lines_to_next,
+            &time_remaining_ms,
+            &timed_out) == 1);
+    assert(score_total == 3800);
+    assert(level == 1);
+    assert(lines_to_next == 1);
+    assert(time_remaining_ms >= 0 && time_remaining_ms <= 120000);
+    assert(timed_out == 0);
+
+    int attack_total = -1;
+    assert(
+        tetris_cc_env_last_attack_meta(
+            env,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            &attack_total,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr) == 1);
+    assert(attack_total == 0);
+
+    tetris_cc_env_destroy(env);
+}
+
 }  // namespace
 
 int main() {
@@ -739,5 +1013,8 @@ int main() {
     test_cc_bot_sparse_board_loop_stability();
     test_cc_bot_loop_and_backend_switching();
     test_beam_multistep_trace_determinism();
+    test_mode_attack_meta_and_garbage_api();
+    test_versus_guideline_attack_meta();
+    test_blitz_meta_api();
     return 0;
 }

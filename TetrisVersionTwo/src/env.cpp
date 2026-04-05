@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <optional>
 #include <queue>
 #include <sstream>
@@ -57,6 +59,22 @@ bool placement_metadata_is_better(const PlacementOption& candidate, const Placem
     }
     return false;
 }
+
+constexpr std::array<int, 8> kB2BChainingUpperBounds{
+    3, 8, 24, 67, 185, 504, 1370, 3725,
+};
+
+constexpr int kBlitzMaxLevel = 15;
+constexpr double kBlitzTickRateHz = 60.0;
+
+constexpr std::array<int, kBlitzMaxLevel> kBlitzLevelLineTotals{
+    3, 8, 15, 24, 35, 48, 63, 80, 99, 120, 144, 170, 198, 228, 260,
+};
+
+constexpr std::array<double, kBlitzMaxLevel> kBlitzGravitySecondsPerRow{
+    1.0, 0.643, 0.404, 0.249, 0.150, 0.0880, 0.0505, 0.0283,
+    0.0155, 0.00827, 0.00431, 0.00219, 0.00108, 0.00052, 0.00024,
+};
 
 int passing_kick_index(const std::vector<KickTest>& tests) {
     for (const auto& test : tests) {
@@ -147,34 +165,119 @@ KickOffsets srs_kicks(Piece piece, Rotation from, Rotation to) {
 }  // namespace
 
 ModernTetrisEnv::ModernTetrisEnv(const EnvConfig& config)
-    : config_(config), randomizer_(config.seed) {
+    : config_(config),
+      randomizer_(config.seed),
+      base_gravity_per_step_(config.gravity_per_step) {
     reset();
 }
+
+void ModernTetrisEnv::set_mode(GameMode mode) {
+    if (config_.mode == mode) {
+        return;
+    }
+    config_.mode = mode;
+    if (is_mode_blitz()) {
+        reset_blitz_state();
+    } else {
+        state_.blitz_timed_out = false;
+        state_.blitz_time_remaining_ms = 0;
+        state_.blitz_level = 1;
+        state_.blitz_lines_to_next = 0;
+        config_.gravity_per_step = base_gravity_per_step_;
+        blitz_clock_started_ = false;
+    }
+}
+
+void ModernTetrisEnv::set_blitz_time_limit_ms(int time_limit_ms) {
+    blitz_time_limit_ms_ = time_limit_ms;
+    if (!is_mode_blitz()) {
+        return;
+    }
+
+    if (blitz_time_limit_ms_ <= 0) {
+        state_.blitz_time_remaining_ms = 0;
+        state_.blitz_timed_out = false;
+        if (state_.game_over && !state_.top_out) {
+            state_.game_over = false;
+        }
+        blitz_clock_started_ = false;
+        return;
+    }
+
+    state_.blitz_time_remaining_ms = blitz_time_limit_ms_;
+    state_.blitz_timed_out = false;
+    if (state_.game_over && !state_.top_out) {
+        state_.game_over = false;
+    }
+    blitz_last_wall_time_ = std::chrono::steady_clock::now();
+    blitz_clock_started_ = true;
+}
+
+void ModernTetrisEnv::refresh_runtime_state() { refresh_blitz_timer(); }
 
 void ModernTetrisEnv::reset(std::optional<std::uint32_t> seed) {
     if (seed.has_value()) {
         randomizer_.reseed(*seed);
+        garbage_rng_state_ = (*seed == 0u ? 1u : *seed);
     } else {
         randomizer_.reseed(config_.seed);
+        garbage_rng_state_ = (config_.seed == 0u ? 1u : config_.seed);
     }
 
     state_ = EnvState{};
+    last_step_result_ = StepResult{};
     state_.board.clear();
     for (auto& row : state_.piece_ids) {
         row.fill(-1);
+    }
+    config_.gravity_per_step = base_gravity_per_step_;
+    blitz_clock_started_ = false;
+    if (is_mode_blitz()) {
+        reset_blitz_state();
     }
     invalidate_placement_cache();
     ensure_queue(static_cast<std::size_t>(config_.queue_size) + 1u);
     spawn_next_piece(true);
 }
 
-StepResult ModernTetrisEnv::step(Action action) {
+StepResult ModernTetrisEnv::make_result_defaults() const {
     StepResult result{};
+    result.combo = state_.combo;
+    result.back_to_back = state_.back_to_back;
+    result.b2b_streak = state_.b2b_streak;
+    result.surge_charge = state_.b2b_surge_charge;
+    result.blitz_mode = is_mode_blitz();
+    result.timed_out = state_.blitz_timed_out;
+    result.blitz_score_total = state_.blitz_score_total;
+    result.blitz_level = state_.blitz_level;
+    result.blitz_lines_to_next = state_.blitz_lines_to_next;
+    result.blitz_time_remaining_ms = state_.blitz_time_remaining_ms;
+    return result;
+}
+
+void ModernTetrisEnv::sync_state_to_result(StepResult& result) const {
+    result.combo = state_.combo;
+    result.back_to_back = state_.back_to_back;
+    result.b2b_streak = state_.b2b_streak;
+    result.game_over = state_.game_over;
+    result.top_out = state_.top_out;
+    result.timed_out = state_.blitz_timed_out;
+    result.blitz_mode = is_mode_blitz();
+    result.blitz_score_total = state_.blitz_score_total;
+    result.blitz_level = state_.blitz_level;
+    result.blitz_lines_to_next = state_.blitz_lines_to_next;
+    result.blitz_time_remaining_ms = state_.blitz_time_remaining_ms;
+}
+
+StepResult ModernTetrisEnv::step(Action action) {
+    refresh_runtime_state();
+    StepResult result = make_result_defaults();
     if (state_.game_over) {
-        result.game_over = true;
-        result.top_out = state_.top_out;
-        result.combo = state_.combo;
-        result.back_to_back = state_.back_to_back;
+        sync_state_to_result(result);
+        if (is_mode_legacy()) {
+            result.legacy_reward = result.reward;
+        }
+        last_step_result_ = result;
         return result;
     }
     invalidate_placement_cache();
@@ -208,6 +311,7 @@ StepResult ModernTetrisEnv::step(Action action) {
             action_succeeded = try_rotate(rotate_cw(state_.active.rotation), &used_kick, &kick_index);
             if (action_succeeded) {
                 state_.spin_eligible = true;
+                state_.rotated_this_piece = true;
                 state_.last_rotate_used_kick = used_kick;
                 state_.last_rotate_kick_index = kick_index;
             }
@@ -220,6 +324,7 @@ StepResult ModernTetrisEnv::step(Action action) {
             action_succeeded = try_rotate(rotate_ccw(state_.active.rotation), &used_kick, &kick_index);
             if (action_succeeded) {
                 state_.spin_eligible = true;
+                state_.rotated_this_piece = true;
                 state_.last_rotate_used_kick = used_kick;
                 state_.last_rotate_kick_index = kick_index;
             }
@@ -232,6 +337,7 @@ StepResult ModernTetrisEnv::step(Action action) {
                 if (rotated.has_value()) {
                     state_.active = rotated->first;
                     state_.spin_eligible = true;
+                    state_.rotated_this_piece = true;
                     state_.last_rotate_used_kick = rotated->second;
                     state_.last_rotate_kick_index = -1;
                     action_succeeded = true;
@@ -245,7 +351,11 @@ StepResult ModernTetrisEnv::step(Action action) {
                 state_.spin_eligible = false;
                 state_.last_rotate_used_kick = false;
                 state_.last_rotate_kick_index = -1;
-                result.reward += 1.0f;
+                if (is_mode_legacy()) {
+                    result.reward += 1.0f;
+                } else {
+                    result.legacy_reward += 1.0f;
+                }
             }
             break;
         case Action::HardDrop: {
@@ -253,7 +363,11 @@ StepResult ModernTetrisEnv::step(Action action) {
             while (try_move(0, -1)) {
                 ++dropped;
             }
-            result.reward += static_cast<float>(2 * dropped);
+            if (is_mode_legacy()) {
+                result.reward += static_cast<float>(2 * dropped);
+            } else {
+                result.legacy_reward += static_cast<float>(2 * dropped);
+            }
             action_succeeded = dropped > 0 || touching_ground();
             lock_active_piece(result);
             break;
@@ -298,10 +412,11 @@ StepResult ModernTetrisEnv::step(Action action) {
     }
 
     result.action_succeeded = action_succeeded;
-    result.combo = state_.combo;
-    result.back_to_back = state_.back_to_back;
-    result.game_over = state_.game_over;
-    result.top_out = state_.top_out;
+    sync_state_to_result(result);
+    if (is_mode_legacy()) {
+        result.legacy_reward = result.reward;
+    }
+    last_step_result_ = result;
     return result;
 }
 
@@ -583,36 +698,42 @@ std::vector<std::uint8_t> ModernTetrisEnv::visible_placement_piece_ids(std::size
 }
 
 StepResult ModernTetrisEnv::apply_option_impl(const PlacementOption& option) {
-    StepResult result{};
+    refresh_runtime_state();
+    StepResult result = make_result_defaults();
     if (state_.game_over) {
-        result.game_over = true;
-        result.top_out = state_.top_out;
-        result.combo = state_.combo;
-        result.back_to_back = state_.back_to_back;
+        sync_state_to_result(result);
+        if (is_mode_legacy()) {
+            result.legacy_reward = result.reward;
+        }
+        last_step_result_ = result;
         return result;
     }
 
     invalidate_placement_cache();
     state_.active = option.placement;
     state_.spin_eligible = option.spin_eligible_path;
+    state_.rotated_this_piece = state_.rotated_this_piece || option.spin_eligible_path;
     state_.last_rotate_used_kick = option.last_rotate_used_kick_path;
     state_.last_rotate_kick_index = option.last_rotate_kick_index_path;
     lock_active_piece(result);
     result.action_succeeded = true;
-    result.combo = state_.combo;
-    result.back_to_back = state_.back_to_back;
-    result.game_over = state_.game_over;
-    result.top_out = state_.top_out;
+    sync_state_to_result(result);
+    if (is_mode_legacy()) {
+        result.legacy_reward = result.reward;
+    }
+    last_step_result_ = result;
     return result;
 }
 
 StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
-    StepResult result{};
+    refresh_runtime_state();
+    StepResult result = make_result_defaults();
     if (state_.game_over) {
-        result.game_over = true;
-        result.top_out = state_.top_out;
-        result.combo = state_.combo;
-        result.back_to_back = state_.back_to_back;
+        sync_state_to_result(result);
+        if (is_mode_legacy()) {
+            result.legacy_reward = result.reward;
+        }
+        last_step_result_ = result;
         return result;
     }
 
@@ -622,10 +743,11 @@ StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
     });
     if (it == options.end()) {
         result.action_succeeded = false;
-        result.combo = state_.combo;
-        result.back_to_back = state_.back_to_back;
-        result.game_over = state_.game_over;
-        result.top_out = state_.top_out;
+        sync_state_to_result(result);
+        if (is_mode_legacy()) {
+            result.legacy_reward = result.reward;
+        }
+        last_step_result_ = result;
         return result;
     }
 
@@ -633,22 +755,25 @@ StepResult ModernTetrisEnv::apply_placement(const ActivePiece& placement) {
 }
 
 StepResult ModernTetrisEnv::apply_placement_index(std::size_t index) {
-    StepResult result{};
+    refresh_runtime_state();
+    StepResult result = make_result_defaults();
     if (state_.game_over) {
-        result.game_over = true;
-        result.top_out = state_.top_out;
-        result.combo = state_.combo;
-        result.back_to_back = state_.back_to_back;
+        sync_state_to_result(result);
+        if (is_mode_legacy()) {
+            result.legacy_reward = result.reward;
+        }
+        last_step_result_ = result;
         return result;
     }
 
     auto option = placement_option_at(index);
     if (!option.has_value()) {
         result.action_succeeded = false;
-        result.combo = state_.combo;
-        result.back_to_back = state_.back_to_back;
-        result.game_over = state_.game_over;
-        result.top_out = state_.top_out;
+        sync_state_to_result(result);
+        if (is_mode_legacy()) {
+            result.legacy_reward = result.reward;
+        }
+        last_step_result_ = result;
         return result;
     }
 
@@ -725,17 +850,47 @@ EnvSnapshot ModernTetrisEnv::snapshot() const {
     EnvSnapshot out{};
     out.state = state_;
     out.randomizer = randomizer_;
+    out.garbage_rng_state = garbage_rng_state_;
+    out.mode = config_.mode;
     return out;
 }
 
 void ModernTetrisEnv::restore(const EnvSnapshot& snapshot) {
     state_ = snapshot.state;
     randomizer_ = snapshot.randomizer;
+    garbage_rng_state_ = snapshot.garbage_rng_state;
+    config_.mode = snapshot.mode;
+    if (is_mode_blitz()) {
+        if (blitz_time_limit_ms_ <= 0) {
+            state_.blitz_timed_out = false;
+            state_.blitz_time_remaining_ms = 0;
+        }
+        update_blitz_level_and_gravity();
+        blitz_last_wall_time_ = std::chrono::steady_clock::now();
+        blitz_clock_started_ = true;
+    } else {
+        config_.gravity_per_step = base_gravity_per_step_;
+        blitz_clock_started_ = false;
+    }
+    last_step_result_ = make_result_defaults();
     invalidate_placement_cache();
 }
 
 void ModernTetrisEnv::restore(const EnvState& state) {
     state_ = state;
+    if (is_mode_blitz()) {
+        if (blitz_time_limit_ms_ <= 0) {
+            state_.blitz_timed_out = false;
+            state_.blitz_time_remaining_ms = 0;
+        }
+        update_blitz_level_and_gravity();
+        blitz_last_wall_time_ = std::chrono::steady_clock::now();
+        blitz_clock_started_ = true;
+    } else {
+        config_.gravity_per_step = base_gravity_per_step_;
+        blitz_clock_started_ = false;
+    }
+    last_step_result_ = make_result_defaults();
     invalidate_placement_cache();
 }
 
@@ -786,6 +941,7 @@ void ModernTetrisEnv::spawn_next_piece(bool reset_hold_availability) {
     state_.lock_resets_used = 0;
     state_.gravity_accumulator = 0.0f;
     state_.spin_eligible = false;
+    state_.rotated_this_piece = false;
     state_.last_rotate_used_kick = false;
     state_.last_rotate_kick_index = -1;
     if (reset_hold_availability) {
@@ -962,6 +1118,7 @@ bool ModernTetrisEnv::apply_hold() {
         state_.lock_resets_used = 0;
         state_.gravity_accumulator = 0.0f;
         state_.spin_eligible = false;
+        state_.rotated_this_piece = false;
         state_.last_rotate_used_kick = false;
         state_.last_rotate_kick_index = -1;
         if (collides(state_.active)) {
@@ -975,6 +1132,296 @@ bool ModernTetrisEnv::apply_hold() {
 
     state_.hold_available = false;
     return !state_.game_over;
+}
+
+bool ModernTetrisEnv::piece_immobile(const ActivePiece& piece) const {
+    ActivePiece left = piece;
+    left.x -= 1;
+    ActivePiece right = piece;
+    right.x += 1;
+    ActivePiece down = piece;
+    down.y -= 1;
+    return collides(left) && collides(right) && collides(down);
+}
+
+int ModernTetrisEnv::apply_attack_rounding(float attack) const {
+    if (!std::isfinite(attack) || attack <= 0.0f) {
+        return 0;
+    }
+    switch (config_.attack.rounding_mode) {
+        case AttackRoundingMode::Down:
+        case AttackRoundingMode::Rng:
+            return static_cast<int>(std::floor(attack));
+    }
+    return 0;
+}
+
+int ModernTetrisEnv::b2b_chaining_extra(int streak) const {
+    if (streak <= 1) {
+        return 0;
+    }
+    for (std::size_t i = 0; i < kB2BChainingUpperBounds.size(); ++i) {
+        if (streak <= kB2BChainingUpperBounds[i]) {
+            return static_cast<int>(i + 1);
+        }
+    }
+
+    int extra = 8;
+    int upper = kB2BChainingUpperBounds.back();
+    int span = upper - kB2BChainingUpperBounds[kB2BChainingUpperBounds.size() - 2];
+    while (streak > upper) {
+        span = std::max(span + 1, static_cast<int>(std::llround(static_cast<double>(span) * 2.718281828)));
+        upper += span;
+        ++extra;
+    }
+    return extra;
+}
+
+int ModernTetrisEnv::versus_guideline_base_attack(int lines, SpinType spin_type) const {
+    if (lines <= 0) {
+        return 0;
+    }
+
+    if (spin_type == SpinType::Mini) {
+        return 0;
+    }
+    if (spin_type == SpinType::Full) {
+        switch (lines) {
+            case 1: return 2;
+            case 2: return 4;
+            case 3: return 6;
+            default: return 0;
+        }
+    }
+    switch (lines) {
+        case 1: return 0;
+        case 2: return 1;
+        case 3: return 2;
+        case 4: return 4;
+        default: return 0;
+    }
+}
+
+int ModernTetrisEnv::versus_guideline_combo_bonus(int combo) const {
+    if (combo <= 0) {
+        return 0;
+    }
+    return std::max(0, combo / 2);
+}
+
+int ModernTetrisEnv::blitz_clear_points(int lines, SpinType spin_type) const {
+    if (spin_type == SpinType::Full) {
+        switch (lines) {
+            case 0: return 400;
+            case 1: return 800;
+            case 2: return 1200;
+            case 3: return 1600;
+            case 4: return 2600;
+            default: return 0;
+        }
+    }
+    if (spin_type == SpinType::Mini) {
+        switch (lines) {
+            case 0: return 100;
+            case 1: return 200;
+            case 2: return 400;
+            case 3: return 800;
+            case 4: return 1600;
+            default: return 0;
+        }
+    }
+
+    switch (lines) {
+        case 1: return 100;
+        case 2: return 300;
+        case 3: return 500;
+        case 4: return 800;
+        default: return 0;
+    }
+}
+
+int ModernTetrisEnv::blitz_level_from_total_lines(int total_lines) const {
+    int level = 1;
+    for (std::size_t i = 0; i < kBlitzLevelLineTotals.size(); ++i) {
+        if (total_lines >= kBlitzLevelLineTotals[i]) {
+            level = static_cast<int>(i) + 2;
+        } else {
+            break;
+        }
+    }
+    return std::min(level, kBlitzMaxLevel);
+}
+
+int ModernTetrisEnv::blitz_lines_to_next(int level, int total_lines) const {
+    if (level >= kBlitzMaxLevel) {
+        return 0;
+    }
+    const int goal = kBlitzLevelLineTotals[static_cast<std::size_t>(std::max(1, level) - 1)];
+    return std::max(0, goal - total_lines);
+}
+
+void ModernTetrisEnv::update_blitz_level_and_gravity() {
+    if (!is_mode_blitz()) {
+        return;
+    }
+    state_.blitz_level = blitz_level_from_total_lines(state_.total_lines_cleared);
+    state_.blitz_lines_to_next = blitz_lines_to_next(state_.blitz_level, state_.total_lines_cleared);
+
+    const int idx = std::min(
+        kBlitzMaxLevel - 1,
+        std::max(0, state_.blitz_level - 1));
+    const double sec_per_row = kBlitzGravitySecondsPerRow[static_cast<std::size_t>(idx)];
+    double g = 0.0;
+    if (std::isfinite(sec_per_row) && sec_per_row > 0.0) {
+        g = 1.0 / sec_per_row;
+    }
+    config_.gravity_per_step = static_cast<float>(g / kBlitzTickRateHz);
+}
+
+void ModernTetrisEnv::reset_blitz_state() {
+    state_.blitz_score_total = 0;
+    state_.blitz_time_remaining_ms = (blitz_time_limit_ms_ > 0) ? blitz_time_limit_ms_ : 0;
+    state_.blitz_timed_out = false;
+    update_blitz_level_and_gravity();
+    if (blitz_time_limit_ms_ > 0) {
+        blitz_last_wall_time_ = std::chrono::steady_clock::now();
+        blitz_clock_started_ = true;
+    } else {
+        blitz_clock_started_ = false;
+    }
+}
+
+void ModernTetrisEnv::refresh_blitz_timer() {
+    if (!is_mode_blitz()) {
+        return;
+    }
+    if (blitz_time_limit_ms_ <= 0) {
+        state_.blitz_timed_out = false;
+        state_.blitz_time_remaining_ms = 0;
+        return;
+    }
+    if (state_.blitz_timed_out) {
+        state_.game_over = true;
+        state_.top_out = false;
+        return;
+    }
+    if (state_.game_over) {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!blitz_clock_started_) {
+        blitz_last_wall_time_ = now;
+        blitz_clock_started_ = true;
+    }
+
+    const auto elapsed_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - blitz_last_wall_time_).count());
+    blitz_last_wall_time_ = now;
+    if (elapsed_ms > 0) {
+        state_.blitz_time_remaining_ms = std::max(0, state_.blitz_time_remaining_ms - elapsed_ms);
+    }
+
+    if (state_.blitz_time_remaining_ms <= 0) {
+        state_.blitz_time_remaining_ms = 0;
+        state_.blitz_timed_out = true;
+        state_.game_over = true;
+        state_.top_out = false;
+    }
+}
+
+int ModernTetrisEnv::attack_base_for_clear(int lines, SpinType spin_type, bool b2b_active) const {
+    if (lines <= 0) {
+        return 0;
+    }
+
+    int base = 0;
+    if (spin_type == SpinType::Full) {
+        switch (lines) {
+            case 1: base = 2; break;
+            case 2: base = 4; break;
+            case 3: base = 6; break;
+            default: base = 0; break;
+        }
+    } else if (spin_type == SpinType::Mini) {
+        switch (lines) {
+            case 1: base = 0; break;
+            case 2: base = 1; break;
+            case 3: base = 2; break;
+            default: base = 0; break;
+        }
+    } else {
+        switch (lines) {
+            case 1: base = 0; break;
+            case 2: base = 1; break;
+            case 3: base = 2; break;
+            case 4: base = 4; break;
+            default: base = 0; break;
+        }
+    }
+
+    if (b2b_active && is_difficult_clear(lines, spin_type)) {
+        base += 1;
+    }
+    return base;
+}
+
+bool ModernTetrisEnv::is_difficult_clear(int lines, SpinType spin_type) const {
+    if (lines <= 0) {
+        return false;
+    }
+    if (lines >= 4) {
+        return true;
+    }
+    return spin_type != SpinType::None && lines >= 1;
+}
+
+bool ModernTetrisEnv::is_all_clear_after_line_clear() const { return state_.board.is_empty(); }
+
+bool ModernTetrisEnv::apply_incoming_garbage(int lines, int* lines_applied) {
+    refresh_runtime_state();
+    if (lines_applied) {
+        *lines_applied = 0;
+    }
+    if (lines <= 0 || state_.game_over) {
+        return false;
+    }
+
+    invalidate_placement_cache();
+    int applied = 0;
+    for (int i = 0; i < lines; ++i) {
+        garbage_rng_state_ = garbage_rng_state_ * 1664525u + 1013904223u;
+        const int hole = static_cast<int>((garbage_rng_state_ >> 16u) % static_cast<std::uint32_t>(Board::kWidth));
+
+        for (int y = Board::kRows - 1; y >= 1; --y) {
+            state_.board.set_cell(0, y, false);
+            auto src_mask = state_.board.row_mask(y - 1);
+            for (int x = 0; x < Board::kWidth; ++x) {
+                const bool filled = (src_mask & (Board::RowMask{1u} << static_cast<unsigned>(x))) != 0;
+                state_.board.set_cell(x, y, filled);
+                state_.piece_ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] =
+                    state_.piece_ids[static_cast<std::size_t>(y - 1)][static_cast<std::size_t>(x)];
+            }
+        }
+
+        for (int x = 0; x < Board::kWidth; ++x) {
+            const bool filled = (x != hole);
+            state_.board.set_cell(x, 0, filled);
+            state_.piece_ids[0][static_cast<std::size_t>(x)] = -1;
+        }
+        ++applied;
+
+        if (collides(state_.active)) {
+            state_.game_over = true;
+            state_.top_out = true;
+            break;
+        }
+    }
+
+    if (lines_applied) {
+        *lines_applied = applied;
+    }
+    return state_.game_over;
 }
 
 void ModernTetrisEnv::lock_active_piece(StepResult& result) {
@@ -1000,8 +1447,11 @@ void ModernTetrisEnv::lock_active_piece(StepResult& result) {
         }
     }
 
+    const bool immobile_lock = piece_immobile(state_.active);
+    const bool rotated_before_lock = state_.rotated_this_piece;
     auto spin_type = SpinType::None;
-    if (lines > 0 && state_.active.piece == Piece::T && state_.spin_eligible) {
+    const bool allow_spin_detection = (lines > 0) || is_mode_blitz();
+    if (allow_spin_detection && state_.active.piece == Piece::T && state_.spin_eligible) {
         auto occupied_corner = [&](int dx, int dy) {
             return state_.board.occupied(state_.active.x + dx, state_.active.y + dy);
         };
@@ -1031,40 +1481,226 @@ void ModernTetrisEnv::lock_active_piece(StepResult& result) {
         }
     }
 
+    if (lines > 0 && is_mode_tetrio_like() && config_.attack.all_mini_plus && rotated_before_lock &&
+        immobile_lock) {
+        if (state_.active.piece != Piece::T || spin_type == SpinType::None) {
+            spin_type = SpinType::Mini;
+        }
+    }
+
     state_.board.clear_filled_lines();
     if (lines > 0) {
         compact_piece_ids(state_.piece_ids, cleared_rows);
     }
+
+    const bool all_clear = (lines > 0) && is_all_clear_after_line_clear();
+    const bool difficult = is_difficult_clear(lines, spin_type);
+
     result.piece_locked = true;
     result.lines_cleared = lines;
     result.spin_type = spin_type;
     result.spin_clear = result.spin_type != SpinType::None;
-    result.difficult_clear = (lines == 4) || result.spin_clear;
+    result.difficult_clear = difficult;
     result.b2b_bonus_applied = false;
+    result.all_clear = all_clear;
+    result.rotated_before_lock = rotated_before_lock;
+    result.immobile_lock = immobile_lock;
+    result.attack_base = 0;
+    result.attack_combo_scaled = 0.0f;
+    result.combo_multiplier = 1.0f;
+    result.attack_rounded = 0;
+    result.attack_b2b_bonus = 0;
+    result.attack_all_clear_bonus = 0;
+    result.surge_release = 0;
+    result.attack_total = 0;
 
+    float legacy_gain = 0.0f;
     if (lines > 0) {
-        result.reward += line_clear_reward(lines, result.spin_clear);
-        state_.combo += 1;
-        if (result.difficult_clear && state_.back_to_back) {
-            result.reward += config_.scoring.b2b_bonus;
+        legacy_gain += line_clear_reward(lines, result.spin_clear);
+        if (difficult && state_.back_to_back) {
+            legacy_gain += config_.scoring.b2b_bonus;
             result.b2b_bonus_applied = true;
         }
-        if (result.difficult_clear) {
-            state_.back_to_back = true;
-        } else {
-            state_.back_to_back = false;
-        }
-        result.reward += combo_bonus(state_.combo);
+        state_.combo += 1;
+        legacy_gain += combo_bonus(state_.combo);
     } else {
         state_.combo = -1;
     }
 
+    if (is_mode_legacy()) {
+        if (lines > 0) {
+            if (difficult) {
+                state_.back_to_back = true;
+                state_.b2b_streak += 1;
+            } else {
+                state_.back_to_back = false;
+                state_.b2b_streak = 0;
+                state_.b2b_surge_charge = 0;
+            }
+        }
+        result.reward += legacy_gain;
+        result.legacy_reward = result.reward;
+        result.surge_charge = state_.b2b_surge_charge;
+    } else if (config_.mode == GameMode::Versus) {
+        int next_streak = state_.b2b_streak;
+        if (lines > 0) {
+            if (difficult) {
+                next_streak += 1;
+            } else {
+                next_streak = 0;
+            }
+        }
+
+        if (lines > 0) {
+            const bool b2b_active_before = state_.b2b_streak >= 1;
+            result.attack_base = versus_guideline_base_attack(lines, spin_type);
+            result.attack_combo_scaled = static_cast<float>(result.attack_base);
+            result.attack_rounded = result.attack_base;
+
+            if (difficult && b2b_active_before) {
+                result.attack_b2b_bonus = 1;
+            }
+            if (all_clear) {
+                result.attack_all_clear_bonus = 7;
+            }
+            const int combo_bonus = versus_guideline_combo_bonus(state_.combo);
+            result.attack_total =
+                result.attack_rounded +
+                result.attack_b2b_bonus +
+                result.attack_all_clear_bonus +
+                combo_bonus;
+        }
+
+        state_.b2b_streak = next_streak;
+        state_.b2b_surge_charge = 0;
+        state_.back_to_back = state_.b2b_streak >= 1;
+        result.surge_charge = 0;
+        result.surge_release = 0;
+        result.legacy_reward += legacy_gain;
+        result.reward += static_cast<float>(result.attack_total);
+        result.b2b_bonus_applied = result.attack_b2b_bonus > 0;
+    } else if (is_mode_blitz()) {
+        int next_streak = state_.b2b_streak;
+        if (lines > 0) {
+            if (difficult) {
+                next_streak += 1;
+            } else {
+                next_streak = 0;
+            }
+        }
+
+        int clear_points = blitz_clear_points(lines, spin_type);
+        const bool b2b_active_before = state_.b2b_streak >= 1;
+        if (lines > 0 && difficult && b2b_active_before && clear_points > 0) {
+            clear_points = static_cast<int>(std::lround(static_cast<double>(clear_points) * 1.5));
+            result.b2b_bonus_applied = true;
+        }
+        const int combo_points = (lines > 0) ? (std::max(0, state_.combo) * 50) : 0;
+        const int all_clear_points = all_clear ? 3500 : 0;
+        const int base_points = clear_points + combo_points + all_clear_points;
+        const int level = std::max(1, state_.blitz_level);
+        const int score_gain = base_points * level;
+
+        state_.blitz_score_total += score_gain;
+        state_.b2b_streak = next_streak;
+        state_.back_to_back = state_.b2b_streak >= 1;
+        state_.b2b_surge_charge = 0;
+        result.surge_charge = 0;
+        result.surge_release = 0;
+        result.legacy_reward += legacy_gain;
+        result.reward += static_cast<float>(score_gain);
+    } else {
+        int next_streak = state_.b2b_streak;
+        int next_surge_charge = state_.b2b_surge_charge;
+        bool streak_break = false;
+        if (lines > 0) {
+            if (all_clear) {
+                next_streak += 2;
+            } else if (difficult) {
+                next_streak += 1;
+            } else {
+                next_streak = 0;
+                streak_break = true;
+            }
+        }
+
+        if (lines > 0) {
+            const bool b2b_active_before = state_.b2b_streak >= 1;
+            const int combo = std::max(0, state_.combo);
+            result.combo_multiplier = 1.0f + 0.25f * static_cast<float>(combo);
+            result.attack_base = attack_base_for_clear(lines, spin_type, b2b_active_before);
+            if (result.attack_base > 0) {
+                result.attack_combo_scaled = static_cast<float>(result.attack_base) * result.combo_multiplier;
+            } else if (combo >= 2) {
+                result.attack_combo_scaled =
+                    std::log(1.0f + 1.25f * static_cast<float>(combo));
+            } else {
+                result.attack_combo_scaled = 0.0f;
+            }
+            result.attack_rounded = apply_attack_rounding(result.attack_combo_scaled);
+
+            if (is_mode_charging()) {
+                if (difficult) {
+                    result.attack_b2b_bonus += 1;
+                }
+                if (streak_break && state_.b2b_surge_charge > 0) {
+                    result.surge_release = state_.b2b_surge_charge;
+                }
+                if (streak_break) {
+                    next_surge_charge = 0;
+                } else if (next_streak >= config_.attack.b2b_charging_surge_start_streak) {
+                    next_surge_charge = std::max(
+                        config_.attack.b2b_charging_non_quickplay_base,
+                        next_streak);
+                } else {
+                    next_surge_charge = 0;
+                }
+            } else if (is_mode_chaining()) {
+                result.attack_b2b_bonus += b2b_chaining_extra(next_streak);
+                next_surge_charge = 0;
+            } else {
+                next_surge_charge = 0;
+            }
+
+            if (all_clear) {
+                result.attack_all_clear_bonus = config_.attack.all_clear_bonus;
+            }
+            result.attack_total =
+                result.attack_rounded +
+                result.attack_b2b_bonus +
+                result.attack_all_clear_bonus +
+                result.surge_release;
+        }
+
+        state_.b2b_streak = next_streak;
+        state_.b2b_surge_charge = next_surge_charge;
+        state_.back_to_back = state_.b2b_streak >= 1;
+        result.surge_charge = state_.b2b_surge_charge;
+        result.legacy_reward += legacy_gain;
+        result.reward += static_cast<float>(result.attack_total);
+        result.b2b_bonus_applied = result.attack_b2b_bonus > 0;
+    }
+
+    result.b2b_streak = state_.b2b_streak;
     state_.last_clear_spin = result.spin_clear;
     state_.last_clear_spin_type = result.spin_type;
     state_.last_clear_difficult = result.difficult_clear;
     state_.last_clear_b2b_bonus = result.b2b_bonus_applied;
+    state_.last_clear_all_clear = result.all_clear;
+    state_.last_attack_base = result.attack_base;
+    state_.last_attack_combo_scaled = result.attack_combo_scaled;
+    state_.last_attack_rounded = result.attack_rounded;
+    state_.last_attack_b2b_bonus = result.attack_b2b_bonus;
+    state_.last_attack_all_clear_bonus = result.attack_all_clear_bonus;
+    state_.last_attack_surge_charge = result.surge_charge;
+    state_.last_attack_surge_release = result.surge_release;
+    state_.last_attack_total = result.attack_total;
     state_.total_lines_cleared += lines;
+    if (is_mode_blitz()) {
+        update_blitz_level_and_gravity();
+    }
     spawn_next_piece(true);
+    sync_state_to_result(result);
 }
 
 float ModernTetrisEnv::line_clear_reward(int lines, bool spin_clear) const {

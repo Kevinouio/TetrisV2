@@ -109,7 +109,11 @@ bool choose_and_apply(
 }  // namespace tetris_v2::beam
 
 struct tetris_cc_env_handle {
-    explicit tetris_cc_env_handle(std::uint32_t seed) : env(tetris_v2::EnvConfig{seed}) {}
+    explicit tetris_cc_env_handle(std::uint32_t seed) : env([seed] {
+        tetris_v2::EnvConfig cfg{};
+        cfg.seed = seed;
+        return cfg;
+    }()) {}
 
     struct CandidateCacheEntry {
         int use_hold{0};
@@ -152,6 +156,31 @@ constexpr std::size_t kCandidateFeatureDim = 6;
 bool valid_bot_backend(int backend) {
     return backend == TETRIS_CC_BOT_BACKEND_COLD_CLEAR || backend == TETRIS_CC_BOT_BACKEND_DEPTH ||
            backend == TETRIS_CC_BOT_BACKEND_BEAM;
+}
+
+bool valid_env_mode(int mode) {
+    return mode == TETRIS_CC_MODE_LEGACY || mode == TETRIS_CC_MODE_ZEN ||
+           mode == TETRIS_CC_MODE_SCORING || mode == TETRIS_CC_MODE_VERSUS;
+}
+
+tetris_v2::GameMode parse_env_mode(int mode) {
+    switch (mode) {
+        case TETRIS_CC_MODE_ZEN: return tetris_v2::GameMode::Zen;
+        case TETRIS_CC_MODE_SCORING: return tetris_v2::GameMode::Scoring;
+        case TETRIS_CC_MODE_VERSUS: return tetris_v2::GameMode::Versus;
+        case TETRIS_CC_MODE_LEGACY:
+        default: return tetris_v2::GameMode::Legacy;
+    }
+}
+
+int env_mode_to_c(tetris_v2::GameMode mode) {
+    switch (mode) {
+        case tetris_v2::GameMode::Legacy: return TETRIS_CC_MODE_LEGACY;
+        case tetris_v2::GameMode::Zen: return TETRIS_CC_MODE_ZEN;
+        case tetris_v2::GameMode::Scoring: return TETRIS_CC_MODE_SCORING;
+        case tetris_v2::GameMode::Versus: return TETRIS_CC_MODE_VERSUS;
+    }
+    return TETRIS_CC_MODE_LEGACY;
 }
 
 tetris_v2::Action parse_action(int action) {
@@ -225,10 +254,31 @@ void maybe_set_u64(std::uint64_t* dst, std::uint64_t value) {
     }
 }
 
+void maybe_set_float(float* dst, float value) {
+    if (dst) {
+        *dst = value;
+    }
+}
+
 void maybe_set_double(double* dst, double value) {
     if (dst) {
         *dst = value;
     }
+}
+
+void refresh_env_runtime(tetris_cc_env_handle* handle) {
+    if (!handle) {
+        return;
+    }
+    handle->env.raw().refresh_runtime_state();
+}
+
+void refresh_env_runtime(const tetris_cc_env_handle* handle) {
+    if (!handle) {
+        return;
+    }
+    auto* mutable_handle = const_cast<tetris_cc_env_handle*>(handle);
+    mutable_handle->env.raw().refresh_runtime_state();
 }
 
 void mark_env_mutated(tetris_cc_env_handle* handle) {
@@ -339,6 +389,7 @@ void ensure_candidate_cache(const tetris_cc_env_handle* handle) {
         return;
     }
     auto* mutable_handle = const_cast<tetris_cc_env_handle*>(handle);
+    refresh_env_runtime(mutable_handle);
     if (mutable_handle->candidate_cache_valid &&
         mutable_handle->candidate_cache_epoch == mutable_handle->mutation_epoch) {
         return;
@@ -385,6 +436,23 @@ void tetris_cc_env_reset(tetris_cc_env_handle* handle, uint32_t seed) {
     mark_env_mutated(handle);
 }
 
+int tetris_cc_env_set_mode(tetris_cc_env_handle* handle, int mode) {
+    if (!handle || !valid_env_mode(mode)) {
+        return 0;
+    }
+    handle->env.raw().set_mode(parse_env_mode(mode));
+    mark_env_mutated(handle);
+    return 1;
+}
+
+int tetris_cc_env_get_mode(const tetris_cc_env_handle* handle, int* mode_out) {
+    if (!handle || !mode_out) {
+        return 0;
+    }
+    *mode_out = env_mode_to_c(handle->env.raw().mode());
+    return 1;
+}
+
 int tetris_cc_env_step(tetris_cc_env_handle* handle, int action, float* reward_out) {
     if (!handle) {
         return 1;
@@ -409,6 +477,19 @@ int tetris_cc_env_hold(tetris_cc_env_handle* handle, float* reward_out) {
         *reward_out = result.reward;
     }
     return result.action_succeeded ? 1 : 0;
+}
+
+int tetris_cc_env_apply_incoming_garbage(
+    tetris_cc_env_handle* handle, int lines, int* lines_applied_out, int* top_out_out) {
+    if (!handle) {
+        return 0;
+    }
+    int applied = 0;
+    const bool top_out = handle->env.raw().apply_incoming_garbage(lines, &applied);
+    mark_env_mutated(handle);
+    maybe_set_int(lines_applied_out, applied);
+    maybe_set_int(top_out_out, top_out ? 1 : 0);
+    return 1;
 }
 
 tetris_cc_snapshot_handle* tetris_cc_env_snapshot_create(const tetris_cc_env_handle* handle) {
@@ -439,6 +520,7 @@ size_t tetris_cc_env_observation_size(const tetris_cc_env_handle* handle, int in
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     return tetris_v2::observation_size(
         handle->env.config().queue_size, include_hidden_rows != 0);
 }
@@ -448,6 +530,7 @@ size_t tetris_cc_env_observation_write(
     if (!handle || !out) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto obs = tetris_v2::encode_observation(
         handle->env.state(), handle->env.config().queue_size, include_hidden_rows != 0);
     auto n = std::min(out_len, obs.size());
@@ -460,6 +543,7 @@ size_t tetris_cc_env_board_write(
     if (!handle || !out) {
         return 0;
     }
+    refresh_env_runtime(handle);
     std::optional<tetris_v2::ActivePiece> active{};
     if (include_active != 0) {
         active = handle->env.state().active;
@@ -472,6 +556,7 @@ size_t tetris_cc_env_board_piece_ids_write(
     if (!handle || !out) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto ids = handle->env.visible_board_piece_ids(include_active != 0);
     auto n = std::min(out_len, ids.size());
     std::copy(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(n), out);
@@ -482,6 +567,7 @@ size_t tetris_cc_env_visible_garbage_count(const tetris_cc_env_handle* handle) {
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     constexpr int kRows = tetris_v2::Board::kVisibleRows;
     constexpr int kCols = tetris_v2::Board::kWidth;
     std::size_t count = 0;
@@ -527,17 +613,36 @@ int tetris_cc_env_set_visible_board_mask(
         state.top_out = false;
         state.combo = -1;
         state.back_to_back = false;
+        state.b2b_streak = 0;
+        state.b2b_surge_charge = 0;
         state.total_lines_cleared = 0;
         state.lock_timer = 0;
         state.lock_resets_used = 0;
         state.gravity_accumulator = 0.0f;
         state.spin_eligible = false;
+        state.rotated_this_piece = false;
         state.last_rotate_used_kick = false;
         state.last_rotate_kick_index = -1;
         state.last_clear_spin = false;
         state.last_clear_spin_type = tetris_v2::SpinType::None;
         state.last_clear_difficult = false;
         state.last_clear_b2b_bonus = false;
+        state.last_clear_all_clear = false;
+        state.last_attack_base = 0;
+        state.last_attack_combo_scaled = 0.0f;
+        state.last_attack_rounded = 0;
+        state.last_attack_b2b_bonus = 0;
+        state.last_attack_all_clear_bonus = 0;
+        state.last_attack_surge_charge = 0;
+        state.last_attack_surge_release = 0;
+        state.last_attack_total = 0;
+        state.blitz_score_total = 0;
+        state.blitz_level = 1;
+        state.blitz_lines_to_next =
+            (handle->env.raw().mode() == tetris_v2::GameMode::Scoring) ? 3 : 0;
+        state.blitz_time_remaining_ms =
+            (handle->env.raw().mode() == tetris_v2::GameMode::Scoring) ? 120000 : 0;
+        state.blitz_timed_out = false;
     }
 
     handle->env.restore(state);
@@ -550,6 +655,7 @@ int tetris_cc_env_active_piece(
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     const auto& a = handle->env.state().active;
     maybe_set_int(piece, static_cast<int>(a.piece));
     maybe_set_int(rotation, static_cast<int>(a.rotation));
@@ -563,6 +669,7 @@ int tetris_cc_env_hold_piece(
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     const auto& state = handle->env.state();
     maybe_set_int(has_hold, state.hold.has_value() ? 1 : 0);
     maybe_set_int(
@@ -575,6 +682,7 @@ size_t tetris_cc_env_queue_count(const tetris_cc_env_handle* handle) {
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     return handle->env.state().queue.size();
 }
 
@@ -582,6 +690,7 @@ int tetris_cc_env_queue_get(const tetris_cc_env_handle* handle, size_t index, in
     if (!handle || !piece) {
         return 0;
     }
+    refresh_env_runtime(handle);
     const auto& queue = handle->env.state().queue;
     if (index >= queue.size()) {
         return 0;
@@ -602,6 +711,7 @@ int tetris_cc_env_meta(
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     const auto& state = handle->env.state();
     maybe_set_int(game_over, state.game_over ? 1 : 0);
     maybe_set_int(top_out, state.top_out ? 1 : 0);
@@ -617,6 +727,7 @@ size_t tetris_cc_env_placement_count(const tetris_cc_env_handle* handle) {
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     return handle->env.enumerate_active_piece_placements().size();
 }
 
@@ -625,6 +736,7 @@ int tetris_cc_env_placement_get(
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto option = handle->env.placement_option_at(index);
     if (!option.has_value()) {
         return 0;
@@ -649,6 +761,7 @@ int tetris_cc_env_placement_get_ex(
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto option = handle->env.placement_option_at(index);
     if (!option.has_value()) {
         return 0;
@@ -668,6 +781,7 @@ size_t tetris_cc_env_placement_board_write(
     if (!handle || !out) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto option = handle->env.placement_option_at(index);
     if (!option.has_value()) {
         return 0;
@@ -680,6 +794,7 @@ size_t tetris_cc_env_placement_board_piece_ids_write(
     if (!handle || !out) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto option = handle->env.placement_option_at(index);
     if (!option.has_value()) {
         return 0;
@@ -793,6 +908,7 @@ int tetris_cc_env_last_clear_meta(
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     const auto& state = handle->env.state();
     maybe_set_int(spin_clear, state.last_clear_spin ? 1 : 0);
     maybe_set_int(difficult_clear, state.last_clear_difficult ? 1 : 0);
@@ -804,9 +920,60 @@ int tetris_cc_env_last_clear_spin_type(const tetris_cc_env_handle* handle, int* 
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     maybe_set_int(
         spin_type,
         static_cast<int>(handle->env.state().last_clear_spin_type));
+    return 1;
+}
+
+int tetris_cc_env_last_attack_meta(
+    const tetris_cc_env_handle* handle,
+    int* attack_base,
+    float* attack_combo_scaled,
+    int* attack_rounded,
+    int* attack_b2b_bonus,
+    int* attack_all_clear_bonus,
+    int* attack_total,
+    int* all_clear,
+    int* b2b_streak,
+    int* surge_charge,
+    int* surge_release) {
+    if (!handle) {
+        return 0;
+    }
+    refresh_env_runtime(handle);
+    const auto& state = handle->env.state();
+    maybe_set_int(attack_base, state.last_attack_base);
+    maybe_set_float(attack_combo_scaled, state.last_attack_combo_scaled);
+    maybe_set_int(attack_rounded, state.last_attack_rounded);
+    maybe_set_int(attack_b2b_bonus, state.last_attack_b2b_bonus);
+    maybe_set_int(attack_all_clear_bonus, state.last_attack_all_clear_bonus);
+    maybe_set_int(attack_total, state.last_attack_total);
+    maybe_set_int(all_clear, state.last_clear_all_clear ? 1 : 0);
+    maybe_set_int(b2b_streak, state.b2b_streak);
+    maybe_set_int(surge_charge, state.last_attack_surge_charge);
+    maybe_set_int(surge_release, state.last_attack_surge_release);
+    return 1;
+}
+
+int tetris_cc_env_blitz_meta(
+    const tetris_cc_env_handle* handle,
+    int* score_total,
+    int* level,
+    int* lines_to_next,
+    int* time_remaining_ms,
+    int* timed_out) {
+    if (!handle) {
+        return 0;
+    }
+    refresh_env_runtime(handle);
+    const auto& state = handle->env.state();
+    maybe_set_int(score_total, state.blitz_score_total);
+    maybe_set_int(level, state.blitz_level);
+    maybe_set_int(lines_to_next, state.blitz_lines_to_next);
+    maybe_set_int(time_remaining_ms, state.blitz_time_remaining_ms);
+    maybe_set_int(timed_out, state.blitz_timed_out ? 1 : 0);
     return 1;
 }
 
@@ -814,6 +981,7 @@ size_t tetris_cc_env_rotation_trace_count(const tetris_cc_env_handle* handle, in
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto action = parse_rotate_action(rotate_action);
     if (!action.has_value()) {
         return 0;
@@ -839,6 +1007,7 @@ int tetris_cc_env_rotation_trace_get(
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto action = parse_rotate_action(rotate_action);
     if (!action.has_value()) {
         return 0;
@@ -871,6 +1040,7 @@ int tetris_cc_env_rotation_trace_meta(
     if (!handle) {
         return 0;
     }
+    refresh_env_runtime(handle);
     auto action = parse_rotate_action(rotate_action);
     if (!action.has_value()) {
         return 0;

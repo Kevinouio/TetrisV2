@@ -22,6 +22,36 @@ typedef struct tetris_cc_candidate_row {
     float features[6];
 } tetris_cc_candidate_row;
 
+typedef struct tetris_cc_beam_weights {
+    double holes;
+    double aggregate_height;
+    double max_height;
+    double bumpiness;
+    double rows_cleared;
+    double landing_height;
+    double row_transitions;
+    double column_transitions;
+    double cumulative_wells;
+    double max_well_depth;
+    double hole_depth;
+    double rows_with_holes;
+    double covered_holes;
+    double eroded_cells;
+    double top_out_penalty;
+    double survival_bonus;
+    double combo;
+    double b2b;
+    double perfect_clear;
+    double immediate_score_delta;
+    double immediate_lines_cleared;
+    double immediate_full_tspin;
+    double immediate_mini_tspin;
+    double immediate_difficult_clear;
+    double immediate_b2b_bonus;
+    double immediate_kick_used;
+    double immediate_kick_full;
+} tetris_cc_beam_weights;
+
 /*
  * Clean-rewrite CC API surface (action-step primary).
  * Spin type encoding: 0=None, 1=Mini, 2=Full.
@@ -29,8 +59,12 @@ typedef struct tetris_cc_candidate_row {
 tetris_cc_env_handle* tetris_cc_env_create(uint32_t seed);
 void tetris_cc_env_destroy(tetris_cc_env_handle* handle);
 void tetris_cc_env_reset(tetris_cc_env_handle* handle, uint32_t seed);
+int tetris_cc_env_set_mode(tetris_cc_env_handle* handle, int mode);
+int tetris_cc_env_get_mode(const tetris_cc_env_handle* handle, int* mode_out);
 int tetris_cc_env_step(tetris_cc_env_handle* handle, int action, float* reward_out);
 int tetris_cc_env_hold(tetris_cc_env_handle* handle, float* reward_out);
+int tetris_cc_env_apply_incoming_garbage(
+    tetris_cc_env_handle* handle, int lines, int* lines_applied_out, int* top_out_out);
 
 tetris_cc_snapshot_handle* tetris_cc_env_snapshot_create(const tetris_cc_env_handle* handle);
 void tetris_cc_snapshot_destroy(tetris_cc_snapshot_handle* snapshot);
@@ -103,6 +137,28 @@ int tetris_cc_env_last_clear_meta(
     int* difficult_clear,
     int* b2b_bonus_applied);
 int tetris_cc_env_last_clear_spin_type(const tetris_cc_env_handle* handle, int* spin_type);
+int tetris_cc_env_last_attack_meta(
+    const tetris_cc_env_handle* handle,
+    int* attack_base,
+    float* attack_combo_scaled,
+    int* attack_rounded,
+    int* attack_b2b_bonus,
+    int* attack_all_clear_bonus,
+    int* attack_total,
+    int* all_clear,
+    int* b2b_streak,
+    int* surge_charge,
+    int* surge_release);
+int tetris_cc_env_blitz_meta(
+    const tetris_cc_env_handle* handle,
+    int* score_total,
+    int* level,
+    int* lines_to_next,
+    int* time_remaining_ms,
+    int* timed_out);
+int tetris_cc_env_set_blitz_time_limit_ms(tetris_cc_env_handle* handle, int time_limit_ms);
+int tetris_cc_env_get_blitz_time_limit_ms(
+    const tetris_cc_env_handle* handle, int* time_limit_ms_out);
 
 size_t tetris_cc_env_rotation_trace_count(const tetris_cc_env_handle* handle, int rotate_action);
 int tetris_cc_env_rotation_trace_get(
@@ -126,6 +182,13 @@ int tetris_cc_env_rotation_trace_meta(
     int* final_x,
     int* final_y,
     int* final_rotation);
+
+enum {
+    TETRIS_CC_MODE_LEGACY = 0,
+    TETRIS_CC_MODE_ZEN = 1,
+    TETRIS_CC_MODE_SCORING = 2,
+    TETRIS_CC_MODE_VERSUS = 3,
+};
 
 enum {
     TETRIS_CC_BOT_BACKEND_COLD_CLEAR = 0,
@@ -154,6 +217,10 @@ int tetris_cc_bot_set_beam_config(
     int use_transposition_table,
     int collect_debug_info,
     uint64_t max_nodes);
+int tetris_cc_bot_set_beam_weights(
+    tetris_cc_bot_handle* bot, const tetris_cc_beam_weights* weights);
+int tetris_cc_bot_get_beam_weights(
+    const tetris_cc_bot_handle* bot, tetris_cc_beam_weights* weights_out);
 int tetris_cc_bot_sync_from_env(tetris_cc_bot_handle* bot, const tetris_cc_env_handle* env);
 int tetris_cc_bot_choose(
     tetris_cc_bot_handle* bot,
