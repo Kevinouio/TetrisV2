@@ -3,17 +3,36 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tetris-version-one"
-version = "0.1.0"
-description = "Stable baseline: Tetris environments + PPO agent"
-authors = [{name="Your Name"}]
-requires-python = ">=3.9"
+name = "tetris-v2"
+version = "0.2.0"
+description = "C++ Tetris runtime with masked-placement PPO and DQN training"
+readme = "README.md"
+requires-python = ">=3.10"
 dependencies = [
-    "gymnasium>=0.29.1",
-    "numpy",
-    "pygame",
+    "gymnasium>=1.1",
+    "numpy>=1.24",
+    "pygame>=2.5",
+    "torch>=2.1",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+tetris-eval = "scripts.eval_rl:main"
+tetris-generate-expert-data = "scripts.generate_expert_dataset:main"
+tetris-play-bot = "scripts.play_cold_clear:main"
+tetris-play-human = "scripts.play_human:main"
+tetris-play-rl = "scripts.play_rl_pygame:main"
+tetris-play-rl-cli = "scripts.play_rl_cli:main"
+tetris-pretrain-dqn = "scripts.pretrain_rl_dqn_expert:main"
+tetris-train-dqn = "tetris_v2.rl.dqn.train:main"
+tetris-train-dqn-hybrid = "scripts.train_rl_dqn_hybrid:main"
+tetris-train-ppo = "tetris_v2.rl.ppo.train:main"
 
 [tool.setuptools.packages.find]
 where = [""]
-include = ["TetrisVersionOne*", "TetrisVersionTwo*"]
+include = ["tetris_v2*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

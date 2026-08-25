@@ -1,25 +1,18 @@
-# Bytecode and cache
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
-
-
-# Virtual environments
 .venv/
 venv/
-
-
-# IDE settings
-.vscode/
-.idea/
-.json
-# Test & tooling artifacts
+*.egg-info/
+dist/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 coverage*
 
-# C/C++ builds
-build/
+# C/C++
+/build*/
+/Testing/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -30,10 +23,12 @@ CMakeFiles/
 *.dll
 *.exe
 compile_commands.json
-cold-clear/
-cold-clear-2/
+
+# Local references and generated data
+/.local/
+/runs/
+
 # Experiment outputs
-runs/
 videos/
 wandb/
 checkpoints/
@@ -48,6 +43,8 @@ checkpoints/
 *.mp4
 *.pdf
 
-# Misc
+# Editors and OS files
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
