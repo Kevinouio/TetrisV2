@@ -1,80 +1,122 @@
-# TetrisV2 Workspace
+# TetrisV2
 
-This repo now contains two tracks:
-- **Version One (Python)** — NES and modern SRS environments with PPO training (`TetrisVersionOne/`), plus scripts/tests/presets.
-- **Version Two (C++/Rust interop)** — A cold-clear-compatible environment (`TetrisVersionTwo/`) with a C++ port of Cold Clear 2 (`cold_clear_cpp`) and a pygame viewer.
+TetrisV2 is a C++ Tetris runtime with a Python reinforcement-learning stack.
+The runtime owns all game rules and exposes a small C API; the Python package
+uses that API for masked-placement PPO and DQN training, evaluation, expert
+data generation, and playback.
 
-## Project Site
+![Cold Clear bot playing Tetris](docs/assets/cold-clear.gif)
 
-- GitHub Pages devlog: https://kevinouio.github.io/TetrisV2/
-- Source content: `docs/` in this repository
+## Setup
 
-## Version Two (Cold Clear)
-- C++ core: `TetrisVersionTwo/cold_clear_cpp` mirrors the Rust reference (`cold-clear-2/`).
-- Environment/wrapper: `TetrisVersionTwo/include/tetris_v2/`, `TetrisVersionTwo/src/`.
-- CLI viewer: `TetrisVersionTwo/cli/cc_play.cpp` (outputs JSON; now includes a `ghost` overlay of the chosen move).
-- Pygame viewer: `TetrisVersionTwo/scripts/play_pygame.py` renders the board, queue/hold, and ghost outline.
+Build the native runtime from the repository root:
 
-### Build
 ```bash
-cmake -S . -B build
-cmake --build build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
-### Run Cold Clear in CLI/pygame
+Install the Python package and test tools:
+
 ```bash
-# CLI (prints JSON or text)
-build/TetrisVersionTwo/cc_play --steps 200 --delay-ms 120 --json
-
-# Pygame viewer (expects cc_play at build/TetrisVersionTwo/cc_play)
-python TetrisVersionTwo/scripts/play_pygame.py --steps 500 --delay-ms 80
-```
-Notes:
-- The bot considers the full visible queue (8 by default) and speculates with the 7‑bag. Increase search time by raising the iteration count in `cc_play` (argument to `choose_move`).
-- Default heuristics live in `cold_clear_cpp/include/cold_clear_cpp/eval.hpp` (C++) and `cold-clear-2/src/default.json` (Rust). Adjust these to trade off survival vs. T‑spins.
-- Combo tracking bug is fixed; soft-drop distance is included in the eval reward.
-
-### Demo (Cold Clear playing to survive)
-Default survival-oriented eval (human-set weights; not tuned for score chasing):
-<a href="Recordings/ColdClear.gif">
-
-
-  <img src="Recordings/ColdClear.gif" width="360" alt="Cold Clear survival loop">
-</a>
-
-### Logging for imitation
-To collect demonstrations from Cold Clear, tap into `cc_play` to emit per-move state/action JSONL (board, hold, queue, bag, chosen `Placement`). A future `scripts/` helper can batch games over seeds to produce a dataset.
-
-## Version One (Python/PPO)
-- Envs: `TetrisVersionOne/env/` (NES + modern SRS with ghost/hold/kicks).
-- Agent: `TetrisVersionOne/agents/ppo/`.
-- Scripts: `TetrisVersionOne/scripts/` (`train`, `eval`, `play_human`).
-- Tests: `TetrisVersionOne/tests/`.
-
-### Install (Python toolchain)
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
+python -m pytest -q
 ```
 
-### Quick starts
+The Python binding discovers the native library in `build/`, including the
+usual `Debug` and `Release` subdirectories on multi-config platforms. Commands
+that open the runtime also accept `--lib PATH`; `TETRIS_V2_LIBRARY` provides
+the same override for tests and automation. The Python package does not bundle
+a platform-specific native library, so build the C++ target before using it.
+
+## Train, evaluate, and play
+
+The reliable training path is expert warm-start, DAgger data collection, then
+short hybrid DQN fine-tuning. The complete commands and checkpoint-selection
+procedure are in [docs/TRAINING.md](docs/TRAINING.md).
+
+To evaluate the proven checkpoint already produced in this workspace:
+
 ```bash
-# Human play (modern)
-python -m TetrisVersionOne.scripts.play_human --env modern --fps 60
-
-# Train PPO (modern)
-python -m TetrisVersionOne.scripts.train --env modern \
-  --total-timesteps 1500000 --num-envs 8 --log-dir runs/ppo_modern_v1
-
-# Eval PPO
-python -m TetrisVersionOne.scripts.eval runs/ppo_modern_v1/final_model.pt \
-  --env modern --render
+tetris-eval runs/v3_hybrid_finetune/dqn_hybrid_final.pt \
+  --algo dqn \
+  --episodes 100 \
+  --seed 70000 \
+  --max-steps 150 \
+  --min-placements 101 \
+  --min-lines 20
 ```
 
-## Roadmap
-- Collect Cold Clear trajectories for imitation learning.
-- Flow-based / RL fine-tuning on top of the learned policy.
-- Tighten integration between Python envs and the C++/Rust Cold Clear core.
+Watch it in a window or terminal:
+
+```bash
+tetris-play-rl runs/v3_hybrid_finetune/dqn_hybrid_final.pt --algo dqn
+tetris-play-rl-cli runs/v3_hybrid_finetune/dqn_hybrid_final.pt \
+  --algo dqn --render-board
+```
+
+PPO and DQN-from-scratch remain available for experiments:
+
+```bash
+tetris-train-ppo --total-timesteps 500000 --log-dir runs/ppo
+tetris-train-dqn --total-timesteps 500000 --log-dir runs/dqn
+```
+
+The strict quality result in this workspace applies to the hybrid DQN path;
+train new PPO or unassisted DQN checkpoints before treating them as playable.
+
+For manual play or bot autoplay:
+
+```bash
+tetris-play-human
+tetris-play-bot --think-ms 20 --auto-reset
+```
+
+All console commands can also be run as modules from a source checkout, for
+example `python -m scripts.eval_rl --help`.
+
+## RL contract
+
+- The C++ `tetris_cc_*` API is the single source of truth for state, actions,
+  rewards, and termination.
+- Each observation has 254 bounded features: the visible board, active piece,
+  hold piece, five-piece preview, hold availability, combo, and back-to-back
+  state.
+- A policy chooses among 3,200 stable physical decisions encoded as
+  `(use_hold, rotation, landing_y, x)`. One decision optionally holds and then
+  locks exactly one piece.
+- `info["action_mask"]` identifies legal actions after every reset and step.
+  PPO, DQN, evaluation, and playback all apply it before selecting an action.
+- The default training reward combines normalized game score, board-quality
+  change, survival, and a top-out penalty. The unshaped C++ score remains in
+  `info["raw_reward"]`.
+- Checkpoints and datasets using the former eight-action or
+  451-feature/97-action schemas are intentionally incompatible with the
+  current environment.
+
+## Repository layout
+
+```text
+apps/              C++ command-line applications
+include/tetris_v2/ Public C++ and C headers
+src/               Tetris runtime, planner, bot, and C API
+tetris_v2/rl/      Gymnasium environment and PPO/DQN implementations
+scripts/           Training, evaluation, data, and playback entry points
+tests/cpp/         Native runtime and C API tests
+tests/python/      Binding and RL pipeline tests
+tests/data/        Source fixtures for native tests
+tests/tools/       Fixture-generation utilities
+```
+
+Generated builds, runs, checkpoints, datasets, and local references are ignored
+by Git. The removed Version One implementation remains available in repository
+history rather than in the active source tree.
 
 ## License
-See `LICENSE`.
+
+Project code is licensed under [`LICENSE`](LICENSE). The planner includes an
+adaptation of Cold Clear 2; attribution and its selected MIT license are in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

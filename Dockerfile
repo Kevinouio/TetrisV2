@@ -16,10 +16,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+ENV TETRIS_V2_LIBRARY=/app/build/libtetris_v2_c_api.so
 COPY . /app
 
-RUN cmake -S . -B build \
-    && cmake --build build \
-    && python3 -m pip install --no-cache-dir pygame
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --parallel \
+    && ctest --test-dir build --output-on-failure \
+    && python3 -m pip install --no-cache-dir .
 
 CMD ["bash"]
