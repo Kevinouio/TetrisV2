@@ -1,4 +1,4 @@
-"""Generate top-1 expert placement labels for TetrisV2."""
+"""Generate top-1 expert labels and complete TetrisV2 transitions."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from tetris_v2.rl.policy import load_policy
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate top-1 expert dataset shards for DQN.")
+    parser = argparse.ArgumentParser(description="Generate schema-v3 expert transition shards.")
     parser.add_argument("--output-dir", type=Path, default=Path("runs/expert_dataset"))
     parser.add_argument("--episodes", type=int, default=200)
     parser.add_argument("--max-steps", type=int, default=4000)
@@ -23,10 +23,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--random-action-prob", type=float, default=0.15)
     parser.add_argument("--behavior-checkpoint", type=Path, default=None)
     parser.add_argument(
+        "--behavior-algo",
+        choices=("dqn", "ppo", "flow_dqn"),
+        default="dqn",
+        help="Algorithm used by --behavior-checkpoint for DAgger state collection.",
+    )
+    parser.add_argument(
         "--teacher-action-prob",
         type=float,
         default=0.1,
-        help="With --behavior-checkpoint, execute the teacher this fraction of the time.",
+        help="With a behavior checkpoint, execute the teacher this fraction of the time.",
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--shard-size", type=int, default=4096)
@@ -93,7 +99,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     env = CCTetrisEnv(seed=args.seed, max_steps=args.max_steps, lib_path=args.lib)
     print(f"[expert dataset] using library: {env.runtime.lib._name}")
     behavior = (
-        load_policy("dqn", args.behavior_checkpoint, device=args.device)
+        load_policy(args.behavior_algo, args.behavior_checkpoint, device=args.device)
         if args.behavior_checkpoint is not None
         else None
     )
@@ -149,9 +155,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     teacher_action_prob=float(args.teacher_action_prob),
                 )
 
+                current_obs = np.asarray(obs, dtype=np.float32)
+                obs, reward, terminated, truncated, info = env.step(action)
                 records.append(
                     {
-                        "obs": np.asarray(obs, dtype=np.float32),
+                        "obs": current_obs,
                         "action_mask": np.asarray(label["action_mask"], dtype=np.uint8),
                         "teacher_best_action": teacher_action,
                         "seed": int(args.seed + ep),
@@ -164,10 +172,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                         "think_ms": float(label["think_ms"]),
                         "budget_miss": int(label["budget_miss"]),
                         "unexpanded_count": int(label["unexpanded_count"]),
+                        "executed_action": int(action),
+                        "reward": float(reward),
+                        "raw_reward": float(info.get("raw_reward", reward)),
+                        "next_obs": np.asarray(obs, dtype=np.float32),
+                        "next_action_mask": np.asarray(info["action_mask"], dtype=np.uint8),
+                        "terminated": bool(terminated),
+                        "truncated": bool(truncated),
                     }
                 )
-
-                obs, _, terminated, truncated, info = env.step(action)
                 step += 1
 
                 if len(records) >= args.shard_size:
@@ -179,17 +192,32 @@ def main(argv: Optional[list[str]] = None) -> int:
         env.close()
 
     flush_shard()
-    write_manifest(args.output_dir / "manifest.json", shards=shard_paths, total_samples=total)
+    write_manifest(
+        args.output_dir / "manifest.json",
+        shards=shard_paths,
+        total_samples=total,
+        version=3,
+    )
     summary = {
+        "schema_version": 3,
         "episodes": int(args.episodes),
         "samples": int(total),
         "shards": [p.name for p in shard_paths],
         "label_mode": "top1",
         "think_ms": int(args.think_ms),
+        "max_steps": int(args.max_steps),
+        "random_action_prob": float(args.random_action_prob),
+        "teacher_action_prob": (
+            float(args.teacher_action_prob) if args.behavior_checkpoint is not None else None
+        ),
+        "shard_size": int(args.shard_size),
         "seed": int(args.seed),
+        "device": args.device,
+        "library": str(env.runtime.lib._name),
         "behavior_checkpoint": (
             str(args.behavior_checkpoint) if args.behavior_checkpoint is not None else None
         ),
+        "behavior_algo": args.behavior_algo if args.behavior_checkpoint is not None else None,
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Wrote {total} expert samples to {args.output_dir}")

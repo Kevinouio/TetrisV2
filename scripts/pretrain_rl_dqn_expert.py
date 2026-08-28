@@ -33,8 +33,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    args = parse_args(argv)
+def run(args: argparse.Namespace) -> int:
     if args.updates <= 0:
         raise SystemExit("--updates must be >= 1")
     if args.batch_size <= 0:
@@ -148,6 +147,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     print(f"Saved expert pretrain checkpoint to {final_path}")
     return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    return run(parse_args(argv))
 
 
 if __name__ == "__main__":

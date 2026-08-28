@@ -1,0 +1,36 @@
+name: ppo
+args:
+  total_timesteps: 1000000
+  num_envs: 8
+  n_steps: 1024
+  minibatch_size: 1024
+  update_epochs: 4
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  value_clip_range: 0.2
+  target_kl: 0.03
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  hidden_sizes: [512, 256]
+  network_type: auto
+  lr_anneal: true
+  expert_dataset_dir: null
+  extra_expert_dataset_dir: []
+  expert_batch_size: 512
+  bc_coef_start: 1.0
+  bc_coef_end: 0.1
+  bc_anneal_timesteps: 1000000
+  init_checkpoint: null
+  resume_checkpoint: null
+  seed: 123
+  device: null
+  max_steps: 4000
+  log_interval: 10000
+  eval_frequency: 50000
+  eval_episodes: 5
+  checkpoint_frequency: 250000
+  log_dir: ${paths.runs_dir}/ppo
+  lib: null

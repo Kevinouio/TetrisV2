@@ -1,0 +1,33 @@
+# @package _global_
+defaults:
+  - override /trainer: dqn_hybrid
+
+preset:
+  name: dqn_hybrid
+  trainer: dqn_hybrid
+
+trainer:
+  args:
+    offline_dataset_dir: ${paths.dqn_dagger_dataset}
+    init_checkpoint: ${paths.runs_dir}/dqn_dagger_1/dqn_expert_pretrain_step_12000.pt
+    total_timesteps: 10000
+    buffer_size: 20000
+    warmup_steps: 512
+    batch_size: 128
+    train_frequency: 4
+    learning_rate: 0.0001
+    epsilon_start: 0.02
+    epsilon_end: 0.01
+    epsilon_decay_steps: 10000
+    max_steps: 300
+    expert_think_ms: 1
+    online_expert_interval: 1
+    lambda_bc_start: 1.0
+    lambda_bc_end: 1.0
+    lambda_pair_start: 0.0
+    lambda_pair_end: 0.0
+    pairs_per_sample: 0
+    checkpoint_frequency: 2500
+    eval_frequency: 2500
+    eval_episodes: 10
+    log_dir: ${paths.runs_dir}/dqn_hybrid

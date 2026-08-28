@@ -1,4 +1,4 @@
-"""Pygame playback for TetrisV2 PPO and DQN checkpoints."""
+"""Pygame playback for TetrisV2 RL checkpoints."""
 
 from __future__ import annotations
 
@@ -39,14 +39,19 @@ PIECE_COLORS = {
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play a TetrisV2 RL policy in pygame.")
     parser.add_argument("checkpoint", type=Path, help="Checkpoint path (.pt)")
-    parser.add_argument("--algo", choices=("ppo", "dqn"), required=True)
+    parser.add_argument("--algo", choices=("ppo", "dqn", "flow_dqn"), required=True)
     parser.add_argument("--lib", type=Path, default=None, help="Path to tetris_v2_c_api shared library.")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--cell", type=int, default=28)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--max-steps", type=int, default=4000)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--temperature", type=float, default=1.0, help="PPO only")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="PPO sampling temperature or Flow-DQN Gaussian-latent scale.",
+    )
     parser.add_argument("--epsilon", type=float, default=0.0, help="Exploration rate when --stochastic")
     parser.add_argument(
         "--deterministic",
@@ -95,6 +100,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         env.close()
         raise SystemExit(
             f"Checkpoint action_dim={policy.action_dim} incompatible with RL action space={env.action_space.n}."
+        )
+    env_obs_dim = int(np.prod(env.observation_space.shape))
+    if policy.obs_dim != env_obs_dim:
+        env.close()
+        raise SystemExit(
+            f"Checkpoint obs_dim={policy.obs_dim} incompatible with RL observation size={env_obs_dim}."
         )
 
     obs, info = env.reset(seed=args.seed)

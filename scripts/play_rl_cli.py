@@ -1,4 +1,4 @@
-"""CLI playback for TetrisV2 PPO and DQN checkpoints."""
+"""CLI playback for TetrisV2 RL checkpoints."""
 
 from __future__ import annotations
 
@@ -15,12 +15,17 @@ from tetris_v2.rl.policy import load_policy
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play a TetrisV2 RL policy in CLI mode.")
     parser.add_argument("checkpoint", type=Path, help="Checkpoint path (.pt)")
-    parser.add_argument("--algo", choices=("ppo", "dqn"), required=True)
+    parser.add_argument("--algo", choices=("ppo", "dqn", "flow_dqn"), required=True)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=4000)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--temperature", type=float, default=1.0, help="PPO only")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="PPO sampling temperature or Flow-DQN Gaussian-latent scale.",
+    )
     parser.add_argument("--epsilon", type=float, default=0.0, help="Exploration rate when --stochastic")
     parser.add_argument(
         "--deterministic",
@@ -47,8 +52,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     env = CCTetrisEnv(seed=args.seed, max_steps=args.max_steps, lib_path=args.lib)
 
     if policy.action_dim != int(env.action_space.n):
+        env.close()
         raise SystemExit(
             f"Checkpoint action_dim={policy.action_dim} incompatible with env action space={env.action_space.n}."
+        )
+    env_obs_dim = int(np.prod(env.observation_space.shape))
+    if policy.obs_dim != env_obs_dim:
+        env.close()
+        raise SystemExit(
+            f"Checkpoint obs_dim={policy.obs_dim} incompatible with env observation size={env_obs_dim}."
         )
 
     try:

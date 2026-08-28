@@ -17,6 +17,7 @@ class EpisodeMetrics:
     episode_return: float
     topout: bool
     truncated: bool
+    illegal_actions: int = 0
 
     def to_dict(self) -> dict[str, int | float | bool]:
         return {
@@ -27,6 +28,7 @@ class EpisodeMetrics:
             "return": self.episode_return,
             "topout": self.topout,
             "truncated": self.truncated,
+            "illegal_actions": self.illegal_actions,
         }
 
 
@@ -51,6 +53,7 @@ def summarize_episodes(episodes: Sequence[EpisodeMetrics]) -> dict[str, object]:
         "mean_return": float(np.mean([episode.episode_return for episode in episodes])),
         "topout_rate": float(np.mean([episode.topout for episode in episodes])),
         "truncation_rate": float(np.mean([episode.truncated for episode in episodes])),
+        "illegal_actions": int(sum(episode.illegal_actions for episode in episodes)),
     }
 
 
@@ -65,12 +68,14 @@ def evaluate_gate(
         for episode in episodes
         if (min_placements is not None and episode.placements < min_placements)
         or (min_lines is not None and episode.lines < min_lines)
+        or episode.illegal_actions > 0
     ]
     return {
-        "enabled": min_placements is not None or min_lines is not None,
+        "enabled": min_placements is not None or min_lines is not None or bool(failed_episodes),
         "passed": not failed_episodes,
         "min_placements": min_placements,
         "min_lines": min_lines,
+        "max_illegal_actions": 0,
         "failed_episodes": failed_episodes,
     }
 

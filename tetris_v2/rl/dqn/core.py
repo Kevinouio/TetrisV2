@@ -10,6 +10,13 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from tetris_v2.rl.actions import (
+    BOARD_ROWS,
+    BOARD_WIDTH,
+    PLACEMENT_ACTION_DIM,
+    PLACEMENT_CHANNELS,
+)
+
 
 class PlacementConvNet(nn.Module):
     """Board-aware Q-map over (hold, rotation, landing row, column)."""
@@ -21,10 +28,12 @@ class PlacementConvNet(nn.Module):
         self.board_global = nn.Linear(200, channels)
         self.context = nn.Linear(54, channels)
         self.refine = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.output = nn.Conv2d(channels, 8, kernel_size=1)
+        self.output = nn.Conv2d(channels, PLACEMENT_CHANNELS, kernel_size=1)
 
-        y = torch.linspace(0.0, 1.0, 40).view(1, 1, 40, 1).expand(1, 1, 40, 10)
-        x = torch.linspace(0.0, 1.0, 10).view(1, 1, 1, 10).expand(1, 1, 40, 10)
+        y = torch.linspace(0.0, 1.0, BOARD_ROWS).view(1, 1, BOARD_ROWS, 1)
+        x = torch.linspace(0.0, 1.0, BOARD_WIDTH).view(1, 1, 1, BOARD_WIDTH)
+        y = y.expand(1, 1, BOARD_ROWS, BOARD_WIDTH).clone()
+        x = x.expand(1, 1, BOARD_ROWS, BOARD_WIDTH).clone()
         self.register_buffer("y_coord", y)
         self.register_buffer("x_coord", x)
 
@@ -37,8 +46,8 @@ class PlacementConvNet(nn.Module):
     def forward(self, x: Tensor) -> Tensor:  # type: ignore[override]
         batch = x.shape[0]
         board_flat = x[:, :200]
-        board = board_flat.reshape(batch, 1, 20, 10)
-        board = F.pad(board, (0, 0, 0, 20))
+        board = board_flat.reshape(batch, 1, 20, BOARD_WIDTH)
+        board = F.pad(board, (0, 0, 0, BOARD_ROWS - 20))
         spatial = torch.cat(
             [board, self.y_coord.expand(batch, -1, -1, -1), self.x_coord.expand(batch, -1, -1, -1)],
             dim=1,
@@ -46,7 +55,7 @@ class PlacementConvNet(nn.Module):
         conditioning = self.board_global(board_flat) + self.context(x[:, 200:254])
         features = F.relu(self.board_conv(spatial) + conditioning[:, :, None, None])
         features = F.relu(features + self.refine(features))
-        return self.output(features).reshape(batch, 3200)
+        return self.output(features).reshape(batch, PLACEMENT_ACTION_DIM)
 
 
 class QNetwork(nn.Module):

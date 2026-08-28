@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - override /trainer: ppo_pretrain
+
+preset:
+  name: ppo_pretrain
+  trainer: ppo_pretrain
+
+trainer:
+  args:
+    dataset_dir: ${paths.expert_dataset}
+    updates: 20000
+    batch_size: 512
+    checkpoint_frequency: 5000
+    log_dir: ${paths.runs_dir}/ppo_pretrain

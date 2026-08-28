@@ -66,8 +66,7 @@ def evaluate(agent: DQNAgent, *, episodes: int, seed: int, max_steps: int, lib_p
     return float(np.mean(returns)) if returns else 0.0
 
 
-def main(argv: Optional[list[str]] = None) -> int:
-    args = parse_args(argv)
+def run(args: argparse.Namespace) -> int:
     if args.batch_size <= 0:
         raise SystemExit("--batch-size must be >= 1")
     if args.buffer_size <= 0:
@@ -195,6 +194,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     print(f"Saved DQN checkpoint to {final_path}")
     return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    return run(parse_args(argv))
 
 
 if __name__ == "__main__":

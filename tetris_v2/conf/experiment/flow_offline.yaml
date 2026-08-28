@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - override /trainer: flow_dqn
+
+preset:
+  name: flow_offline
+  trainer: flow_dqn
+
+trainer:
+  args:
+    offline_dataset_dir: ${paths.expert_dataset}
+    offline_updates: 200000
+    online_timesteps: 0
+    distill_q_coef: 3.0
+    q_guidance_coef: 1.0
+    flow_t0_ce_coef: 1.0
+    actor_bc_coef: 1.0
+    action_logit_scale: 10.0
+    normalized_q: true
+    checkpoint_frequency: 25000
+    log_dir: ${paths.runs_dir}/flow_dqn_offline

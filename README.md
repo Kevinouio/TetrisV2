@@ -2,8 +2,8 @@
 
 TetrisV2 is a C++ Tetris runtime with a Python reinforcement-learning stack.
 The runtime owns all game rules and exposes a small C API; the Python package
-uses that API for masked-placement PPO and DQN training, evaluation, expert
-data generation, and playback.
+uses that API for masked-placement PPO, DQN, and discrete Flow-DQN training,
+evaluation, expert data generation, and playback.
 
 ![Cold Clear bot playing Tetris](docs/assets/cold-clear.gif)
 
@@ -34,9 +34,21 @@ a platform-specific native library, so build the C++ target before using it.
 
 ## Train, evaluate, and play
 
-The reliable training path is expert warm-start, DAgger data collection, then
-short hybrid DQN fine-tuning. The complete commands and checkpoint-selection
-procedure are in [docs/TRAINING.md](docs/TRAINING.md).
+The reliable training pattern is expert warm-start, DAgger data collection,
+then online fine-tuning. The complete DQN, structured PPO, and Flow-DQN
+commands are in [docs/TRAINING.md](docs/TRAINING.md).
+
+Reusable Hydra presets keep the full experiment arguments in YAML. For
+example, the validated Flow-DQN schedule is launched with:
+
+```bash
+tetris-train experiment=flow_offline runtime=cuda
+tetris-train experiment=flow_online runtime=cuda
+```
+
+Use `dry_run=true` to print the resolved trainer configuration without starting
+a run, or override an individual setting with Hydra syntax such as
+`trainer.args.batch_size=128`.
 
 To evaluate the proven checkpoint already produced in this workspace:
 
@@ -58,15 +70,18 @@ tetris-play-rl-cli runs/v3_hybrid_finetune/dqn_hybrid_final.pt \
   --algo dqn --render-board
 ```
 
-PPO and DQN-from-scratch remain available for experiments:
+PPO, DQN, and Flow-DQN can also train without expert data:
 
 ```bash
 tetris-train-ppo --total-timesteps 500000 --log-dir runs/ppo
 tetris-train-dqn --total-timesteps 500000 --log-dir runs/dqn
+tetris-train-flow-dqn --online-timesteps 500000 --log-dir runs/flow_dqn
 ```
 
-The strict quality result in this workspace applies to the hybrid DQN path;
-train new PPO or unassisted DQN checkpoints before treating them as playable.
+Flow-DQN is a full `8 x 40 x 10` masked-action PyTorch adaptation inspired by
+[Flow Q-Learning](https://arxiv.org/abs/2502.02538), whose original algorithm
+uses continuous actions. It is intentionally documented as a Tetris-specific
+discrete adaptation rather than a literal FQL implementation.
 
 For manual play or bot autoplay:
 
@@ -89,7 +104,8 @@ example `python -m scripts.eval_rl --help`.
   `(use_hold, rotation, landing_y, x)`. One decision optionally holds and then
   locks exactly one piece.
 - `info["action_mask"]` identifies legal actions after every reset and step.
-  PPO, DQN, evaluation, and playback all apply it before selecting an action.
+  PPO, DQN, Flow-DQN, evaluation, and playback all apply it before selecting
+  an action.
 - The default training reward combines normalized game score, board-quality
   change, survival, and a top-out penalty. The unshaped C++ score remains in
   `info["raw_reward"]`.
@@ -103,7 +119,8 @@ example `python -m scripts.eval_rl --help`.
 apps/              C++ command-line applications
 include/tetris_v2/ Public C++ and C headers
 src/               Tetris runtime, planner, bot, and C API
-tetris_v2/rl/      Gymnasium environment and PPO/DQN implementations
+tetris_v2/conf/    Packaged Hydra trainer and experiment presets
+tetris_v2/rl/      Gymnasium environment and PPO/DQN/Flow-DQN implementations
 scripts/           Training, evaluation, data, and playback entry points
 tests/cpp/         Native runtime and C API tests
 tests/python/      Binding and RL pipeline tests
@@ -117,6 +134,6 @@ history rather than in the active source tree.
 
 ## License
 
-Project code is licensed under [`LICENSE`](LICENSE). The planner includes an
-adaptation of Cold Clear 2; attribution and its selected MIT license are in
+Project code is licensed under [`LICENSE`](LICENSE). Cold Clear attribution,
+its selected MIT license, and the Flow Q-Learning research attribution are in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

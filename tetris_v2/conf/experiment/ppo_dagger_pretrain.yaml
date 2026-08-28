@@ -1,0 +1,19 @@
+# @package _global_
+defaults:
+  - override /trainer: ppo_pretrain
+
+preset:
+  name: ppo_dagger_pretrain
+  trainer: ppo_pretrain
+
+trainer:
+  args:
+    dataset_dir: ${paths.expert_dataset}
+    extra_dataset_dir:
+      - ${paths.ppo_dagger_dataset}
+      - ${paths.ppo_dagger_dataset}
+    init_checkpoint: ${paths.runs_dir}/ppo_pretrain/ppo_expert_pretrain.pt
+    updates: 15000
+    batch_size: 512
+    checkpoint_frequency: 3000
+    log_dir: ${paths.runs_dir}/ppo_dagger_pretrain

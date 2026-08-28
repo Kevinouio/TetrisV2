@@ -1,0 +1,23 @@
+defaults:
+  - trainer: flow_dqn
+  - runtime: auto
+  - experiment: ???
+  - _self_
+
+paths:
+  runs_dir: runs
+  expert_dataset: ${paths.runs_dir}/v4_expert_transitions
+  dqn_dagger_dataset: ${paths.runs_dir}/dagger_1
+  ppo_dagger_dataset: ${paths.runs_dir}/ppo_dagger_1
+
+dry_run: false
+
+hydra:
+  job:
+    chdir: false
+    name: tetris-train
+  run:
+    dir: ${paths.runs_dir}/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ${paths.runs_dir}/hydra/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

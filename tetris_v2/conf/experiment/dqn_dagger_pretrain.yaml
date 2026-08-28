@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - override /trainer: dqn_pretrain
+
+preset:
+  name: dqn_dagger_pretrain
+  trainer: dqn_pretrain
+
+trainer:
+  args:
+    dataset_dir: ${paths.expert_dataset}
+    extra_dataset_dir:
+      - ${paths.dqn_dagger_dataset}
+      - ${paths.dqn_dagger_dataset}
+    init_checkpoint: ${paths.runs_dir}/dqn_pretrain/dqn_expert_pretrain.pt
+    updates: 15000
+    batch_size: 256
+    learning_rate: 0.001
+    checkpoint_frequency: 3000
+    log_dir: ${paths.runs_dir}/dqn_dagger_1

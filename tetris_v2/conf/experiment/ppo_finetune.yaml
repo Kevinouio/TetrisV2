@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - override /trainer: ppo
+
+preset:
+  name: ppo_finetune
+  trainer: ppo
+
+trainer:
+  args:
+    init_checkpoint: ${paths.runs_dir}/ppo_dagger_pretrain/ppo_expert_pretrain.pt
+    expert_dataset_dir: ${paths.expert_dataset}
+    extra_expert_dataset_dir:
+      - ${paths.ppo_dagger_dataset}
+      - ${paths.ppo_dagger_dataset}
+    total_timesteps: 1000000
+    num_envs: 8
+    n_steps: 1024
+    minibatch_size: 1024
+    update_epochs: 4
+    bc_coef_start: 1.0
+    bc_coef_end: 0.1
+    bc_anneal_timesteps: 1000000
+    max_steps: 300
+    seed: 300000
+    log_dir: ${paths.runs_dir}/ppo_finetune

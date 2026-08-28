@@ -10,3 +10,11 @@ repository's runtime and C API.
 Cold Clear 2 is offered under MIT or Apache-2.0 at the user's option. This
 repository uses it under the MIT option; see
 [`licenses/COLD_CLEAR_2_MIT.txt`](licenses/COLD_CLEAR_2_MIT.txt).
+
+The discrete Flow-DQN design in `tetris_v2/rl/flow_dqn/` is inspired by
+[Flow Q-Learning](https://arxiv.org/abs/2502.02538) by Seohong Park, Qiyang Li,
+and Sergey Levine. Its full placement-map policy is an independent PyTorch
+adaptation for TetrisV2's masked discrete action space, rather than a literal
+implementation of the paper's continuous-action algorithm. The authors'
+[official FQL implementation](https://github.com/seohongpark/fql) is available
+separately under the MIT license.

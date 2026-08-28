@@ -1,0 +1,28 @@
+# @package _global_
+defaults:
+  - override /trainer: flow_dqn
+
+preset:
+  name: flow_online
+  trainer: flow_dqn
+
+trainer:
+  args:
+    offline_dataset_dir: ${paths.expert_dataset}
+    resume_checkpoint: ${paths.runs_dir}/flow_dqn_offline/flow_dqn_final.pt
+    offline_updates: 0
+    online_timesteps: 500000
+    online_offline_fraction: 0.9
+    exploration_temperature: 0.25
+    warmup_steps: 512
+    buffer_size: 100000
+    batch_size: 256
+    train_frequency: 1
+    gradient_steps: 1
+    max_steps: 300
+    seed: 360000
+    checkpoint_frequency: 25000
+    eval_frequency: 25000
+    eval_episodes: 5
+    log_interval: 5000
+    log_dir: ${paths.runs_dir}/flow_dqn_online

@@ -25,6 +25,7 @@ def test_episode_summary_and_strict_gate() -> None:
     assert summary["mean_return"] == 250.0
     assert summary["topout_rate"] == 0.5
     assert summary["truncation_rate"] == 0.25
+    assert summary["illegal_actions"] == 0
 
     passing = evaluate_gate(episodes, min_placements=10, min_lines=1)
     assert passing["passed"]
@@ -34,6 +35,14 @@ def test_episode_summary_and_strict_gate() -> None:
     assert not failing["passed"]
     assert failing["failed_episodes"] == [1]
 
+    illegal = evaluate_gate(
+        [EpisodeMetrics(1, 20, 20, 2, 200.0, False, True, illegal_actions=1)],
+        min_placements=20,
+        min_lines=2,
+    )
+    assert not illegal["passed"]
+    assert illegal["failed_episodes"] == [1]
+
 
 class FakePolicy:
     obs_dim = 2
@@ -41,6 +50,11 @@ class FakePolicy:
 
     def act(self, *_: object, **__: object) -> int:
         return 0
+
+
+class FakeIllegalPolicy(FakePolicy):
+    def act(self, *_: object, **__: object) -> int:
+        return self.action_dim
 
 
 class FakeEnv:
@@ -85,7 +99,7 @@ class FakeEnv:
         self.closed = True
 
 
-@pytest.mark.parametrize("algo", ["ppo", "dqn"])
+@pytest.mark.parametrize("algo", ["ppo", "dqn", "flow_dqn"])
 def test_eval_json_report_and_failure_exit(
     algo: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -129,6 +143,7 @@ def test_eval_json_report_and_failure_exit(
             "return": 150.0,
             "topout": True,
             "truncated": False,
+            "illegal_actions": 0,
         },
         {
             "episode": 2,
@@ -138,10 +153,12 @@ def test_eval_json_report_and_failure_exit(
             "return": 0.0,
             "topout": False,
             "truncated": True,
+            "illegal_actions": 0,
         },
     ]
     assert report["summary"]["placements"]["min"] == 1
     assert report["summary"]["topout_rate"] == 0.5
+    assert report["summary"]["illegal_actions"] == 0
     assert report["gate"]["passed"] is False
     assert report["gate"]["failed_episodes"] == [2]
 
@@ -176,3 +193,22 @@ def test_eval_writes_json_file_and_passes_gate(
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["gate"]["passed"] is True
     assert report["summary"]["lines"]["min"] == 1
+
+
+def test_eval_records_illegal_action_and_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(eval_rl, "load_policy", lambda *_args, **_kwargs: FakeIllegalPolicy())
+    monkeypatch.setattr(eval_rl, "CCTetrisEnv", FakeEnv)
+
+    status = eval_rl.main(
+        ["checkpoint.pt", "--algo", "flow_dqn", "--episodes", "1", "--json"]
+    )
+
+    assert status == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["schema_version"] == 2
+    assert report["episodes"][0]["illegal_actions"] == 1
+    assert report["summary"]["illegal_actions"] == 1
+    assert report["gate"]["failed_episodes"] == [1]

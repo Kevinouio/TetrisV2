@@ -1,0 +1,19 @@
+# @package _global_
+defaults:
+  - override /trainer: flow_dqn
+
+preset:
+  name: flow_from_scratch
+  trainer: flow_dqn
+
+trainer:
+  args:
+    offline_dataset_dir: null
+    offline_updates: 0
+    online_timesteps: 500000
+    online_offline_fraction: null
+    buffer_size: 100000
+    warmup_steps: 5000
+    batch_size: 256
+    max_steps: 300
+    log_dir: ${paths.runs_dir}/flow_dqn_from_scratch

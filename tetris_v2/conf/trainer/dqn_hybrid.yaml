@@ -1,0 +1,34 @@
+name: dqn_hybrid
+args:
+  offline_dataset_dir: null
+  total_timesteps: 1000000
+  buffer_size: 250000
+  warmup_steps: 5000
+  batch_size: 512
+  train_frequency: 1
+  learning_rate: 0.001
+  gamma: 0.99
+  target_sync_interval: 1000
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_steps: 200000
+  hidden_sizes: [512, 256]
+  seed: 123
+  device: null
+  max_steps: 4000
+  log_interval: 10000
+  eval_frequency: 50000
+  eval_episodes: 5
+  checkpoint_frequency: 100000
+  log_dir: ${paths.runs_dir}/dqn_hybrid
+  lib: null
+  expert_think_ms: 10
+  online_expert_interval: 4
+  online_expert_capacity: 50000
+  lambda_bc_start: 1.0
+  lambda_bc_end: 0.1
+  lambda_pair_start: 0.0
+  lambda_pair_end: 0.0
+  lambda_anneal_steps: 500000
+  pairs_per_sample: 0
+  init_checkpoint: null

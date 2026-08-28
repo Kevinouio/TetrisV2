@@ -1,4 +1,4 @@
-"""Shared checkpoint loader + policy inference helpers for PPO/DQN."""
+"""Shared checkpoint loading and masked inference for every RL algorithm."""
 
 from __future__ import annotations
 
@@ -10,10 +10,11 @@ import numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover
     from tetris_v2.rl.dqn.core import DQNAgent
+    from tetris_v2.rl.flow_dqn.core import FlowDQNAgent
     from tetris_v2.rl.ppo.core import PPOAgent
 
 
-AlgoName = Literal["ppo", "dqn"]
+AlgoName = Literal["ppo", "dqn", "flow_dqn"]
 
 
 @dataclass
@@ -21,9 +22,10 @@ class LoadedPolicy:
     algo: AlgoName
     obs_dim: int
     action_dim: int
-    metadata: Dict[str, float]
+    metadata: Dict[str, object]
     ppo_agent: Optional["PPOAgent"] = None
     dqn_agent: Optional["DQNAgent"] = None
+    flow_dqn_agent: Optional["FlowDQNAgent"] = None
 
     def act(
         self,
@@ -44,13 +46,23 @@ class LoadedPolicy:
                 action_mask=action_mask,
             )
             return int(action)
-        assert self.dqn_agent is not None
-        dqn_epsilon = 0.0 if deterministic else max(0.0, float(epsilon))
+        if self.algo == "dqn":
+            assert self.dqn_agent is not None
+            dqn_epsilon = 0.0 if deterministic else max(0.0, float(epsilon))
+            return int(
+                self.dqn_agent.select_action(
+                    obs,
+                    epsilon=dqn_epsilon,
+                    deterministic=deterministic,
+                    action_mask=action_mask,
+                )
+            )
+        assert self.flow_dqn_agent is not None
         return int(
-            self.dqn_agent.select_action(
+            self.flow_dqn_agent.select_action(
                 obs,
-                epsilon=dqn_epsilon,
                 deterministic=deterministic,
+                temperature=temperature,
                 action_mask=action_mask,
             )
         )
@@ -58,8 +70,8 @@ class LoadedPolicy:
 
 def load_policy(algo: AlgoName, checkpoint: Path, *, device: Optional[str] = None) -> LoadedPolicy:
     algo = str(algo).lower()  # type: ignore[assignment]
-    if algo not in {"ppo", "dqn"}:
-        raise ValueError("algo must be 'ppo' or 'dqn'")
+    if algo not in {"ppo", "dqn", "flow_dqn"}:
+        raise ValueError("algo must be 'ppo', 'dqn', or 'flow_dqn'")
     if algo == "ppo":
         from tetris_v2.rl.ppo.core import PPOAgent
 
@@ -71,15 +83,26 @@ def load_policy(algo: AlgoName, checkpoint: Path, *, device: Optional[str] = Non
             metadata=dict(metadata),
             ppo_agent=agent,
         )
-    from tetris_v2.rl.dqn.core import DQNAgent
+    if algo == "dqn":
+        from tetris_v2.rl.dqn.core import DQNAgent
 
-    agent, metadata = DQNAgent.load(str(checkpoint), device=device)
+        agent, metadata = DQNAgent.load(str(checkpoint), device=device)
+        return LoadedPolicy(
+            algo="dqn",
+            obs_dim=int(agent.config.obs_dim),
+            action_dim=int(agent.config.action_dim),
+            metadata=dict(metadata),
+            dqn_agent=agent,
+        )
+    from tetris_v2.rl.flow_dqn.core import FlowDQNAgent
+
+    agent, metadata = FlowDQNAgent.load(str(checkpoint), device=device)
     return LoadedPolicy(
-        algo="dqn",
+        algo="flow_dqn",
         obs_dim=int(agent.config.obs_dim),
         action_dim=int(agent.config.action_dim),
         metadata=dict(metadata),
-        dqn_agent=agent,
+        flow_dqn_agent=agent,
     )
 
 

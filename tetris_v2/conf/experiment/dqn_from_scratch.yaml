@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - override /trainer: dqn
+
+preset:
+  name: dqn_from_scratch
+  trainer: dqn
+
+trainer:
+  args:
+    total_timesteps: 1000000
+    max_steps: 300
+    log_dir: ${paths.runs_dir}/dqn_from_scratch

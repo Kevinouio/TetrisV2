@@ -1,4 +1,4 @@
-"""Evaluate a TetrisV2 PPO or DQN checkpoint on the C++ environment."""
+"""Evaluate a TetrisV2 RL checkpoint on the C++ environment."""
 
 from __future__ import annotations
 
@@ -29,14 +29,19 @@ def _nonnegative_int(value: str) -> int:
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate a TetrisV2 PPO or DQN checkpoint.")
+    parser = argparse.ArgumentParser(description="Evaluate a TetrisV2 RL checkpoint.")
     parser.add_argument("checkpoint", type=Path, help="Checkpoint path (.pt)")
-    parser.add_argument("--algo", choices=("ppo", "dqn"), required=True)
+    parser.add_argument("--algo", choices=("ppo", "dqn", "flow_dqn"), required=True)
     parser.add_argument("--episodes", type=_positive_int, default=10)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--max-steps", type=_nonnegative_int, default=4000)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--temperature", type=float, default=1.0, help="PPO only")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="PPO sampling temperature or Flow-DQN Gaussian-latent scale.",
+    )
     parser.add_argument(
         "--epsilon",
         type=float,
@@ -91,7 +96,8 @@ def _print_human_report(report: dict[str, Any]) -> None:
             f"Episode {episode['episode']} seed={episode['seed']}: "
             f"placements={episode['placements']} lines={episode['lines']} "
             f"return={float(episode['return']):.2f} "
-            f"topout={episode['topout']} truncated={episode['truncated']}"
+            f"topout={episode['topout']} truncated={episode['truncated']} "
+            f"illegal_actions={episode['illegal_actions']}"
         )
 
     summary = report["summary"]
@@ -105,6 +111,7 @@ def _print_human_report(report: dict[str, Any]) -> None:
     print(f"  return: mean={float(summary['mean_return']):.2f}")
     print(f"  topout rate={float(summary['topout_rate']):.2%}")
     print(f"  truncation rate={float(summary['truncation_rate']):.2%}")
+    print(f"  illegal actions={int(summary['illegal_actions'])}")
 
     gate = report["gate"]
     if gate["enabled"]:
@@ -113,6 +120,7 @@ def _print_human_report(report: dict[str, Any]) -> None:
             requirements.append(f"placements>={gate['min_placements']}")
         if gate["min_lines"] is not None:
             requirements.append(f"lines>={gate['min_lines']}")
+        requirements.append("illegal_actions=0")
         status = "PASS" if gate["passed"] else "FAIL"
         detail = f"; failed episodes={gate['failed_episodes']}" if not gate["passed"] else ""
         print(f"Gate: {status} ({', '.join(requirements)}){detail}")
@@ -148,6 +156,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             total_reward = 0.0
             placements = int(info["placements"])
             last_lines = int(info["lines"])
+            illegal_actions = 0
             while not (terminated or truncated):
                 action = policy.act(
                     obs,
@@ -156,6 +165,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                     epsilon=args.epsilon,
                     action_mask=action_mask,
                 )
+                action = int(action)
+                if not 0 <= action < action_mask.size or action_mask[action] <= 0.5:
+                    illegal_actions += 1
+                    terminated = True
+                    break
                 obs, reward, terminated, truncated, info = env.step(action)
                 action_mask = np.asarray(info["action_mask"], dtype=np.float32)
                 total_reward += float(reward)
@@ -169,8 +183,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                     placements=placements,
                     lines=last_lines,
                     episode_return=total_reward,
-                    topout=bool(info["top_out"]),
+                    topout=bool(info.get("top_out", False)),
                     truncated=bool(truncated),
+                    illegal_actions=illegal_actions,
                 )
             )
     finally:
@@ -182,7 +197,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         min_lines=args.min_lines,
     )
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "checkpoint": str(args.checkpoint),
         "algorithm": args.algo,
         "configuration": {

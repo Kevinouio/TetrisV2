@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - override /trainer: dqn_pretrain
+
+preset:
+  name: dqn_pretrain
+  trainer: dqn_pretrain
+
+trainer:
+  args:
+    dataset_dir: ${paths.expert_dataset}
+    updates: 20000
+    batch_size: 256
+    checkpoint_frequency: 5000
+    log_dir: ${paths.runs_dir}/dqn_pretrain
