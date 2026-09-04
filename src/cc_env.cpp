@@ -11,14 +11,23 @@ EnvConfig parity_config(EnvConfig config) {
 
 }  // namespace
 
-Env::Env(const EnvConfig& config) : env_(parity_config(config)) {}
+Env::Env(const EnvConfig& config, bool enforce_rotation_parity)
+    : env_(enforce_rotation_parity ? parity_config(config) : config) {}
 
 void Env::reset(std::optional<std::uint32_t> seed) { env_.reset(seed); }
 
 StepResult Env::step(Action action) { return env_.step(action); }
 
+StepResult Env::input(Action action) { return env_.input(action); }
+
+StepResult Env::tick() { return env_.tick(); }
+
 StepResult Env::apply_placement_index(std::size_t index) {
     return env_.apply_placement_index(index);
+}
+
+GarbageInsertResult Env::insert_garbage_rows(const std::vector<int>& hole_columns) {
+    return env_.insert_garbage_rows(hole_columns);
 }
 
 std::vector<PlacementOption> Env::enumerate_active_piece_placements() const {
@@ -28,6 +37,8 @@ std::vector<PlacementOption> Env::enumerate_active_piece_placements() const {
 std::optional<PlacementOption> Env::placement_option_at(std::size_t index) const {
     return env_.placement_option_at(index);
 }
+
+std::optional<ActivePiece> Env::ghost_piece() const { return env_.ghost_piece(); }
 
 RotationTrace Env::rotation_trace(Action rotate_action) const {
     return env_.rotation_trace(rotate_action);

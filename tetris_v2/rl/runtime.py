@@ -13,8 +13,53 @@ BOARD_ROWS = 20
 BOARD_COLS = 10
 EMPTY_CELL_ID = 255
 
+ACTION_NONE = 0
+ACTION_LEFT = 1
+ACTION_RIGHT = 2
+ACTION_SOFT_DROP = 3
+ACTION_HARD_DROP = 4
 ACTION_CW = 5
 ACTION_CCW = 6
+ACTION_ROTATE_CW = ACTION_CW
+ACTION_ROTATE_CCW = ACTION_CCW
+ACTION_ROTATE_180 = 7
+ACTION_HOLD = 8
+
+
+class _EnvStepResult(ctypes.Structure):
+    _fields_ = [
+        ("action_succeeded", ctypes.c_int),
+        ("piece_locked", ctypes.c_int),
+        ("hold_used", ctypes.c_int),
+        ("lines_cleared", ctypes.c_int),
+        ("spin_clear", ctypes.c_int),
+        ("spin_type", ctypes.c_int),
+        ("difficult_clear", ctypes.c_int),
+        ("b2b_bonus_applied", ctypes.c_int),
+        ("combo", ctypes.c_int),
+        ("back_to_back", ctypes.c_int),
+        ("reward", ctypes.c_float),
+        ("game_over", ctypes.c_int),
+        ("top_out", ctypes.c_int),
+    ]
+
+
+def _step_result_dict(result: _EnvStepResult) -> Dict[str, object]:
+    return {
+        "action_succeeded": bool(result.action_succeeded),
+        "piece_locked": bool(result.piece_locked),
+        "hold_used": bool(result.hold_used),
+        "lines_cleared": int(result.lines_cleared),
+        "spin_clear": bool(result.spin_clear),
+        "spin_type": int(result.spin_type),
+        "difficult_clear": bool(result.difficult_clear),
+        "b2b_bonus_applied": bool(result.b2b_bonus_applied),
+        "combo": int(result.combo),
+        "back_to_back": bool(result.back_to_back),
+        "reward": float(result.reward),
+        "game_over": bool(result.game_over),
+        "top_out": bool(result.top_out),
+    }
 
 PIECE_NAMES = {
     0: "I",
@@ -68,14 +113,16 @@ def _require_abi(condition: bool, operation: str) -> None:
 class EnvCtypes:
     """ctypes wrapper around the current `tetris_cc_*` C API."""
 
-    def __init__(self, lib_path: Path, seed: int):
+    def __init__(self, lib_path: Path, seed: int, *, play_mode: bool = False):
         self.lib = ctypes.CDLL(str(lib_path))
         self._bind()
-        self.handle = self.lib.tetris_cc_env_create(ctypes.c_uint32(seed))
+        create = self.lib.tetris_cc_env_create_play if play_mode else self.lib.tetris_cc_env_create
+        self.handle = create(ctypes.c_uint32(seed))
         if not self.handle:
             raise RuntimeError("Failed to create env handle")
         self.bot_handle = None
         self.seed = int(seed)
+        self.play_mode = bool(play_mode)
 
     def _bind(self):
         void_p = ctypes.c_void_p
@@ -84,11 +131,34 @@ class EnvCtypes:
         self.lib.tetris_cc_env_create.argtypes = [ctypes.c_uint32]
         self.lib.tetris_cc_env_create.restype = void_p
 
+        self.lib.tetris_cc_env_create_play.argtypes = [ctypes.c_uint32]
+        self.lib.tetris_cc_env_create_play.restype = void_p
+
         self.lib.tetris_cc_env_destroy.argtypes = [void_p]
         self.lib.tetris_cc_env_destroy.restype = None
 
         self.lib.tetris_cc_env_reset.argtypes = [void_p, ctypes.c_uint32]
         self.lib.tetris_cc_env_reset.restype = None
+
+        self.lib.tetris_cc_env_step_ex.argtypes = [
+            void_p,
+            ctypes.c_int,
+            ctypes.POINTER(_EnvStepResult),
+        ]
+        self.lib.tetris_cc_env_step_ex.restype = ctypes.c_int
+
+        self.lib.tetris_cc_env_input_ex.argtypes = [
+            void_p,
+            ctypes.c_int,
+            ctypes.POINTER(_EnvStepResult),
+        ]
+        self.lib.tetris_cc_env_input_ex.restype = ctypes.c_int
+
+        self.lib.tetris_cc_env_tick_ex.argtypes = [
+            void_p,
+            ctypes.POINTER(_EnvStepResult),
+        ]
+        self.lib.tetris_cc_env_tick_ex.restype = ctypes.c_int
 
         self.lib.tetris_cc_env_hold.argtypes = [void_p, ctypes.POINTER(ctypes.c_float)]
         self.lib.tetris_cc_env_hold.restype = ctypes.c_int
@@ -122,6 +192,9 @@ class EnvCtypes:
 
         self.lib.tetris_cc_env_active_piece.argtypes = [void_p, c_int_p, c_int_p, c_int_p, c_int_p]
         self.lib.tetris_cc_env_active_piece.restype = ctypes.c_int
+
+        self.lib.tetris_cc_env_ghost_piece.argtypes = [void_p, c_int_p, c_int_p, c_int_p, c_int_p]
+        self.lib.tetris_cc_env_ghost_piece.restype = ctypes.c_int
 
         self.lib.tetris_cc_env_hold_piece.argtypes = [void_p, c_int_p, c_int_p, c_int_p]
         self.lib.tetris_cc_env_hold_piece.restype = ctypes.c_int
@@ -294,6 +367,30 @@ class EnvCtypes:
         self.lib.tetris_cc_env_reset(self.handle, ctypes.c_uint32(seed))
         if self.bot_handle:
             self.bot_sync()
+
+    def step(self, action: int):
+        result = _EnvStepResult()
+        ok = self.lib.tetris_cc_env_step_ex(self.handle, int(action), ctypes.byref(result))
+        _require_abi(bool(ok), f"step action {action}")
+        if self.bot_handle:
+            self.bot_sync()
+        return _step_result_dict(result)
+
+    def input(self, action: int):
+        result = _EnvStepResult()
+        ok = self.lib.tetris_cc_env_input_ex(self.handle, int(action), ctypes.byref(result))
+        _require_abi(bool(ok), f"apply zero-time input {action}")
+        if self.bot_handle:
+            self.bot_sync()
+        return _step_result_dict(result)
+
+    def tick(self):
+        result = _EnvStepResult()
+        ok = self.lib.tetris_cc_env_tick_ex(self.handle, ctypes.byref(result))
+        _require_abi(bool(ok), "advance one simulation tick")
+        if self.bot_handle:
+            self.bot_sync()
+        return _step_result_dict(result)
 
     def hold(self):
         reward = ctypes.c_float(0.0)
@@ -487,6 +584,27 @@ class EnvCtypes:
         )
         _require_abi(bool(ok), "read the active piece")
         return {"piece": int(piece.value), "rotation": int(rotation.value), "x": int(x.value), "y": int(y.value)}
+
+    def ghost(self):
+        piece = ctypes.c_int(-1)
+        rotation = ctypes.c_int(-1)
+        x = ctypes.c_int(0)
+        landing_y = ctypes.c_int(0)
+        ok = self.lib.tetris_cc_env_ghost_piece(
+            self.handle,
+            ctypes.byref(piece),
+            ctypes.byref(rotation),
+            ctypes.byref(x),
+            ctypes.byref(landing_y),
+        )
+        if not ok:
+            return None
+        return {
+            "piece": int(piece.value),
+            "rotation": int(rotation.value),
+            "x": int(x.value),
+            "y": int(landing_y.value),
+        }
 
     def hold_info(self):
         has_hold = ctypes.c_int(0)
@@ -736,7 +854,16 @@ __all__ = [
     "BOARD_ROWS",
     "BOARD_COLS",
     "EMPTY_CELL_ID",
+    "ACTION_NONE",
+    "ACTION_LEFT",
+    "ACTION_RIGHT",
+    "ACTION_SOFT_DROP",
+    "ACTION_HARD_DROP",
     "ACTION_CW",
     "ACTION_CCW",
+    "ACTION_ROTATE_CW",
+    "ACTION_ROTATE_CCW",
+    "ACTION_ROTATE_180",
+    "ACTION_HOLD",
     "PIECE_NAMES",
 ]

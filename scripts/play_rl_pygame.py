@@ -39,7 +39,11 @@ PIECE_COLORS = {
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play a TetrisV2 RL policy in pygame.")
     parser.add_argument("checkpoint", type=Path, help="Checkpoint path (.pt)")
-    parser.add_argument("--algo", choices=("ppo", "dqn", "flow_dqn"), required=True)
+    parser.add_argument(
+        "--algo",
+        choices=("ppo", "dqn", "flow_dqn", "battle_dqn"),
+        required=True,
+    )
     parser.add_argument("--lib", type=Path, default=None, help="Path to tetris_v2_c_api shared library.")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--cell", type=int, default=28)

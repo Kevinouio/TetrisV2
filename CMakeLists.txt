@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(TETRIS_STRICT_WARNINGS "Enable extra compiler warnings" ON)
 
 add_library(tetris_v2
+    src/battle.cpp
     src/board.cpp
     src/cc2_data.cpp
     src/cc2_dag.cpp
@@ -16,6 +17,7 @@ add_library(tetris_v2
     src/cc2_sync.cpp
     src/cc_env.cpp
     src/cold_clear_bot.cpp
+    src/decision.cpp
     src/env.cpp
     src/observation.cpp
     src/piece_defs.cpp
@@ -83,6 +85,7 @@ if(BUILD_TESTING)
     tetris_add_test(tetris_smoke tests/cpp/smoke_env.cpp)
     tetris_add_test(tetris_kick_search_tests tests/cpp/kick_search_tests.cpp)
     tetris_add_test(tetris_b2b_spin_tests tests/cpp/b2b_spin_tests.cpp)
+    tetris_add_test(tetris_battle_tests tests/cpp/battle_tests.cpp tetris_v2_c_api)
     tetris_add_test(tetris_c_api_tests tests/cpp/c_api_tests.cpp tetris_v2_c_api)
 
     tetris_add_test(tetris_twist_dataset_tests tests/cpp/twist_dataset_tests.cpp)

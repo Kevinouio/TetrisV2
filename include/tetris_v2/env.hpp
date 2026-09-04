@@ -15,6 +15,9 @@
 
 namespace tetris_v2 {
 
+inline constexpr std::int8_t kEmptyPieceId = -1;
+inline constexpr std::int8_t kGarbagePieceId = 7;
+
 struct ScoringConfig {
     std::array<float, 5> normal_clear_reward{0.0f, 100.0f, 300.0f, 500.0f, 800.0f};
     std::array<float, 3> mini_spin_reward{100.0f, 200.0f, 400.0f};
@@ -26,7 +29,8 @@ struct ScoringConfig {
 struct EnvConfig {
     std::uint32_t seed{1};
     int queue_size{5};
-    float gravity_per_step{1.0f / 60.0f};
+    int spawn_y{21};
+    double gravity_per_step{1.0 / 60.0};
     int lock_delay_steps{30};
     int max_lock_resets{15};
     bool allow_rotate_180{true};
@@ -47,7 +51,7 @@ struct EnvState {
     int total_lines_cleared{0};
     int lock_timer{0};
     int lock_resets_used{0};
-    float gravity_accumulator{0.0f};
+    double gravity_accumulator{0.0};
     bool spin_eligible{false};
     bool last_rotate_used_kick{false};
     int last_rotate_kick_index{-1};
@@ -60,6 +64,14 @@ struct EnvState {
 struct EnvSnapshot {
     EnvState state{};
     SevenBagRandomizer randomizer{};
+};
+
+struct GarbageInsertResult {
+    int rows_requested{0};
+    int rows_applied{0};
+    bool overflow{false};
+    bool active_collision{false};
+    bool top_out{false};
 };
 
 struct PlacementOption {
@@ -98,12 +110,18 @@ public:
 
     void reset(std::optional<std::uint32_t> seed = std::nullopt);
     StepResult step(Action action);
+    // Applies an action without gravity or lock-timer advancement.
+    StepResult input(Action action);
+    // Advances gravity and the lock timer once without applying an action.
+    StepResult tick();
     std::vector<PlacementOption> enumerate_active_piece_placements() const;
     std::optional<PlacementOption> placement_option_at(std::size_t index) const;
+    std::optional<ActivePiece> ghost_piece() const;
     std::vector<std::uint8_t> visible_board_piece_ids(bool include_active) const;
     std::vector<std::uint8_t> visible_placement_piece_ids(std::size_t index) const;
     StepResult apply_placement(const ActivePiece& placement);
     StepResult apply_placement_index(std::size_t index);
+    GarbageInsertResult insert_garbage_rows(const std::vector<int>& hole_columns);
     RotationTrace rotation_trace(Action rotate_action) const;
 
     EnvSnapshot snapshot() const;
@@ -117,6 +135,7 @@ public:
     std::string render_ascii(int visible_rows = Board::kVisibleRows) const;
 
 private:
+    StepResult advance(Action action, bool advance_time);
     void ensure_queue(std::size_t minimum);
     void spawn_next_piece(bool reset_hold_availability);
     bool collides(const ActivePiece& piece) const;

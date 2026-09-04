@@ -37,7 +37,7 @@ bool ColdClearBot::sync_from_env(const ModernTetrisEnv& env) {
     return true;
 }
 
-bool ColdClearBot::start_search_locked(const Snapshot& snapshot) {
+bool ColdClearBot::start_search_locked(const Snapshot& snapshot, bool background) {
     if (!snapshot.valid) {
         return false;
     }
@@ -50,7 +50,7 @@ bool ColdClearBot::start_search_locked(const Snapshot& snapshot) {
     const auto queue = build_known_queue_for_dag(state);
     synchronizer_.set_weights(weights_);
     synchronizer_.set_exploitation(exploitation_);
-    synchronizer_.start(root, queue, true);
+    synchronizer_.start(root, queue, true, background);
     return true;
 }
 
@@ -108,15 +108,21 @@ bool ColdClearBot::choose(
         snapshot = synced_snapshot_;
     }
 
+    const bool deterministic_effort = think_ms == 0;
     const int normalized_think_ms = std::max(1, think_ms);
-    if (!start_search_locked(snapshot)) {
+    if (!start_search_locked(snapshot, !deterministic_effort)) {
         return false;
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    const auto deadline = t0 + std::chrono::milliseconds(normalized_think_ms);
-    synchronizer_.wait_until(deadline);
-    auto sync = synchronizer_.snapshot();
+    cc2::SyncSnapshot sync{};
+    if (deterministic_effort) {
+        sync = synchronizer_.run_work_units(kDeterministicWorkUnits);
+    } else {
+        const auto deadline = t0 + std::chrono::milliseconds(normalized_think_ms);
+        synchronizer_.wait_until(deadline);
+        sync = synchronizer_.snapshot();
+    }
     synchronizer_.stop();
     const auto t1 = std::chrono::steady_clock::now();
 
@@ -143,7 +149,10 @@ bool ColdClearBot::choose(
     stats.expansions = sync.stats.expansions;
     stats.think_ms = elapsed_ms;
     stats.nps = sync.nps;
-    stats.budget_miss = elapsed_ms > static_cast<double>(normalized_think_ms) + 1.0 ? 1 : 0;
+    stats.budget_miss =
+        deterministic_effort
+            ? 0
+            : (elapsed_ms > static_cast<double>(normalized_think_ms) + 1.0 ? 1 : 0);
 
     {
         std::lock_guard<std::mutex> lock(mutex_);

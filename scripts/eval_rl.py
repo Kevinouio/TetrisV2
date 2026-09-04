@@ -31,7 +31,11 @@ def _nonnegative_int(value: str) -> int:
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a TetrisV2 RL checkpoint.")
     parser.add_argument("checkpoint", type=Path, help="Checkpoint path (.pt)")
-    parser.add_argument("--algo", choices=("ppo", "dqn", "flow_dqn"), required=True)
+    parser.add_argument(
+        "--algo",
+        choices=("ppo", "dqn", "flow_dqn", "battle_dqn"),
+        required=True,
+    )
     parser.add_argument("--episodes", type=_positive_int, default=10)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--max-steps", type=_nonnegative_int, default=4000)

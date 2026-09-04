@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -25,10 +26,17 @@ public:
     void set_weights(const FreestyleWeights& weights);
     void set_exploitation(double exploitation);
 
-    void start(GameState root, const std::deque<Piece>& queue, bool speculate);
+    void start(
+        GameState root,
+        const std::deque<Piece>& queue,
+        bool speculate,
+        bool background = true);
     void stop();
 
     void wait_until(std::chrono::steady_clock::time_point deadline);
+    // Runs exactly work_units DAG selections on the caller thread. Call start
+    // with background=false first; no wall-clock deadline affects the result.
+    SyncSnapshot run_work_units(std::size_t work_units);
     SyncSnapshot snapshot() const;
 
 private:

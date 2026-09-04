@@ -15,7 +15,11 @@ from tetris_v2.rl.policy import load_policy
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Play a TetrisV2 RL policy in CLI mode.")
     parser.add_argument("checkpoint", type=Path, help="Checkpoint path (.pt)")
-    parser.add_argument("--algo", choices=("ppo", "dqn", "flow_dqn"), required=True)
+    parser.add_argument(
+        "--algo",
+        choices=("ppo", "dqn", "flow_dqn", "battle_dqn"),
+        required=True,
+    )
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=4000)

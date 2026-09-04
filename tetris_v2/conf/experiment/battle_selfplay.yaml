@@ -1,0 +1,21 @@
+# @package _global_
+defaults:
+  - override /trainer: battle_dqn
+
+preset:
+  name: battle_selfplay
+  trainer: battle_dqn
+
+trainer:
+  args:
+    total_timesteps: 1000000
+    random_opponent_weight: 0.20
+    heuristic_opponent_weight: 0.30
+    frozen_opponent_weight: 0.50
+    current_opponent_weight: 0.0
+    disable_curriculum: false
+    checkpoint_frequency: 100000
+    pool_checkpoint_frequency: 100000
+    eval_frequency: 50000
+    eval_matches: 100
+    log_dir: ${paths.runs_dir}/battle_selfplay

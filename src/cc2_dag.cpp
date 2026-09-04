@@ -25,6 +25,7 @@ void Dag::reset(GameState root, const std::deque<Piece>& queue, bool speculate) 
     root_ = root;
     queue_ = queue;
     speculate_ = speculate;
+    rng_.seed(kRngSeed);
     nodes_.clear();
     ensure_node(NodeKey{root_, 0});
 }

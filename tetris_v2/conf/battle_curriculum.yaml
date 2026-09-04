@@ -1,0 +1,50 @@
+stages:
+  - name: random
+    opponent_mix:
+      random: 1.0
+    promotion:
+      - opponent: random
+        min_win_rate: 0.90
+        min_matches: 100
+        max_illegal_actions: 0
+
+  - name: heuristic
+    opponent_mix:
+      random: 0.30
+      cold_clear: 0.70
+    promotion:
+      - opponent: random
+        min_win_rate: 0.95
+        min_matches: 100
+        max_illegal_actions: 0
+      - opponent: cold_clear
+        min_win_rate: 0.55
+        min_matches: 100
+        max_illegal_actions: 0
+
+  - name: frozen_self_play
+    opponent_mix:
+      random: 0.10
+      cold_clear: 0.20
+      frozen: 0.60
+      current: 0.10
+    promotion:
+      - opponent: random
+        min_win_rate: 0.95
+        min_matches: 100
+        max_illegal_actions: 0
+      - opponent: cold_clear
+        min_win_rate: 0.60
+        min_matches: 100
+        max_illegal_actions: 0
+      - opponent: frozen
+        min_win_rate: 0.52
+        min_matches: 100
+        max_illegal_actions: 0
+
+  - name: mixed
+    opponent_mix:
+      random: 0.20
+      cold_clear: 0.30
+      frozen: 0.50
+      current: 0.0

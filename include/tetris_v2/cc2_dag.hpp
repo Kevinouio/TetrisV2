@@ -43,6 +43,8 @@ public:
     DagStatistics do_work(const FreestyleWeights& weights, double exploitation);
 
 private:
+    static constexpr std::uint32_t kRngSeed = 12345u;
+
     struct NodeKey {
         GameState state{};
         std::uint16_t depth{0};
@@ -97,7 +99,7 @@ private:
     GameState root_{};
     std::deque<Piece> queue_{};
     bool speculate_{true};
-    mutable std::mt19937 rng_{12345};
+    mutable std::mt19937 rng_{kRngSeed};
     std::unordered_map<NodeKey, Node, NodeKeyHash> nodes_{};
 };
 

@@ -4,6 +4,7 @@
 #include <array>
 #include <optional>
 #include <queue>
+#include <stdexcept>
 #include <sstream>
 #include <unordered_map>
 
@@ -201,7 +202,13 @@ void ModernTetrisEnv::reset(std::optional<std::uint32_t> seed) {
     spawn_next_piece(true);
 }
 
-StepResult ModernTetrisEnv::step(Action action) {
+StepResult ModernTetrisEnv::step(Action action) { return advance(action, true); }
+
+StepResult ModernTetrisEnv::input(Action action) { return advance(action, false); }
+
+StepResult ModernTetrisEnv::tick() { return advance(Action::None, true); }
+
+StepResult ModernTetrisEnv::advance(Action action, bool advance_time) {
     StepResult result{};
     if (state_.game_over) {
         result.game_over = true;
@@ -214,6 +221,7 @@ StepResult ModernTetrisEnv::step(Action action) {
     bool skip_gravity = false;
     bool moved_while_grounded = false;
     bool action_succeeded = false;
+    const bool was_grounded = touching_ground();
 
     switch (action) {
         case Action::Left:
@@ -223,7 +231,7 @@ StepResult ModernTetrisEnv::step(Action action) {
                 state_.last_rotate_used_kick = false;
                 state_.last_rotate_kick_index = -1;
             }
-            moved_while_grounded = action_succeeded && touching_ground();
+            moved_while_grounded = action_succeeded && (was_grounded || touching_ground());
             break;
         case Action::Right:
             action_succeeded = try_move(1, 0);
@@ -232,7 +240,7 @@ StepResult ModernTetrisEnv::step(Action action) {
                 state_.last_rotate_used_kick = false;
                 state_.last_rotate_kick_index = -1;
             }
-            moved_while_grounded = action_succeeded && touching_ground();
+            moved_while_grounded = action_succeeded && (was_grounded || touching_ground());
             break;
         case Action::RotateCW: {
             bool used_kick = false;
@@ -243,7 +251,7 @@ StepResult ModernTetrisEnv::step(Action action) {
                 state_.last_rotate_used_kick = used_kick;
                 state_.last_rotate_kick_index = kick_index;
             }
-            moved_while_grounded = action_succeeded && touching_ground();
+            moved_while_grounded = action_succeeded && (was_grounded || touching_ground());
             break;
         }
         case Action::RotateCCW: {
@@ -255,7 +263,7 @@ StepResult ModernTetrisEnv::step(Action action) {
                 state_.last_rotate_used_kick = used_kick;
                 state_.last_rotate_kick_index = kick_index;
             }
-            moved_while_grounded = action_succeeded && touching_ground();
+            moved_while_grounded = action_succeeded && (was_grounded || touching_ground());
             break;
         }
         case Action::Rotate180:
@@ -268,7 +276,7 @@ StepResult ModernTetrisEnv::step(Action action) {
                     state_.last_rotate_kick_index = -1;
                     action_succeeded = true;
                 }
-                moved_while_grounded = action_succeeded && touching_ground();
+                moved_while_grounded = action_succeeded && (was_grounded || touching_ground());
             }
             break;
         case Action::SoftDrop:
@@ -306,26 +314,25 @@ StepResult ModernTetrisEnv::step(Action action) {
         }
     }
 
-    if (!state_.game_over && !result.piece_locked && !skip_gravity) {
+    if (advance_time && !state_.game_over && !result.piece_locked && !skip_gravity) {
         state_.gravity_accumulator += config_.gravity_per_step;
-        while (state_.gravity_accumulator >= 1.0f) {
+        while (state_.gravity_accumulator >= 1.0) {
             if (!try_move(0, -1)) {
-                state_.gravity_accumulator = 0.0f;
+                state_.gravity_accumulator = 0.0;
                 break;
             }
-            state_.gravity_accumulator -= 1.0f;
+            state_.gravity_accumulator -= 1.0;
         }
     }
 
-    if (!state_.game_over && !result.piece_locked) {
+    if (advance_time && !state_.game_over && !result.piece_locked) {
         if (touching_ground()) {
             ++state_.lock_timer;
             if (state_.lock_timer >= config_.lock_delay_steps) {
                 lock_active_piece(result);
             }
-        } else {
+        } else if (state_.lock_resets_used < config_.max_lock_resets) {
             state_.lock_timer = 0;
-            state_.lock_resets_used = 0;
         }
     }
 
@@ -515,6 +522,22 @@ std::vector<PlacementOption> ModernTetrisEnv::enumerate_active_piece_placements(
     return options;
 }
 
+std::optional<ActivePiece> ModernTetrisEnv::ghost_piece() const {
+    if (state_.game_over || state_.active.piece == Piece::None || collides(state_.active)) {
+        return std::nullopt;
+    }
+
+    ActivePiece ghost = state_.active;
+    for (;;) {
+        ActivePiece candidate = ghost;
+        --candidate.y;
+        if (collides(candidate)) {
+            return ghost;
+        }
+        ghost = candidate;
+    }
+}
+
 std::optional<PlacementOption> ModernTetrisEnv::placement_option_at(std::size_t index) const {
     auto options = enumerate_active_piece_placements();
     if (index >= options.size()) {
@@ -532,7 +555,7 @@ std::vector<std::uint8_t> ModernTetrisEnv::visible_board_piece_ids(bool include_
         int y = (Board::kVisibleRows - 1) - row;
         for (int x = 0; x < Board::kWidth; ++x) {
             auto id = state_.piece_ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
-            if (id >= 0 && id <= 6) {
+            if (id >= 0 && id <= kGarbagePieceId) {
                 out[static_cast<std::size_t>(row * Board::kWidth + x)] =
                     static_cast<std::uint8_t>(id);
             }
@@ -586,7 +609,7 @@ std::vector<std::uint8_t> ModernTetrisEnv::visible_placement_piece_ids(std::size
         int y = (Board::kVisibleRows - 1) - row;
         for (int x = 0; x < Board::kWidth; ++x) {
             auto id = ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
-            if (id >= 0 && id <= 6) {
+            if (id >= 0 && id <= kGarbagePieceId) {
                 out[static_cast<std::size_t>(row * Board::kWidth + x)] =
                     static_cast<std::uint8_t>(id);
             }
@@ -660,6 +683,80 @@ StepResult ModernTetrisEnv::apply_placement_index(std::size_t index) {
     result.combo = state_.combo;
     result.back_to_back = state_.back_to_back;
     result.game_over = state_.game_over;
+    result.top_out = state_.top_out;
+    return result;
+}
+
+GarbageInsertResult ModernTetrisEnv::insert_garbage_rows(
+    const std::vector<int>& hole_columns) {
+    GarbageInsertResult result{};
+    result.rows_requested = static_cast<int>(hole_columns.size());
+    result.top_out = state_.top_out;
+    if (hole_columns.empty() || state_.game_over) {
+        return result;
+    }
+    for (const int hole : hole_columns) {
+        if (hole < 0 || hole >= Board::kWidth) {
+            throw std::invalid_argument("Garbage hole column is outside the board.");
+        }
+    }
+
+    const int requested = static_cast<int>(hole_columns.size());
+    const int inserted = std::min(requested, Board::kRows);
+    result.rows_applied = inserted;
+    result.overflow = requested > Board::kRows;
+
+    const Board previous_board = state_.board;
+    const auto previous_ids = state_.piece_ids;
+    Board raised_board{};
+    std::array<std::array<std::int8_t, Board::kWidth>, Board::kRows> raised_ids{};
+    for (auto& row : raised_ids) {
+        row.fill(kEmptyPieceId);
+    }
+
+    for (int y = 0; y < Board::kRows; ++y) {
+        const auto mask = previous_board.row_mask(y);
+        if (mask == 0) {
+            continue;
+        }
+        const int destination_y = y + requested;
+        if (destination_y >= Board::kRows) {
+            result.overflow = true;
+            continue;
+        }
+        for (int x = 0; x < Board::kWidth; ++x) {
+            if ((mask & (Board::RowMask{1u} << x)) == 0) {
+                continue;
+            }
+            raised_board.set_cell(x, destination_y);
+            raised_ids[static_cast<std::size_t>(destination_y)][static_cast<std::size_t>(x)] =
+                previous_ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
+        }
+    }
+
+    // Holes are supplied in arrival order. Applying one row at a time places the
+    // newest row at the bottom, so a batch appears in reverse arrival order.
+    for (int y = 0; y < inserted; ++y) {
+        const auto hole_index = hole_columns.size() - 1u - static_cast<std::size_t>(y);
+        const int hole = hole_columns[hole_index];
+        for (int x = 0; x < Board::kWidth; ++x) {
+            if (x == hole) {
+                continue;
+            }
+            raised_board.set_cell(x, y);
+            raised_ids[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] =
+                kGarbagePieceId;
+        }
+    }
+
+    state_.board = raised_board;
+    state_.piece_ids = raised_ids;
+    result.active_collision =
+        state_.active.piece != Piece::None && collides(state_.active);
+    if (result.overflow || result.active_collision) {
+        state_.game_over = true;
+        state_.top_out = true;
+    }
     result.top_out = state_.top_out;
     return result;
 }
@@ -782,9 +879,10 @@ void ModernTetrisEnv::spawn_next_piece(bool reset_hold_availability) {
     auto next = state_.queue.front();
     state_.queue.pop_front();
     state_.active = spawn_piece(next);
+    state_.active.y = config_.spawn_y;
     state_.lock_timer = 0;
     state_.lock_resets_used = 0;
-    state_.gravity_accumulator = 0.0f;
+    state_.gravity_accumulator = 0.0;
     state_.spin_eligible = false;
     state_.last_rotate_used_kick = false;
     state_.last_rotate_kick_index = -1;
@@ -921,9 +1019,10 @@ bool ModernTetrisEnv::apply_hold() {
         Piece swapped = *state_.hold;
         state_.hold = current;
         state_.active = spawn_piece(swapped);
+        state_.active.y = config_.spawn_y;
         state_.lock_timer = 0;
         state_.lock_resets_used = 0;
-        state_.gravity_accumulator = 0.0f;
+        state_.gravity_accumulator = 0.0;
         state_.spin_eligible = false;
         state_.last_rotate_used_kick = false;
         state_.last_rotate_kick_index = -1;

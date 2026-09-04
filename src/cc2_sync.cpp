@@ -28,7 +28,11 @@ void Synchronizer::set_exploitation(double exploitation) {
     exploitation_ = exploitation;
 }
 
-void Synchronizer::start(GameState root, const std::deque<Piece>& queue, bool speculate) {
+void Synchronizer::start(
+    GameState root,
+    const std::deque<Piece>& queue,
+    bool speculate,
+    bool background) {
     std::unique_lock<std::mutex> lock(mutex_);
     active_ = false;
     cv_.notify_all();
@@ -37,9 +41,11 @@ void Synchronizer::start(GameState root, const std::deque<Piece>& queue, bool sp
     stats_ = DagStatistics{};
     latest_suggestion_ = DagSuggestion{};
     search_started_ = std::chrono::steady_clock::now();
-    active_ = true;
+    active_ = background;
     lock.unlock();
-    cv_.notify_all();
+    if (background) {
+        cv_.notify_all();
+    }
 }
 
 void Synchronizer::stop() {
@@ -58,6 +64,55 @@ void Synchronizer::wait_until(std::chrono::steady_clock::time_point deadline) {
             break;
         }
     }
+}
+
+SyncSnapshot Synchronizer::run_work_units(std::size_t work_units) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    active_ = false;
+    cv_.notify_all();
+    cv_.wait(lock, [this] { return !worker_in_chunk_; });
+    if (shutdown_) {
+        return {};
+    }
+
+    const auto weights = weights_;
+    const auto exploitation = exploitation_;
+    worker_in_chunk_ = true;
+    lock.unlock();
+
+    DagStatistics delta{};
+    DagSuggestion suggestion{};
+    try {
+        for (std::size_t unit = 0; unit < work_units; ++unit) {
+            delta.accumulate(dag_.do_work(weights, exploitation));
+        }
+        suggestion = dag_.suggest();
+    } catch (...) {
+        lock.lock();
+        worker_in_chunk_ = false;
+        cv_.notify_all();
+        throw;
+    }
+
+    lock.lock();
+    stats_.accumulate(delta);
+    if (suggestion.valid) {
+        latest_suggestion_ = suggestion;
+    }
+    worker_in_chunk_ = false;
+    cv_.notify_all();
+
+    SyncSnapshot out{};
+    out.stats = stats_;
+    out.suggestion = latest_suggestion_;
+    const auto elapsed =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - search_started_)
+            .count();
+    if (elapsed > 0.0) {
+        out.nps = static_cast<double>(out.stats.nodes) / elapsed;
+    }
+    return out;
 }
 
 SyncSnapshot Synchronizer::snapshot() const {

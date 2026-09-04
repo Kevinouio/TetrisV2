@@ -58,11 +58,16 @@ tetris-train experiment=ppo_finetune runtime=cuda
 tetris-train experiment=dqn_pretrain runtime=cuda
 tetris-train experiment=dqn_dagger_pretrain runtime=cuda
 tetris-train experiment=dqn_hybrid runtime=cuda
+
+# Two-player shared Battle-DQN (CPU-first)
+tetris-train experiment=battle_smoke runtime=cpu
+tetris-train experiment=battle_selfplay runtime=cpu
 ```
 
 The DAgger presets expect the learner-state datasets described below to exist.
 The pure-RL presets are `dqn_from_scratch`, `ppo_from_scratch`, and
-`flow_from_scratch`.
+`flow_from_scratch`. Battle mode is pure online RL with optional compatible
+single-player DQN warm-start and its own staged opponent curriculum.
 
 Configuration lives under [`tetris_v2/conf`](../tetris_v2/conf). Each trainer
 group contains every argument accepted by its compatibility CLI, while the
@@ -508,6 +513,56 @@ tetris-train-flow-dqn \
 
 The expert-assisted configurations are the intended reliability paths.
 
+## Two-player Battle-DQN
+
+Battle mode is a separate native joint environment with two independent
+boards and the unchanged 3,200 complete-placement actions. Its shared policy
+uses 470 player-perspective features, masked Double-DQN, packed replay, a
+bounded frozen-opponent pool, and fixed-seed curriculum promotion. It is
+CPU-first; `think_ms=0` is deterministic fixed-work Cold Clear.
+
+Start with the development smoke, then launch the staged run:
+
+```bash
+tetris-battle-smoke \
+  --opponent cold_clear \
+  --repeat-determinism \
+  --train-updates 2 \
+  --json-output runs/battle_smoke/report.json
+
+tetris-train experiment=battle_selfplay runtime=cpu
+```
+
+To warm-start the own-board branch from a current 254/3,200
+placement-convolution DQN, use `trainer.args.init_checkpoint=...`. To continue
+all optimizer, schedule, replay, pool, curriculum, counter, and RNG state, use
+`trainer.args.resume_checkpoint=...` and set a larger absolute
+`trainer.args.total_timesteps`. Full checkpoints are episode-boundary only.
+
+The final battle gates use paired physical seats, deterministic inference,
+500 matches, disjoint fixed seed blocks, zero illegal actions, at least 95%
+wins against random, and at least 65% against Cold Clear:
+
+```bash
+tetris-eval-battle runs/battle_selfplay/battle_dqn_final.pt \
+  --opponent random --matches 500 --seed 2000000 \
+  --repeat-determinism \
+  --json-output runs/battle_selfplay/eval_random_500.json
+
+tetris-eval-battle runs/battle_selfplay/battle_dqn_final.pt \
+  --opponent cold_clear --matches 500 --seed 2100000 \
+  --repeat-determinism \
+  --json-output runs/battle_selfplay/eval_cold_clear_500.json
+```
+
+Use `tetris-eval-battle-pool` for retained snapshots and
+`tetris-battle-matrix` for raw checkpoint-versus-checkpoint win rates,
+draw-adjusted score rates, W/L/D totals, and match counts. The full rule order,
+reward equation, configuration flags, pressure
+test, no-opponent 2,000-placement command, known limits, and current measured
+status are in [BATTLE.md](BATTLE.md). No 500-match battle target should be
+reported as passed without its generated JSON report.
+
 ## Final acceptance gate
 
 Use seeds that were not used for generation, training, development evaluation,
@@ -558,10 +613,13 @@ tetris-play-rl-cli runs/dqn_hybrid/dqn_hybrid_final.pt \
 
 tetris-play-rl runs/ppo_finetune/ppo_best.pt --algo ppo
 tetris-play-rl runs/flow_dqn_full/flow_dqn_final.pt --algo flow_dqn
+tetris-play-rl runs/battle_selfplay/battle_dqn_final.pt --algo battle_dqn
 ```
 
 Use `--stochastic` for exploratory playback. Deterministic greedy playback is
-the default and is the mode used by the quality gate.
+the default and is the mode used by the quality gate. Battle-DQN playback is a
+single-player survival view with a documented blank public opponent; battle
+match evaluation itself is headless and uses `tetris-eval-battle`.
 
 ## Proven workspace result
 
@@ -607,7 +665,9 @@ Git. New clones must train them again or copy the desired artifacts separately.
 ## Compatibility
 
 Current checkpoints use 254 observation features and 3,200 stable placement
-actions. Legacy MLP PPO checkpoints still load when their matching environment
+actions. Battle-DQN has its own versioned 470-feature schema and the same
+action IDs; only its explicit blank-opponent adapter accepts 254-value
+single-player input. Legacy MLP PPO checkpoints still load when their matching environment
 schema is available. Schema-v2 current-action datasets remain valid for PPO
 and DQN cloning, but Flow-DQN rejects them with a regeneration message because
 they do not contain Bellman transitions. Older eight-action and

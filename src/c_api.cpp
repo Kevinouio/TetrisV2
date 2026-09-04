@@ -11,15 +11,35 @@
 #include <optional>
 #include <vector>
 
+#include "tetris_v2/battle.hpp"
 #include "tetris_v2/cc2_data.hpp"
 #include "tetris_v2/cc2_eval.hpp"
 #include "tetris_v2/cc_bot.hpp"
 #include "tetris_v2/cc_env.hpp"
+#include "tetris_v2/decision.hpp"
 #include "tetris_v2/observation.hpp"
 #include "tetris_v2/piece_defs.hpp"
 
+static_assert(
+    TETRIS_CC_BATTLE_PLAYER_COUNT == tetris_v2::kBattlePlayerCount,
+    "battle C ABI player count drifted");
+static_assert(
+    TETRIS_CC_BATTLE_OBSERVATION_SIZE == tetris_v2::kBattleObservationSize,
+    "battle C ABI observation size drifted");
+
 struct tetris_cc_env_handle {
-    explicit tetris_cc_env_handle(std::uint32_t seed) : env(tetris_v2::EnvConfig{seed}) {}
+    explicit tetris_cc_env_handle(std::uint32_t seed, bool play_mode = false)
+        : env(config_for(seed, play_mode), !play_mode) {}
+
+    static tetris_v2::EnvConfig config_for(std::uint32_t seed, bool play_mode) {
+        tetris_v2::EnvConfig config{};
+        config.seed = seed;
+        if (play_mode) {
+            config.spawn_y = 19;
+        }
+        return config;
+    }
+
     tetris_v2::cc::Env env;
 };
 
@@ -29,6 +49,14 @@ struct tetris_cc_bot_handle {
 
 struct tetris_cc_snapshot_handle {
     tetris_v2::EnvSnapshot snapshot{};
+};
+
+struct tetris_cc_battle_handle {
+    explicit tetris_cc_battle_handle(const tetris_v2::BattleConfig& config)
+        : battle(config) {}
+
+    tetris_v2::BattleEnv battle;
+    std::array<tetris_v2::cc::Bot, tetris_v2::kBattlePlayerCount> bots{};
 };
 
 namespace {
@@ -110,63 +138,27 @@ void maybe_set_double(double* dst, double value) {
     }
 }
 
+void write_step_result(
+    const tetris_v2::StepResult& result, tetris_cc_env_step_result* out) {
+    out->action_succeeded = result.action_succeeded ? 1 : 0;
+    out->piece_locked = result.piece_locked ? 1 : 0;
+    out->hold_used = result.hold_used ? 1 : 0;
+    out->lines_cleared = result.lines_cleared;
+    out->spin_clear = result.spin_clear ? 1 : 0;
+    out->spin_type = static_cast<int>(result.spin_type);
+    out->difficult_clear = result.difficult_clear ? 1 : 0;
+    out->b2b_bonus_applied = result.b2b_bonus_applied ? 1 : 0;
+    out->combo = result.combo;
+    out->back_to_back = result.back_to_back ? 1 : 0;
+    out->reward = result.reward;
+    out->game_over = result.game_over ? 1 : 0;
+    out->top_out = result.top_out ? 1 : 0;
+}
+
 constexpr std::size_t kRlPlacementSlots = 96;
 constexpr std::size_t kRlActionDim = 97;
-constexpr std::size_t kDecisionXCount = tetris_v2::Board::kWidth;
-constexpr std::size_t kDecisionYCount = tetris_v2::Board::kRows;
-constexpr std::size_t kDecisionRotationCount = 4;
-constexpr std::size_t kDecisionPoseCount =
-    kDecisionXCount * kDecisionYCount * kDecisionRotationCount;
-constexpr std::size_t kDecisionActionDim = 2 * kDecisionPoseCount;
 constexpr float kIllegalScore = -1.0e6f;
 constexpr float kFallbackFloor = -1000.0f;
-
-struct DecisionOption {
-    bool use_hold{false};
-    std::size_t placement_index{0};
-    std::size_t action{0};
-    tetris_v2::ActivePiece placement{};
-};
-
-std::optional<std::size_t> decision_action(
-    bool use_hold, const tetris_v2::ActivePiece& placement) {
-    const int rotation = static_cast<int>(placement.rotation);
-    if (placement.x < 0 || placement.x >= static_cast<int>(kDecisionXCount) ||
-        placement.y < 0 || placement.y >= static_cast<int>(kDecisionYCount) ||
-        rotation < 0 || rotation >= static_cast<int>(kDecisionRotationCount)) {
-        return std::nullopt;
-    }
-    const auto pose =
-        (static_cast<std::size_t>(rotation) * kDecisionYCount +
-         static_cast<std::size_t>(placement.y)) *
-            kDecisionXCount +
-        static_cast<std::size_t>(placement.x);
-    return (use_hold ? kDecisionPoseCount : 0) + pose;
-}
-
-std::vector<DecisionOption> enumerate_decisions(const tetris_v2::cc::Env& env) {
-    std::vector<DecisionOption> out;
-    auto append = [&](const tetris_v2::cc::Env& source, bool use_hold) {
-        const auto options = source.enumerate_active_piece_placements();
-        for (std::size_t i = 0; i < options.size(); ++i) {
-            auto action = decision_action(use_hold, options[i].placement);
-            if (action.has_value()) {
-                out.push_back(DecisionOption{use_hold, i, *action, options[i].placement});
-            }
-        }
-    };
-
-    append(env, false);
-    if (env.state().hold_available) {
-        tetris_v2::cc::Env held(env.config());
-        held.restore(env.snapshot());
-        const auto result = held.step(tetris_v2::Action::Hold);
-        if (result.hold_used && !result.game_over) {
-            append(held, true);
-        }
-    }
-    return out;
-}
 
 std::uint8_t combo_to_cc2(int combo) {
     if (combo < 0) {
@@ -287,6 +279,14 @@ tetris_cc_env_handle* tetris_cc_env_create(uint32_t seed) {
     }
 }
 
+tetris_cc_env_handle* tetris_cc_env_create_play(uint32_t seed) {
+    try {
+        return new tetris_cc_env_handle(seed, true);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 void tetris_cc_env_destroy(tetris_cc_env_handle* handle) { delete handle; }
 
 void tetris_cc_env_reset(tetris_cc_env_handle* handle, uint32_t seed) {
@@ -305,6 +305,40 @@ int tetris_cc_env_step(tetris_cc_env_handle* handle, int action, float* reward_o
         *reward_out = result.reward;
     }
     return result.game_over ? 1 : 0;
+}
+
+int tetris_cc_env_step_ex(
+    tetris_cc_env_handle* handle, int action, tetris_cc_env_step_result* result_out) {
+    if (!handle || !result_out ||
+        action < static_cast<int>(tetris_v2::Action::None) ||
+        action > static_cast<int>(tetris_v2::Action::Hold)) {
+        return 0;
+    }
+    const auto result = handle->env.step(static_cast<tetris_v2::Action>(action));
+    write_step_result(result, result_out);
+    return 1;
+}
+
+int tetris_cc_env_input_ex(
+    tetris_cc_env_handle* handle, int action, tetris_cc_env_step_result* result_out) {
+    if (!handle || !result_out ||
+        action < static_cast<int>(tetris_v2::Action::None) ||
+        action > static_cast<int>(tetris_v2::Action::Hold)) {
+        return 0;
+    }
+    const auto result = handle->env.input(static_cast<tetris_v2::Action>(action));
+    write_step_result(result, result_out);
+    return 1;
+}
+
+int tetris_cc_env_tick_ex(
+    tetris_cc_env_handle* handle, tetris_cc_env_step_result* result_out) {
+    if (!handle || !result_out) {
+        return 0;
+    }
+    const auto result = handle->env.tick();
+    write_step_result(result, result_out);
+    return 1;
 }
 
 int tetris_cc_env_hold(tetris_cc_env_handle* handle, float* reward_out) {
@@ -394,6 +428,22 @@ int tetris_cc_env_active_piece(
     maybe_set_int(rotation, static_cast<int>(a.rotation));
     maybe_set_int(x, a.x);
     maybe_set_int(y, a.y);
+    return 1;
+}
+
+int tetris_cc_env_ghost_piece(
+    const tetris_cc_env_handle* handle, int* piece, int* rotation, int* x, int* landing_y) {
+    if (!handle) {
+        return 0;
+    }
+    const auto ghost = handle->env.ghost_piece();
+    if (!ghost.has_value()) {
+        return 0;
+    }
+    maybe_set_int(piece, static_cast<int>(ghost->piece));
+    maybe_set_int(rotation, static_cast<int>(ghost->rotation));
+    maybe_set_int(x, ghost->x);
+    maybe_set_int(landing_y, ghost->y);
     return 1;
 }
 
@@ -519,18 +569,21 @@ int tetris_cc_env_apply_placement_index(
     return 1;
 }
 
-size_t tetris_cc_env_decision_action_dim(void) { return kDecisionActionDim; }
+size_t tetris_cc_env_decision_action_dim(void) { return tetris_v2::kDecisionActionDim; }
 
 size_t tetris_cc_env_decision_mask_write(
     const tetris_cc_env_handle* handle, uint8_t* out, size_t out_len) {
-    if (!handle || !out || out_len < kDecisionActionDim) {
+    if (!handle || !out || out_len < tetris_v2::kDecisionActionDim) {
         return 0;
     }
-    std::fill_n(out, static_cast<std::ptrdiff_t>(kDecisionActionDim), static_cast<uint8_t>(0));
-    for (const auto& option : enumerate_decisions(handle->env)) {
+    std::fill_n(
+        out,
+        static_cast<std::ptrdiff_t>(tetris_v2::kDecisionActionDim),
+        static_cast<uint8_t>(0));
+    for (const auto& option : tetris_v2::enumerate_stable_decisions(handle->env)) {
         out[option.action] = static_cast<uint8_t>(1);
     }
-    return kDecisionActionDim;
+    return tetris_v2::kDecisionActionDim;
 }
 
 int tetris_cc_env_decision_get(
@@ -541,23 +594,20 @@ int tetris_cc_env_decision_get(
     int* x,
     int* y,
     int* rotation) {
-    if (!handle || action >= kDecisionActionDim) {
+    if (!handle || action >= tetris_v2::kDecisionActionDim) {
         return 0;
     }
-    const auto options = enumerate_decisions(handle->env);
-    const auto it = std::find_if(options.begin(), options.end(), [&](const DecisionOption& option) {
-        return option.action == action;
-    });
-    if (it == options.end()) {
+    const auto option = tetris_v2::stable_decision_at_action(handle->env, action);
+    if (!option.has_value()) {
         return 0;
     }
-    maybe_set_int(use_hold, it->use_hold ? 1 : 0);
+    maybe_set_int(use_hold, option->use_hold ? 1 : 0);
     if (placement_index) {
-        *placement_index = it->placement_index;
+        *placement_index = option->placement_index;
     }
-    maybe_set_int(x, it->placement.x);
-    maybe_set_int(y, it->placement.y);
-    maybe_set_int(rotation, static_cast<int>(it->placement.rotation));
+    maybe_set_int(x, option->placement.x);
+    maybe_set_int(y, option->placement.y);
+    maybe_set_int(rotation, static_cast<int>(option->placement.rotation));
     return 1;
 }
 
@@ -569,15 +619,12 @@ int tetris_cc_env_decision_action_for_choice(
     if (!handle || !action_out) {
         return 0;
     }
-    const auto options = enumerate_decisions(handle->env);
-    const bool held = use_hold != 0;
-    const auto it = std::find_if(options.begin(), options.end(), [&](const DecisionOption& option) {
-        return option.use_hold == held && option.placement_index == placement_index;
-    });
-    if (it == options.end()) {
+    const auto action = tetris_v2::stable_decision_for_choice(
+        handle->env, use_hold != 0, placement_index);
+    if (!action.has_value()) {
         return 0;
     }
-    *action_out = it->action;
+    *action_out = *action;
     return 1;
 }
 
@@ -589,25 +636,14 @@ int tetris_cc_env_apply_decision(
     int* game_over_out,
     int* used_hold_out,
     size_t* placement_index_out) {
-    if (!handle || action >= kDecisionActionDim) {
+    if (!handle || action >= tetris_v2::kDecisionActionDim) {
         return 0;
     }
-    const auto options = enumerate_decisions(handle->env);
-    const auto it = std::find_if(options.begin(), options.end(), [&](const DecisionOption& option) {
-        return option.action == action;
-    });
-    if (it == options.end()) {
-        return 0;
-    }
-
-    if (it->use_hold) {
-        const auto held = handle->env.step(tetris_v2::Action::Hold);
-        if (!held.hold_used || held.game_over) {
-            return 0;
-        }
-    }
-    const auto result = handle->env.apply_placement_index(it->placement_index);
-    if (!result.action_succeeded) {
+    tetris_v2::StepResult result{};
+    int used_hold = 0;
+    std::size_t placement_index = 0;
+    if (!tetris_v2::apply_stable_decision(
+            handle->env, action, &result, &used_hold, &placement_index)) {
         return 0;
     }
     if (reward_out) {
@@ -615,9 +651,9 @@ int tetris_cc_env_apply_decision(
     }
     maybe_set_int(lines_cleared_out, result.lines_cleared);
     maybe_set_int(game_over_out, result.game_over ? 1 : 0);
-    maybe_set_int(used_hold_out, it->use_hold ? 1 : 0);
+    maybe_set_int(used_hold_out, used_hold);
     if (placement_index_out) {
-        *placement_index_out = it->placement_index;
+        *placement_index_out = placement_index;
     }
     return 1;
 }
@@ -992,6 +1028,278 @@ int tetris_cc_bot_choose_and_apply(
     maybe_set_double(nps_out, stats.nps);
     maybe_set_int(budget_miss_out, stats.budget_miss);
     return 1;
+}
+
+void tetris_cc_battle_config_default(tetris_cc_battle_config* config_out) {
+    if (!config_out) {
+        return;
+    }
+    const tetris_v2::BattleConfig config{};
+    config_out->seed = config.seed;
+    for (std::size_t i = 0; i < config.attack_table.size(); ++i) {
+        config_out->attack_table[i] = config.attack_table[i];
+    }
+    config_out->garbage_delay = config.garbage_delay;
+    config_out->max_joint_steps = config.max_joint_steps;
+    config_out->same_piece_sequence = config.same_piece_sequence ? 1 : 0;
+}
+
+tetris_cc_battle_handle* tetris_cc_battle_create(
+    const tetris_cc_battle_config* config) {
+    try {
+        tetris_v2::BattleConfig native{};
+        if (config) {
+            native.seed = config->seed;
+            for (std::size_t i = 0; i < native.attack_table.size(); ++i) {
+                native.attack_table[i] = config->attack_table[i];
+            }
+            native.garbage_delay = config->garbage_delay;
+            native.max_joint_steps = config->max_joint_steps;
+            native.same_piece_sequence = config->same_piece_sequence != 0;
+        }
+        return new tetris_cc_battle_handle(native);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void tetris_cc_battle_destroy(tetris_cc_battle_handle* handle) { delete handle; }
+
+int tetris_cc_battle_reset(tetris_cc_battle_handle* handle, uint32_t seed) {
+    if (!handle) {
+        return 0;
+    }
+    try {
+        handle->battle.reset(seed);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+size_t tetris_cc_battle_action_dim(void) { return tetris_v2::kDecisionActionDim; }
+
+size_t tetris_cc_battle_observation_size(const tetris_cc_battle_handle* handle) {
+    return handle ? tetris_v2::kBattleObservationSize : 0;
+}
+
+size_t tetris_cc_battle_observation_write(
+    const tetris_cc_battle_handle* handle,
+    size_t perspective_player,
+    float* out,
+    size_t out_len) {
+    if (!handle || !out || perspective_player >= tetris_v2::kBattlePlayerCount) {
+        return 0;
+    }
+    try {
+        const auto observation = handle->battle.observation(perspective_player);
+        const auto count = std::min(out_len, observation.size());
+        std::copy(
+            observation.begin(),
+            observation.begin() + static_cast<std::ptrdiff_t>(count),
+            out);
+        return count;
+    } catch (...) {
+        return 0;
+    }
+}
+
+size_t tetris_cc_battle_decision_mask_write(
+    const tetris_cc_battle_handle* handle,
+    size_t player,
+    uint8_t* out,
+    size_t out_len) {
+    if (!handle || !out || player >= tetris_v2::kBattlePlayerCount ||
+        out_len < tetris_v2::kDecisionActionDim) {
+        return 0;
+    }
+    std::fill_n(
+        out,
+        static_cast<std::ptrdiff_t>(tetris_v2::kDecisionActionDim),
+        static_cast<std::uint8_t>(0));
+    const bool top_out_terminal =
+        handle->battle.player_env(0).state().top_out ||
+        handle->battle.player_env(1).state().top_out;
+    // A max-step draw is a time-limit truncation in the Python API. Preserve
+    // the legal successor mask so bootstrapping remains possible.
+    if (!handle->battle.terminated() || !top_out_terminal) {
+        for (const auto& decision : tetris_v2::enumerate_stable_decisions(
+                 handle->battle.player_env(player))) {
+            out[decision.action] = static_cast<std::uint8_t>(1);
+        }
+    }
+    return tetris_v2::kDecisionActionDim;
+}
+
+int tetris_cc_battle_step(
+    tetris_cc_battle_handle* handle,
+    size_t player0_action,
+    size_t player1_action,
+    tetris_cc_battle_step_result* result_out) {
+    if (!handle || !result_out) {
+        return 0;
+    }
+    try {
+        const auto result = handle->battle.step(player0_action, player1_action);
+        *result_out = {};
+        result_out->success = result.success ? 1 : 0;
+        result_out->terminated = result.terminated ? 1 : 0;
+        result_out->winner = result.winner;
+        result_out->joint_step = result.joint_step;
+        for (std::size_t player = 0; player < tetris_v2::kBattlePlayerCount; ++player) {
+            const auto& native = result.players[player];
+            auto& output = result_out->players[player];
+            output.action_succeeded = native.action_succeeded ? 1 : 0;
+            output.used_hold = native.used_hold ? 1 : 0;
+            output.placement_index = native.placement_index;
+            output.reward = native.reward;
+            output.lines_cleared = native.lines_cleared;
+            output.attack_generated = native.attack_generated;
+            output.garbage_cancelled = native.garbage_cancelled;
+            output.garbage_sent = native.garbage_sent;
+            output.garbage_received = native.garbage_received;
+            output.garbage_applied = native.garbage_applied;
+            output.incoming_garbage = native.incoming_garbage;
+            output.next_garbage_delay = native.next_garbage_delay;
+            output.top_out = native.top_out ? 1 : 0;
+        }
+        return result.success ? 1 : 0;
+    } catch (...) {
+        *result_out = {};
+        result_out->winner = -1;
+        return 0;
+    }
+}
+
+int tetris_cc_battle_meta_get(
+    const tetris_cc_battle_handle* handle,
+    tetris_cc_battle_meta* meta_out) {
+    if (!handle || !meta_out) {
+        return 0;
+    }
+    try {
+        *meta_out = {};
+        meta_out->joint_steps = handle->battle.joint_steps();
+        meta_out->terminated = handle->battle.terminated() ? 1 : 0;
+        meta_out->winner = handle->battle.winner();
+        for (std::size_t player = 0; player < tetris_v2::kBattlePlayerCount; ++player) {
+            meta_out->pending_garbage[player] = handle->battle.pending_garbage(player);
+            meta_out->next_garbage_delay[player] =
+                handle->battle.next_garbage_delay(player);
+            const auto& native = handle->battle.stats(player);
+            auto& output = meta_out->players[player];
+            output.placements = native.placements;
+            output.score = native.score;
+            output.lines_cleared = native.lines_cleared;
+            output.attack_generated = native.attack_generated;
+            output.garbage_cancelled = native.garbage_cancelled;
+            output.garbage_sent = native.garbage_sent;
+            output.garbage_received = native.garbage_received;
+            output.garbage_applied = native.garbage_applied;
+            output.top_outs = native.top_outs;
+        }
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
+size_t tetris_cc_battle_board_write(
+    const tetris_cc_battle_handle* handle,
+    size_t player,
+    int include_active,
+    uint8_t* out,
+    size_t out_len) {
+    if (!handle || !out || player >= tetris_v2::kBattlePlayerCount) {
+        return 0;
+    }
+    std::optional<tetris_v2::ActivePiece> active{};
+    if (include_active != 0) {
+        active = handle->battle.player_env(player).state().active;
+    }
+    return write_visible_board(
+        handle->battle.player_env(player).state().board, active, out, out_len);
+}
+
+size_t tetris_cc_battle_board_piece_ids_write(
+    const tetris_cc_battle_handle* handle,
+    size_t player,
+    int include_active,
+    uint8_t* out,
+    size_t out_len) {
+    if (!handle || !out || player >= tetris_v2::kBattlePlayerCount) {
+        return 0;
+    }
+    const auto ids =
+        handle->battle.player_env(player).visible_board_piece_ids(include_active != 0);
+    const auto count = std::min(out_len, ids.size());
+    std::copy(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(count), out);
+    return count;
+}
+
+int tetris_cc_battle_enqueue_garbage(
+    tetris_cc_battle_handle* handle,
+    size_t player,
+    const int* hole_columns,
+    size_t row_count,
+    int delay) {
+    if (!handle || player >= tetris_v2::kBattlePlayerCount ||
+        (!hole_columns && row_count != 0)) {
+        return 0;
+    }
+    try {
+        std::vector<int> holes;
+        if (row_count != 0) {
+            holes.assign(hole_columns, hole_columns + row_count);
+        }
+        return handle->battle.enqueue_garbage(player, holes, delay) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+int tetris_cc_battle_bot_choose(
+    tetris_cc_battle_handle* handle,
+    size_t player,
+    int think_ms,
+    size_t* action_out,
+    float* score_out,
+    uint64_t* nodes_out,
+    double* think_ms_out,
+    double* nps_out,
+    int* budget_miss_out) {
+    if (!handle || !action_out || player >= tetris_v2::kBattlePlayerCount ||
+        handle->battle.terminated()) {
+        return 0;
+    }
+    try {
+        auto& bot = handle->bots[player];
+        const auto& env = handle->battle.player_env(player);
+        if (!bot.sync_from_env(env)) {
+            return 0;
+        }
+        tetris_v2::cc::BotChoice choice{};
+        tetris_v2::cc::BotThinkStats stats{};
+        if (!bot.choose(think_ms, &choice, &stats)) {
+            return 0;
+        }
+        const auto action = tetris_v2::stable_decision_for_choice(
+            env, choice.use_hold, choice.placement_index);
+        if (!action.has_value()) {
+            return 0;
+        }
+        *action_out = *action;
+        if (score_out) {
+            *score_out = choice.score;
+        }
+        maybe_set_u64(nodes_out, stats.nodes);
+        maybe_set_double(think_ms_out, stats.think_ms);
+        maybe_set_double(nps_out, stats.nps);
+        maybe_set_int(budget_miss_out, stats.budget_miss);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
 }
 
 }  // extern "C"

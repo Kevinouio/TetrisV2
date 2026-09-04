@@ -479,6 +479,7 @@ void test_hold_lifecycle_and_rejected_hold_gravity() {
     assert(!first_hold.game_over);
     assert(env.state().hold == Piece::T);
     assert(env.state().active.piece == Piece::I);
+    assert(env.state().active.y == cfg.spawn_y);
     assert(!env.state().hold_available);
     assert(env.state().combo == 2);
     assert(env.state().back_to_back);
@@ -594,6 +595,92 @@ void test_drop_scoring_remains_additive() {
     assert(result.reward == 106.0f);  // 3 rows * 2 drop points + 100 single-clear points.
 }
 
+void test_zero_time_input_and_single_tick_split() {
+    EnvConfig cfg;
+    cfg.seed = 11;
+    cfg.gravity_per_step = 1.0f;
+    cfg.lock_delay_steps = 30;
+
+    ModernTetrisEnv env(cfg);
+    auto airborne = make_clean_state(env, Piece::T, {Piece::I, Piece::O});
+    airborne.active = ActivePiece{Piece::T, Rotation::North, 4, 10};
+    env.restore(airborne);
+
+    const auto left = env.input(Action::Left);
+    const auto rotate = env.input(Action::RotateCW);
+    const auto right = env.input(Action::Right);
+    assert(left.action_succeeded);
+    assert(rotate.action_succeeded);
+    assert(right.action_succeeded);
+    assert(env.state().active.y == 10);
+    assert(env.state().gravity_accumulator == 0.0f);
+    assert(env.state().lock_timer == 0);
+
+    const auto gravity_tick = env.tick();
+    assert(!gravity_tick.piece_locked);
+    assert(env.state().active.y == 9);
+    assert(env.state().gravity_accumulator == 0.0f);
+
+    auto grounded = make_clean_state(env, Piece::O, {Piece::I, Piece::T});
+    grounded.active = ActivePiece{Piece::O, Rotation::North, 4, 0};
+    grounded.lock_timer = 12;
+    env.restore(grounded);
+
+    assert(env.input(Action::Left).action_succeeded);
+    assert(env.state().lock_timer == 0);
+    assert(env.state().lock_resets_used == 1);
+    assert(env.input(Action::Right).action_succeeded);
+    assert(env.state().lock_timer == 0);
+    assert(env.state().lock_resets_used == 2);
+    assert(!env.tick().piece_locked);
+    assert(env.state().lock_timer == 1);
+
+    auto drop_state = make_clean_state(env, Piece::O, {Piece::I, Piece::T});
+    drop_state.active = ActivePiece{Piece::O, Rotation::North, 4, 3};
+    env.restore(drop_state);
+    const auto hard_drop = env.input(Action::HardDrop);
+    assert(hard_drop.action_succeeded);
+    assert(hard_drop.piece_locked);
+    assert(env.state().active.piece == Piece::I);
+}
+
+void test_legacy_step_matches_split_for_non_hold_actions() {
+    EnvConfig cfg;
+    cfg.seed = 12;
+    cfg.gravity_per_step = 1.0f;
+    cfg.lock_delay_steps = 30;
+
+    ModernTetrisEnv stepped(cfg);
+    ModernTetrisEnv split(cfg);
+    auto state = make_clean_state(stepped, Piece::O, {Piece::I, Piece::T});
+    state.active = ActivePiece{Piece::O, Rotation::North, 4, 0};
+    state.lock_timer = 12;
+    stepped.restore(state);
+    split.restore(state);
+
+    const auto legacy_result = stepped.step(Action::Left);
+    const auto input_result = split.input(Action::Left);
+    const auto tick_result = split.tick();
+    assert(legacy_result.action_succeeded == input_result.action_succeeded);
+    assert(legacy_result.reward == input_result.reward + tick_result.reward);
+    assert(stepped.state().active == split.state().active);
+    assert(stepped.state().board.rows() == split.state().board.rows());
+    assert(stepped.state().lock_timer == split.state().lock_timer);
+    assert(stepped.state().lock_resets_used == split.state().lock_resets_used);
+    assert(stepped.state().gravity_accumulator == split.state().gravity_accumulator);
+    assert(stepped.state().game_over == split.state().game_over);
+
+    stepped.restore(state);
+    split.restore(state);
+    const auto none_result = stepped.step(Action::None);
+    const auto direct_tick = split.tick();
+    assert(none_result.piece_locked == direct_tick.piece_locked);
+    assert(none_result.reward == direct_tick.reward);
+    assert(stepped.state().active == split.state().active);
+    assert(stepped.state().lock_timer == split.state().lock_timer);
+    assert(stepped.state().gravity_accumulator == split.state().gravity_accumulator);
+}
+
 }  // namespace
 
 int main() {
@@ -607,5 +694,7 @@ int main() {
     test_hold_topout_is_reported_as_used();
     test_complete_lockout_and_reset();
     test_drop_scoring_remains_additive();
+    test_zero_time_input_and_single_tick_split();
+    test_legacy_step_matches_split_for_non_hold_actions();
     return 0;
 }

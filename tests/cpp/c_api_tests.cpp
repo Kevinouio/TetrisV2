@@ -250,6 +250,172 @@ void test_cc_rotation_trace_disables_rotate180() {
     tetris_cc_env_destroy(env);
 }
 
+void test_cc_play_mode_rich_steps_and_ghost() {
+    auto* legacy = tetris_cc_env_create(99);
+    auto* play = tetris_cc_env_create_play(99);
+    assert(legacy != nullptr);
+    assert(play != nullptr);
+
+    int piece = -1;
+    int rotation = -1;
+    int x = 0;
+    int y = 0;
+    assert(tetris_cc_env_active_piece(legacy, &piece, &rotation, &x, &y) == 1);
+    assert(y == 21);
+    assert(tetris_cc_env_active_piece(play, &piece, &rotation, &x, &y) == 1);
+    assert(y == 19);
+
+    tetris_cc_env_step_result legacy_rotate{};
+    assert(
+        tetris_cc_env_step_ex(
+            legacy, static_cast<int>(Action::Rotate180), &legacy_rotate) == 1);
+    assert(legacy_rotate.action_succeeded == 0);
+    assert(legacy_rotate.piece_locked == 0);
+
+    const int rotation_before = rotation;
+    tetris_cc_env_step_result play_rotate{};
+    assert(
+        tetris_cc_env_step_ex(
+            play, static_cast<int>(Action::Rotate180), &play_rotate) == 1);
+    assert(play_rotate.action_succeeded == 1);
+    assert(play_rotate.piece_locked == 0);
+    assert(play_rotate.game_over == 0);
+    assert(tetris_cc_env_active_piece(play, &piece, &rotation, &x, &y) == 1);
+    assert(rotation == (rotation_before + 2) % 4);
+
+    int ghost_piece = -1;
+    int ghost_rotation = -1;
+    int ghost_x = 0;
+    int ghost_y = 0;
+    assert(
+        tetris_cc_env_ghost_piece(
+            play, &ghost_piece, &ghost_rotation, &ghost_x, &ghost_y) == 1);
+    assert(ghost_piece == piece);
+    assert(ghost_rotation == rotation);
+    assert(ghost_x == x);
+    assert(ghost_y <= y);
+
+    tetris_cc_env_step_result hard_drop{};
+    assert(
+        tetris_cc_env_step_ex(
+            play, static_cast<int>(Action::HardDrop), &hard_drop) == 1);
+    assert(hard_drop.action_succeeded == 1);
+    assert(hard_drop.piece_locked == 1);
+    assert(hard_drop.hold_used == 0);
+    assert(hard_drop.lines_cleared >= 0 && hard_drop.lines_cleared <= 4);
+    assert(hard_drop.spin_type >= static_cast<int>(SpinType::None));
+    assert(hard_drop.spin_type <= static_cast<int>(SpinType::Full));
+    assert(std::isfinite(hard_drop.reward));
+    assert(hard_drop.game_over == 0);
+    assert(hard_drop.top_out == 0);
+
+    assert(tetris_cc_env_step_ex(nullptr, static_cast<int>(Action::None), &hard_drop) == 0);
+    assert(tetris_cc_env_step_ex(play, static_cast<int>(Action::None), nullptr) == 0);
+    assert(tetris_cc_env_step_ex(play, -1, &hard_drop) == 0);
+    assert(tetris_cc_env_ghost_piece(nullptr, nullptr, nullptr, nullptr, nullptr) == 0);
+
+    tetris_cc_env_destroy(legacy);
+    tetris_cc_env_destroy(play);
+}
+
+void test_cc_legacy_step_behavior_is_preserved() {
+    auto* legacy = tetris_cc_env_create(314);
+    auto* rich = tetris_cc_env_create(314);
+    assert(legacy != nullptr);
+    assert(rich != nullptr);
+
+    float legacy_reward = -1.0f;
+    const int legacy_return =
+        tetris_cc_env_step(legacy, static_cast<int>(Action::HardDrop), &legacy_reward);
+    tetris_cc_env_step_result rich_result{};
+    assert(
+        tetris_cc_env_step_ex(
+            rich, static_cast<int>(Action::HardDrop), &rich_result) == 1);
+
+    assert(legacy_return == rich_result.game_over);
+    assert(legacy_reward == rich_result.reward);
+    assert(board_from_cc_api(legacy, true) == board_from_cc_api(rich, true));
+
+    tetris_cc_env_destroy(legacy);
+    tetris_cc_env_destroy(rich);
+}
+
+void test_cc_zero_time_input_and_tick_bridge() {
+    auto* env = tetris_cc_env_create_play(2718);
+    assert(env != nullptr);
+
+    int piece = -1;
+    int rotation = -1;
+    int x = 0;
+    int y = 0;
+    assert(tetris_cc_env_active_piece(env, &piece, &rotation, &x, &y) == 1);
+    const int spawn_y = y;
+
+    tetris_cc_env_step_result input_result{};
+    assert(
+        tetris_cc_env_input_ex(
+            env, static_cast<int>(Action::Left), &input_result) == 1);
+    assert(input_result.action_succeeded == 1);
+    assert(
+        tetris_cc_env_input_ex(
+            env, static_cast<int>(Action::Right), &input_result) == 1);
+    assert(input_result.action_succeeded == 1);
+    assert(tetris_cc_env_active_piece(env, &piece, &rotation, &x, &y) == 1);
+    assert(y == spawn_y);
+
+    int soft_drop_count = 0;
+    do {
+        assert(
+            tetris_cc_env_input_ex(
+                env, static_cast<int>(Action::SoftDrop), &input_result) == 1);
+        if (input_result.action_succeeded != 0) {
+            ++soft_drop_count;
+        }
+    } while (input_result.action_succeeded != 0 && soft_drop_count < Board::kRows);
+    assert(soft_drop_count > 0);
+    assert(input_result.action_succeeded == 0);
+
+    int lock_timer = -1;
+    int lock_resets = -1;
+    assert(
+        tetris_cc_env_meta(
+            env, nullptr, nullptr, nullptr, nullptr, nullptr, &lock_timer, &lock_resets) == 1);
+    assert(lock_timer == 0);
+    assert(lock_resets == 0);
+
+    assert(
+        tetris_cc_env_input_ex(
+            env, static_cast<int>(Action::Left), &input_result) == 1);
+    assert(input_result.action_succeeded == 1);
+    assert(
+        tetris_cc_env_meta(
+            env, nullptr, nullptr, nullptr, nullptr, nullptr, &lock_timer, &lock_resets) == 1);
+    assert(lock_timer == 0);
+    assert(lock_resets == 1);
+
+    tetris_cc_env_step_result tick_result{};
+    assert(tetris_cc_env_tick_ex(env, &tick_result) == 1);
+    assert(tick_result.piece_locked == 0);
+    assert(
+        tetris_cc_env_meta(
+            env, nullptr, nullptr, nullptr, nullptr, nullptr, &lock_timer, &lock_resets) == 1);
+    assert(lock_timer == 1);
+
+    assert(
+        tetris_cc_env_input_ex(
+            env, static_cast<int>(Action::HardDrop), &input_result) == 1);
+    assert(input_result.action_succeeded == 1);
+    assert(input_result.piece_locked == 1);
+
+    assert(tetris_cc_env_input_ex(nullptr, 0, &input_result) == 0);
+    assert(tetris_cc_env_input_ex(env, -1, &input_result) == 0);
+    assert(tetris_cc_env_input_ex(env, 0, nullptr) == 0);
+    assert(tetris_cc_env_tick_ex(nullptr, &tick_result) == 0);
+    assert(tetris_cc_env_tick_ex(env, nullptr) == 0);
+
+    tetris_cc_env_destroy(env);
+}
+
 void test_cc_bot_null_safety() {
     assert(tetris_cc_env_step(nullptr, static_cast<int>(Action::None), nullptr) == 0);
     assert(tetris_cc_bot_sync_from_env(nullptr, nullptr) == 0);
@@ -659,7 +825,7 @@ void test_cc_bot_loop_and_budget_scaling() {
         int ok = tetris_cc_bot_choose_and_apply(
             bot,
             env,
-            5,
+            0,
             &reward,
             &lines,
             &game_over,
@@ -677,7 +843,7 @@ void test_cc_bot_loop_and_budget_scaling() {
         assert(nodes > 0);
         assert(think_ms >= 0.0);
         assert(nps >= 0.0);
-        assert(budget_miss == 0 || budget_miss == 1);
+        assert(budget_miss == 0);
 
         if (game_over != 0) {
             ++topouts;
@@ -739,6 +905,9 @@ int main() {
     test_cc_matches_cpp_env_for_basic_state();
     test_cc_snapshot_restore_keeps_future_deterministic();
     test_cc_rotation_trace_disables_rotate180();
+    test_cc_play_mode_rich_steps_and_ghost();
+    test_cc_legacy_step_behavior_is_preserved();
+    test_cc_zero_time_input_and_tick_bridge();
     test_cc2_movegen_zero_safe_fast_mode();
     test_cc2_combo_progression();
     test_cc2_hold_state_and_dag_edges();

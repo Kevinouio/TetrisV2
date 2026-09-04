@@ -25,6 +25,7 @@ RUNNER_TARGETS = {
     "ppo": "tetris_v2.rl.ppo.train:run",
     "ppo_pretrain": "tetris_v2.rl.ppo.pretrain:run",
     "flow_dqn": "tetris_v2.rl.flow_dqn.train:run",
+    "battle_dqn": "tetris_v2.rl.battle.train:run",
 }
 
 PARSER_TARGETS = {
@@ -34,6 +35,7 @@ PARSER_TARGETS = {
 
 PATH_ARGS = {
     "dataset_dir",
+    "curriculum_config",
     "expert_dataset_dir",
     "init_checkpoint",
     "lib",
@@ -48,7 +50,8 @@ PATH_LIST_ARGS = {
 }
 
 BOOLEAN_OPTIONAL_ARGS = {"lr_anneal", "normalized_q"}
-MULTI_VALUE_ARGS = {"hidden_sizes"}
+BOOLEAN_FLAG_ARGS = {"disable_curriculum", "independent_piece_seeds"}
+MULTI_VALUE_ARGS = {"attack_table", "hidden_sizes"}
 
 
 def _load_runner(name: str) -> Runner:
@@ -77,6 +80,11 @@ def _native_argv(values: dict[str, Any]) -> list[str]:
             if not isinstance(value, bool):
                 raise ValueError(f"trainer.args.{key} must be true or false")
             argv.append(option if value else f"--no-{key.replace('_', '-')}")
+        elif key in BOOLEAN_FLAG_ARGS:
+            if not isinstance(value, bool):
+                raise ValueError(f"trainer.args.{key} must be true or false")
+            if value:
+                argv.append(option)
         elif key in PATH_LIST_ARGS:
             if not isinstance(value, list):
                 raise ValueError(f"trainer.args.{key} must be a list")
@@ -90,6 +98,8 @@ def _native_argv(values: dict[str, Any]) -> list[str]:
         else:
             if isinstance(value, (dict, list)):
                 raise ValueError(f"trainer.args.{key} must be a scalar")
+            if isinstance(value, bool):
+                raise ValueError(f"trainer.args.{key} is not a supported boolean option")
             argv.extend((option, str(value)))
     return argv
 
@@ -145,7 +155,7 @@ def build_namespace(config: DictConfig) -> argparse.Namespace:
                 raise ValueError(f"trainer.args.{key} must be a list")
             values[key] = [_absolute_path(item) for item in values[key]]
 
-    if name in {"ppo", "flow_dqn"}:
+    if name in {"ppo", "flow_dqn", "battle_dqn"}:
         if (
             values.get("init_checkpoint") is not None
             and values.get("resume_checkpoint") is not None

@@ -32,6 +32,10 @@ struct ColdClearBotThinkStats {
 
 class ColdClearBot {
 public:
+    // A zero budget selects deterministic fixed effort instead of consulting
+    // the wall clock. Positive values retain millisecond-budgeted search.
+    static constexpr std::size_t kDeterministicWorkUnits = 8;
+
     ColdClearBot();
     ~ColdClearBot();
 
@@ -67,7 +71,7 @@ private:
         cc2::Placement placement{};
     };
 
-    bool start_search_locked(const Snapshot& snapshot);
+    bool start_search_locked(const Snapshot& snapshot, bool background);
     bool map_suggestion_to_choice(
         const Snapshot& snapshot,
         const cc2::DagSuggestion& suggestion,

@@ -1,0 +1,49 @@
+name: battle_dqn
+args:
+  total_timesteps: 1000000
+  buffer_size: 50000
+  warmup_steps: 2000
+  batch_size: 128
+  train_frequency: 1
+  gradient_steps: 1
+  learning_rate_start: 0.0001
+  learning_rate_end: 0.00001
+  learning_rate_decay_steps: 1000000
+  gamma: 0.995
+  target_sync_interval: 2000
+  max_grad_norm: 10.0
+  epsilon_start: 0.20
+  epsilon_end: 0.02
+  epsilon_decay_steps: 500000
+  seed: 123
+  device: null
+  lib: null
+  init_checkpoint: null
+  resume_checkpoint: null
+  attack_table: [0, 0, 1, 2, 4]
+  garbage_delay: 1
+  max_match_steps: 500
+  independent_piece_seeds: false
+  reward_terminal: 20.0
+  reward_attack: 0.05
+  reward_cancellation: 0.03
+  reward_line_clear: 0.01
+  reward_board_quality: 0.02
+  reward_height: 0.02
+  reward_holes: 0.03
+  reward_garbage: 0.04
+  opponent_pool_size: 20
+  pool_checkpoint_frequency: 100000
+  cold_clear_think_ms: 0  # deterministic fixed-work; positive values are milliseconds
+  random_opponent_weight: 0.20
+  heuristic_opponent_weight: 0.30
+  frozen_opponent_weight: 0.50
+  current_opponent_weight: 0.0
+  disable_curriculum: false
+  curriculum_config: null  # packaged battle_curriculum.yaml; override with a custom YAML path
+  log_frequency: 10000
+  eval_frequency: 50000
+  eval_matches: 100
+  eval_seed: 900000
+  checkpoint_frequency: 100000
+  log_dir: ${paths.runs_dir}/battle_dqn

@@ -2,8 +2,9 @@
 
 TetrisV2 is a C++ Tetris runtime with a Python reinforcement-learning stack.
 The runtime owns all game rules and exposes a small C API; the Python package
-uses that API for masked-placement PPO, DQN, and discrete Flow-DQN training,
-evaluation, expert data generation, and playback.
+uses that API for masked-placement PPO, DQN, discrete Flow-DQN, and deterministic
+two-player Battle-DQN training, evaluation, expert data generation, and
+playback.
 
 ![Cold Clear bot playing Tetris](docs/assets/cold-clear.gif)
 
@@ -78,6 +79,30 @@ tetris-train-dqn --total-timesteps 500000 --log-dir runs/dqn
 tetris-train-flow-dqn --online-timesteps 500000 --log-dir runs/flow_dqn
 ```
 
+Two-player battle mode preserves the same complete-placement action IDs and
+adds atomic attacks, FIFO cancellation, delayed seeded garbage, a shared
+Battle-DQN, a bounded frozen-opponent pool, and fixed-seed curriculum gates.
+Run the complete native/learning smoke and start the CPU preset with:
+
+```bash
+tetris-battle-smoke --repeat-determinism --train-updates 2
+tetris-train experiment=battle_selfplay runtime=cpu
+```
+
+Evaluate a frozen checkpoint against random and deterministic fixed-work Cold
+Clear opponents with 500 paired-seat matches:
+
+```bash
+tetris-eval-battle runs/battle_selfplay/battle_dqn_final.pt \
+  --opponent random --matches 500 --seed 2000000 --repeat-determinism
+tetris-eval-battle runs/battle_selfplay/battle_dqn_final.pt \
+  --opponent cold_clear --matches 500 --seed 2100000 --repeat-determinism
+```
+
+Rules, the 470-value public observation, zero-sum reward, resume guarantees,
+pool/matrix commands, and honestly measured status are in
+[docs/BATTLE.md](docs/BATTLE.md).
+
 Flow-DQN is a full `8 x 40 x 10` masked-action PyTorch adaptation inspired by
 [Flow Q-Learning](https://arxiv.org/abs/2502.02538), whose original algorithm
 uses continuous actions. It is intentionally documented as a Tetris-specific
@@ -88,7 +113,21 @@ For manual play or bot autoplay:
 ```bash
 tetris-play-human
 tetris-play-bot --think-ms 20 --auto-reset
+tetris-play-battle runs/flow_dqn_full/flow_dqn_final.pt --algo flow_dqn
 ```
+
+`tetris-play-human` is the real-time client: arrows move and soft-drop, Space
+hard-drops, Z/X rotate, A rotates 180 degrees, C/Shift holds, P pauses, R
+restarts, and F11 toggles fullscreen. Its fixed 60 Hz simulation is independent
+of the render rate, with configurable handling such as
+`--das-ms 100 --arr-ms 16 --sdf 6`. The placement and kick inspector remains
+available for engine debugging with `python -m scripts.play_pygame`.
+
+`tetris-play-battle` opens a side-by-side match between a checkpoint and Cold
+Clear. Space pauses, `.` advances one joint placement, R resets, N advances the
+seed, S swaps seats, and +/- changes the playback speed. Use `--no-auto-reset`
+to leave the result on screen. Battle-DQN checkpoints are supported with
+`--algo battle_dqn` and inherit their saved battle rules.
 
 All console commands can also be run as modules from a source checkout, for
 example `python -m scripts.eval_rl --help`.
@@ -100,6 +139,9 @@ example `python -m scripts.eval_rl --help`.
 - Each observation has 254 bounded features: the visible board, active piece,
   hold piece, five-piece preview, hold availability, combo, and back-to-back
   state.
+- Battle policies use a separate 470-value player-perspective schema: the same
+  254 own features, the opponent's public locked board, and 16 normalized
+  public garbage/board features. Opponent previews and RNG state stay private.
 - A policy chooses among 3,200 stable physical decisions encoded as
   `(use_hold, rotation, landing_y, x)`. One decision optionally holds and then
   locks exactly one piece.

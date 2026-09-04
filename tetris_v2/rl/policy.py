@@ -9,12 +9,51 @@ from typing import TYPE_CHECKING, Dict, Literal, Optional
 import numpy as np
 
 if TYPE_CHECKING:  # pragma: no cover
+    from tetris_v2.rl.battle.dqn import BattleDQNAgent
     from tetris_v2.rl.dqn.core import DQNAgent
     from tetris_v2.rl.flow_dqn.core import FlowDQNAgent
     from tetris_v2.rl.ppo.core import PPOAgent
 
 
-AlgoName = Literal["ppo", "dqn", "flow_dqn"]
+AlgoName = Literal["ppo", "dqn", "flow_dqn", "battle_dqn"]
+
+
+def _single_player_battle_observation(observation: np.ndarray) -> np.ndarray:
+    """Adapt public single-player state to the battle policy's no-opponent view."""
+
+    from tetris_v2.rl.battle.dqn import BATTLE_OBSERVATION_DIM
+    from tetris_v2.rl.battle.stats import compute_board_stats
+
+    own = np.asarray(observation, dtype=np.float32)
+    if own.shape != (254,):
+        raise ValueError("Battle-DQN survival inference requires a 254-value observation.")
+    value = np.zeros(BATTLE_OBSERVATION_DIM, dtype=np.float32)
+    value[:254] = own
+    board = own[:200].reshape(20, 10)[::-1]
+    stats = compute_board_stats(board)
+    value[454:470] = np.asarray(
+        [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            stats.aggregate_height / 200.0,
+            stats.max_height / 20.0,
+            stats.holes / 200.0,
+            stats.bumpiness / 180.0,
+            stats.wells / 420.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            (20.0 - stats.max_height) / 40.0,
+            (200.0 - stats.holes) / 400.0,
+        ],
+        dtype=np.float32,
+    )
+    np.clip(value[454:470], 0.0, 1.0, out=value[454:470])
+    return value
 
 
 @dataclass
@@ -26,6 +65,7 @@ class LoadedPolicy:
     ppo_agent: Optional["PPOAgent"] = None
     dqn_agent: Optional["DQNAgent"] = None
     flow_dqn_agent: Optional["FlowDQNAgent"] = None
+    battle_dqn_agent: Optional["BattleDQNAgent"] = None
 
     def act(
         self,
@@ -57,6 +97,20 @@ class LoadedPolicy:
                     action_mask=action_mask,
                 )
             )
+        if self.algo == "battle_dqn":
+            assert self.battle_dqn_agent is not None
+            if action_mask is None:
+                raise ValueError("Battle-DQN inference requires a legal-action mask.")
+            battle_obs = _single_player_battle_observation(obs)
+            battle_epsilon = 0.0 if deterministic else max(0.0, float(epsilon))
+            return int(
+                self.battle_dqn_agent.select_action(
+                    battle_obs,
+                    action_mask=np.asarray(action_mask),
+                    epsilon=battle_epsilon,
+                    deterministic=deterministic,
+                )
+            )
         assert self.flow_dqn_agent is not None
         return int(
             self.flow_dqn_agent.select_action(
@@ -70,8 +124,8 @@ class LoadedPolicy:
 
 def load_policy(algo: AlgoName, checkpoint: Path, *, device: Optional[str] = None) -> LoadedPolicy:
     algo = str(algo).lower()  # type: ignore[assignment]
-    if algo not in {"ppo", "dqn", "flow_dqn"}:
-        raise ValueError("algo must be 'ppo', 'dqn', or 'flow_dqn'")
+    if algo not in {"ppo", "dqn", "flow_dqn", "battle_dqn"}:
+        raise ValueError("algo must be 'ppo', 'dqn', 'flow_dqn', or 'battle_dqn'")
     if algo == "ppo":
         from tetris_v2.rl.ppo.core import PPOAgent
 
@@ -93,6 +147,22 @@ def load_policy(algo: AlgoName, checkpoint: Path, *, device: Optional[str] = Non
             action_dim=int(agent.config.action_dim),
             metadata=dict(metadata),
             dqn_agent=agent,
+        )
+    if algo == "battle_dqn":
+        from tetris_v2.rl.battle.dqn import BattleDQNAgent
+
+        agent, metadata = BattleDQNAgent.load_frozen(
+            checkpoint,
+            device=device or "cpu",
+        )
+        adapted_metadata = dict(metadata)
+        adapted_metadata["survival_adapter"] = "blank_public_opponent_v1"
+        return LoadedPolicy(
+            algo="battle_dqn",
+            obs_dim=254,
+            action_dim=int(agent.config.action_dim),
+            metadata=adapted_metadata,
+            battle_dqn_agent=agent,
         )
     from tetris_v2.rl.flow_dqn.core import FlowDQNAgent
 
